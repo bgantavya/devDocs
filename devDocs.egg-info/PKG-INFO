@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: devDocs
-Version: 1.0.1
+Version: 1.0.2
 Summary: A CLI tool to auto-generate professional README.md files using Google Gemini API.
 Author: Gantavya Bansal
 Author-email: Gantavya Bansal <gantavyaoo@gmail.com>

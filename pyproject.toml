@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "devDocs"
-version = "1.0.1"
+version = "1.0.2"
 description = "AI-powered CLI tool that builds professional '*.md' documentation files of a project for internal teams using the Google Gemini API."
 readme = "README.md"
 requires-python = ">=3.8"
