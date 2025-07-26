@@ -1,16 +1,29 @@
 Metadata-Version: 2.4
 Name: devDocs
-Version: 1.0.2
-Summary: A CLI tool to auto-generate professional README.md files using Google Gemini API.
+Version: 1.0.3
+Summary: AI-powered CLI tool that builds professional '*.md' documentation files of a project for internal teams using the Google Gemini API.
 Author: Gantavya Bansal
 Author-email: Gantavya Bansal <gantavyaoo@gmail.com>
 License: MIT
-Keywords: cli,documentation,readme,generator,gemini-ai
-Classifier: Programming Language :: Python :: 3
-Classifier: License :: OSI Approved :: MIT License
-Classifier: Operating System :: OS Independent
+Project-URL: Homepage, https://github.com/bgantavya/devDocs
+Project-URL: Repository, https://github.com/bgantavya/devDocs
+Project-URL: Issues, https://github.com/bgantavya/devDocs/issues
+Project-URL: Documentation, https://github.com/bgantavya/devDocs#readme
+Keywords: cli,documentation,readme,generator,google-gemini,ai,markdown,docs-generator,auto-readme,open-source
+Classifier: Development Status :: 4 - Beta
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
 Classifier: Topic :: Documentation
 Classifier: Topic :: Software Development :: Code Generators
+Classifier: Topic :: Software Development :: Documentation
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Operating System :: OS Independent
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
 Requires-Dist: google-genai
