@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devDocs" 
+version = "1.0.1"
+description = "A CLI tool to auto-generate professional README.md files using Google Gemini API."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+authors = [
+  { name="Gantavya Bansal", email="gantavyaoo@gmail.com" }
+]
+
+keywords = ["cli", "documentation", "readme", "generator", "gemini-ai"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Documentation",
+    "Topic :: Software Development :: Code Generators"
+]
+
+dependencies = [
+    "google-genai",
+    "httpx",
+]
+
+[project.scripts]
+devDocs = "devDocs.cli:x"
+
+[tool.setuptools]
+packages = ["devDocs"]
+include-package-data = true

@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+setup.py
+devDocs/__init__.py
+devDocs/cli.py
+devDocs.egg-info/PKG-INFO
+devDocs.egg-info/SOURCES.txt
+devDocs.egg-info/dependency_links.txt
+devDocs.egg-info/entry_points.txt
+devDocs.egg-info/requires.txt
+devDocs.egg-info/top_level.txt
