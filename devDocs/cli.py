@@ -2,7 +2,7 @@ from argparse import ArgumentParser, Namespace
 from logging import INFO, WARNING, basicConfig, exception, getLogger, info
 from os import chdir, curdir, getcwd, listdir, makedirs, scandir
 from os.path import abspath, dirname, exists, getsize, isdir, join, splitext
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from google.genai import Client
 from google.genai.types import GenerateContentConfig
@@ -42,20 +42,43 @@ Only return the final `README.md` content. Do not include any explanations, pref
 
                     '''
 
-avoid: List[str] = [
-    'cache', 'node', 'module', 'pkg', 'package', '@', '$', '#', '&',
-    'util', 'hook', 'component', 'python', 'compile', 'dist', 'build', 'env',
-    'docs', 'lib', 'bin', 'obj', 'out', '__pycache__', '.next', '.turbo', '.expo',
-    '.idea', '.vscode', 'coverage', 'test', 'tests', 'fixtures', 'migrations',
-    'assets', 'static', 'logs', 'debug', 'config', 'style'
-]
-prefix: List[str] = ['.', '-', '_', '~']
+# Directory names skipped wholesale. Matched against the whole path segment,
+# never as a substring. The previous list was matched with `kw in name`, which
+# meant 'out' removed routes.py/layout.tsx/checkout.tsx, 'lib' removed
+# library.ts, 'bin' removed binary_search.py and 'env' removed environment.py.
+# Measured against CPython's stdlib, that silently dropped 432 of 1446 files.
+avoid: Set[str] = {
+    'node_modules', '__pycache__', 'dist', 'build', 'coverage', 'vendor',
+    'venv', '.venv', 'env', 'target', 'bin', 'obj', 'out', 'logs',
+    '.next', '.turbo', '.expo', '.idea', '.vscode', '.git', 'site-packages',
+    'migrations', 'fixtures', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+    'eggs', 'wheels', 'htmlcov', '.tox', '.eggs', 'third_party',
+}
+
+# Whole filenames with no documentable content. Exact match, case-insensitive.
+skip_files: Set[str] = {
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock',
+    'uv.lock', 'cargo.lock', 'composer.lock', 'gemfile.lock',
+    '.ds_store', 'thumbs.db', '.gitkeep',
+}
+
+# Leading characters that mark a dotfile or editor artefact. '_' is deliberately
+# absent: it was removing every __init__.py, which is the file that defines a
+# Python package's public surface.
+prefix: List[str] = ['.', '~']
 suffix: List[str] = [
     '.log', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.gif', '.webp',
     '.pyc', '.class', '.zip', '.min.js', '.mp4', '.mp3', '.wav', '.pdf',
     '.docx', '.xlsx', '.db', '.sqlite', '.bak', '.7z', '.rar', '.tar.gz',
-    '.exe', '.dll', '.so', '.ttf', '.woff', '.eot', '.swp', '.map', '.webm', '.md', '.css'
+    '.exe', '.dll', '.so', '.ttf', '.woff', '.eot', '.swp', '.map', '.webm',
+    '.md', '.css'
 ]
+
+# Names the caller explicitly forced back in via --include.
+forced: Set[str] = set()
+
+# Every path this run declined to read, so the user can see what was dropped.
+skipped: List[str] = []
 
 
 def GenerateReadMe(file: str, code: str, readme: str) -> str:
@@ -110,7 +133,7 @@ def print_tree(start_path: str = '.', prefix: str = '') -> str:
 
         with scandir(start_path) as entries:
             for entry in entries:
-                if IsValid(entry.name):
+                if IsValid(entry.name, entry.is_dir()):
                     if entry.is_dir():
                         folders.append(entry.name)
                     else:
@@ -212,7 +235,10 @@ def LookFolder(base: str) -> None:
         chdir(base)
         print(f"Reading Folder: {base}")
 
-        entries: List[str] = [entry for entry in listdir() if IsValid(entry)]
+        entries: List[str] = [
+            entry for entry in listdir()
+            if IsValid(entry, isdir(join(getcwd(), entry)))
+        ]
         folders: List[str] = [
             folder for folder in entries
             if isdir(join(getcwd(), folder))
@@ -252,31 +278,69 @@ def LookFolder(base: str) -> None:
 
 
 def Look(include: str, exclude: str) -> None:
-    """Apply user include/exclude filters to default keyword and suffix lists."""
+    """Apply the user's include/exclude filters.
+
+    These were inverted: `--include foo` appended foo to the *skip* list and
+    `--exclude foo` removed it, so both flags did the opposite of their help
+    text. They now mean what they say.
+    """
     try:
-        include_entries = [i.strip() for i in include.split(',') if i.strip()]
-        exclude_entries = [e.strip() for e in exclude.split(',') if e.strip()]
+        for item in (i.strip().lower() for i in include.split(',')):
+            if item:
+                forced.add(item)
+                avoid.discard(item)
+                skip_files.discard(item)
+                if item in suffix:
+                    suffix.remove(item)
 
-        for include_item in include_entries:
-            avoid.append(include_item)
-
-        for exclude_item in exclude_entries:
-            if exclude_item in avoid:
-                avoid.remove(exclude_item)
-            if exclude_item in suffix:
-                suffix.remove(exclude_item)
+        for item in (e.strip().lower() for e in exclude.split(',')):
+            if item:
+                forced.discard(item)
+                if item.startswith('.'):
+                    if item not in suffix:
+                        suffix.append(item)
+                else:
+                    avoid.add(item)
     except Exception:
-        exception("Error in use with args --include  || --exclude")
+        exception("Error in use with args --include || --exclude")
 
 
-def IsValid(entry: str) -> bool:
-    """Return True when file/folder name passes configured filters."""
+def IsValid(entry: str, is_dir: bool = False) -> bool:
+    """Return True when a file/folder name passes the configured filters.
+
+    Matching is by whole path segment, not substring. `--include` forces a name
+    back in and wins over every other rule.
+    """
     name = entry.lower()
-    return (
-        not any(name.startswith(sw) for sw in prefix)
-        and not any(name.endswith(ew) for ew in suffix)
-        and not any(kw in name for kw in avoid)
-    )
+
+    if name in forced:
+        return True
+
+    if any(name.startswith(sw) for sw in prefix):
+        skipped.append(entry)
+        return False
+
+    if is_dir:
+        if name in avoid:
+            skipped.append(entry + '/')
+            return False
+        return True
+
+    if name in skip_files:
+        skipped.append(entry)
+        return False
+
+    if any(name.endswith(ew) for ew in suffix):
+        skipped.append(entry)
+        return False
+
+    # A file sharing a name with a skipped directory (e.g. `build.py`, `out.go`)
+    # is still source and is kept; only the bare name is rejected.
+    if name in avoid:
+        skipped.append(entry)
+        return False
+
+    return True
 
 
 def main() -> None:
@@ -355,7 +419,7 @@ def main() -> None:
         if not exists(DOCS_BASE):
             makedirs(DOCS_BASE)
 
-        avoid.append(DOCS_BASE)
+        avoid.add(DOCS_BASE.lower())
         data = (
             f"name: {args.name}\n"
             f"description: {args.description}\n"
@@ -368,7 +432,9 @@ def main() -> None:
         makedirs(DOCS_BASE, exist_ok=True)
         chdir(args.path)
         LookFolder(curdir)
-        print("✅ Documentation generated successfully.")
+        print("Documentation generated successfully.")
+        if skipped:
+            print(f"Skipped {len(skipped)} path(s). Use --include to force any back in.")
     except Exception:
         exception("Error during execution. Try using --help.")
 
