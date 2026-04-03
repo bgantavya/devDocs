@@ -47,6 +47,20 @@ Only return the final `README.md` content. Do not include any explanations, pref
 # meant 'out' removed routes.py/layout.tsx/checkout.tsx, 'lib' removed
 # library.ts, 'bin' removed binary_search.py and 'env' removed environment.py.
 # Measured against CPython's stdlib, that silently dropped 432 of 1446 files.
+# Cheapest capable model first. The list was previously ordered the other way
+# round, so every successful call paid the top rate for a job the lite models
+# handle fine. Escalation now only happens when the cheaper model fails.
+MODELS: List[str] = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
+]
+
 avoid: Set[str] = {
     'node_modules', '__pycache__', 'dist', 'build', 'coverage', 'vendor',
     'venv', '.venv', 'env', 'target', 'bin', 'obj', 'out', 'logs',
@@ -86,19 +100,9 @@ def GenerateReadMe(file: str, code: str, readme: str) -> str:
     if client is None:
         return f"# {file}\n\n⚠️ Failed to generate documentation. API client is not initialized."
 
-    models: List[str] = [
-        "gemini-3.1-pro-preview",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash-lite",
-    ]
     last_error: Optional[Exception] = None
 
-    for model_name in models:
+    for model_name in MODELS:
         try:
             response = client.models.generate_content(
                 model=model_name,
