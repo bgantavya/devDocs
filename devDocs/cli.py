@@ -95,6 +95,36 @@ forced: Set[str] = set()
 skipped: List[str] = []
 
 
+# HTTP statuses where trying another model cannot help.
+_FATAL = frozenset({400, 401, 403})
+
+# Models this run has proven unusable, so we stop paying to rediscover that.
+dead_models: Set[str] = set()
+
+
+def _status_of(err: Exception) -> Optional[int]:
+    """Best-effort HTTP status from an SDK exception."""
+    for attr in ('code', 'status_code'):
+        value = getattr(err, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(err, 'response', None)
+    value = getattr(response, 'status_code', None)
+    return value if isinstance(value, int) else None
+
+
+def _text_of(response: object) -> Optional[str]:
+    """Extract markdown from a response, or None when it carried no content.
+
+    `response.text` is None whenever finishReason is SAFETY or MAX_TOKENS,
+    because the candidate has no parts at all.
+    """
+    text = getattr(response, 'text', None)
+    if not text:
+        return None
+    return text.removeprefix('```markdown').removesuffix('```').strip() or None
+
+
 def GenerateReadMe(file: str, code: str, readme: str) -> str:
     """Generate markdown docs using Gemini with fallback model sequence."""
     if client is None:
@@ -103,6 +133,8 @@ def GenerateReadMe(file: str, code: str, readme: str) -> str:
     last_error: Optional[Exception] = None
 
     for model_name in MODELS:
+        if model_name in dead_models:
+            continue
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -113,12 +145,29 @@ def GenerateReadMe(file: str, code: str, readme: str) -> str:
                     f"Existing README (if any):\n{readme}",
                 ],
             )
-            return response.text.removeprefix('```markdown').removesuffix('```').strip()
         except Exception as err:
             last_error = err
+            status = _status_of(err)
+            if status in _FATAL:
+                # Bad key or disabled API: every other model fails identically,
+                # so escalating burns 7 more requests to learn nothing.
+                exception(f"{status} from Gemini; aborting. Check your API key.")
+                raise SystemExit(2)
+            if status == 404:
+                # Model does not exist for this key. Never retry it this run.
+                dead_models.add(model_name)
+            continue
+
+        text = _text_of(response)
+        if text is not None:
+            return text
+        # A 200 with no parts (SAFETY / MAX_TOKENS) is not a transport failure;
+        # a larger model will not fix it.
+        info(f"{model_name} returned no content for {file}")
+        break
 
     exception(f"Error generating README for {file}: {last_error}")
-    return f"# {file}\n\n⚠️ Failed to generate documentation GEMINI SERVER ERROR."
+    return f"# {file}\n\nDocumentation could not be generated for this file."
 
 
 def print_tree(start_path: str = '.', prefix: str = '') -> str:
