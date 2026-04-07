@@ -42,14 +42,7 @@ Only return the final `README.md` content. Do not include any explanations, pref
 
                     '''
 
-# Directory names skipped wholesale. Matched against the whole path segment,
-# never as a substring. The previous list was matched with `kw in name`, which
-# meant 'out' removed routes.py/layout.tsx/checkout.tsx, 'lib' removed
-# library.ts, 'bin' removed binary_search.py and 'env' removed environment.py.
-# Measured against CPython's stdlib, that silently dropped 432 of 1446 files.
-# Cheapest capable model first. The list was previously ordered the other way
-# round, so every successful call paid the top rate for a job the lite models
-# handle fine. Escalation now only happens when the cheaper model fails.
+# Cheapest capable first; escalate only on failure.
 MODELS: List[str] = [
     "gemini-2.0-flash-lite",
     "gemini-2.5-flash-lite",
@@ -61,6 +54,7 @@ MODELS: List[str] = [
     "gemini-3.1-pro-preview",
 ]
 
+# Directory names. Whole segments, never substrings.
 avoid: Set[str] = {
     'node_modules', '__pycache__', 'dist', 'build', 'coverage', 'vendor',
     'venv', '.venv', 'env', 'target', 'bin', 'obj', 'out', 'logs',
@@ -69,16 +63,14 @@ avoid: Set[str] = {
     'eggs', 'wheels', 'htmlcov', '.tox', '.eggs', 'third_party',
 }
 
-# Whole filenames with no documentable content. Exact match, case-insensitive.
+# Exact filenames, lowercased.
 skip_files: Set[str] = {
     'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock',
     'uv.lock', 'cargo.lock', 'composer.lock', 'gemfile.lock',
     '.ds_store', 'thumbs.db', '.gitkeep',
 }
 
-# Leading characters that mark a dotfile or editor artefact. '_' is deliberately
-# absent: it was removing every __init__.py, which is the file that defines a
-# Python package's public surface.
+# No '_': it was eating every __init__.py.
 prefix: List[str] = ['.', '~']
 suffix: List[str] = [
     '.log', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.gif', '.webp',
@@ -88,22 +80,21 @@ suffix: List[str] = [
     '.md', '.css'
 ]
 
-# Names the caller explicitly forced back in via --include.
-forced: Set[str] = set()
-
-# Every path this run declined to read, so the user can see what was dropped.
-skipped: List[str] = []
+forced: Set[str] = set()   # forced back in by --include
+skipped: List[str] = []    # reported at end of run
 
 
-# HTTP statuses where trying another model cannot help.
-_FATAL = frozenset({400, 401, 403})
-
-# Models this run has proven unusable, so we stop paying to rediscover that.
-dead_models: Set[str] = set()
+_FATAL = frozenset({400, 401, 403})   # another model cannot help
+dead_models: Set[str] = set()         # 404'd this run, skip them
 
 
 def _status_of(err: Exception) -> Optional[int]:
-    """Best-effort HTTP status from an SDK exception."""
+    """Pull the HTTP status off an SDK exception.
+
+    The SDK puts it on `.code`, `.status_code` or `.response.status_code`
+    depending on the failure, so all three are tried. None means the error
+    carried no status and should be treated as retryable.
+    """
     for attr in ('code', 'status_code'):
         value = getattr(err, attr, None)
         if isinstance(value, int):
@@ -114,10 +105,11 @@ def _status_of(err: Exception) -> Optional[int]:
 
 
 def _text_of(response: object) -> Optional[str]:
-    """Extract markdown from a response, or None when it carried no content.
+    """Return the markdown a response carried, or None if it carried none.
 
-    `response.text` is None whenever finishReason is SAFETY or MAX_TOKENS,
-    because the candidate has no parts at all.
+    `.text` is None whenever finishReason is SAFETY or MAX_TOKENS, because the
+    candidate then has no parts at all. Callers must treat None as "this model
+    produced nothing", not as a transport error.
     """
     text = getattr(response, 'text', None)
     if not text:
@@ -126,7 +118,12 @@ def _text_of(response: object) -> Optional[str]:
 
 
 def GenerateReadMe(file: str, code: str, readme: str) -> str:
-    """Generate markdown docs using Gemini with fallback model sequence."""
+    """Ask Gemini for this file's markdown, escalating models only when needed.
+
+    Walks MODELS cheapest first. A fatal status aborts the run outright, a 404
+    retires that model, anything else falls through to the next one. Returns a
+    placeholder rather than raising so one bad file cannot end the run.
+    """
     if client is None:
         return f"# {file}\n\n⚠️ Failed to generate documentation. API client is not initialized."
 
@@ -149,22 +146,17 @@ def GenerateReadMe(file: str, code: str, readme: str) -> str:
             last_error = err
             status = _status_of(err)
             if status in _FATAL:
-                # Bad key or disabled API: every other model fails identically,
-                # so escalating burns 7 more requests to learn nothing.
                 exception(f"{status} from Gemini; aborting. Check your API key.")
                 raise SystemExit(2)
             if status == 404:
-                # Model does not exist for this key. Never retry it this run.
                 dead_models.add(model_name)
             continue
 
         text = _text_of(response)
         if text is not None:
             return text
-        # A 200 with no parts (SAFETY / MAX_TOKENS) is not a transport failure;
-        # a larger model will not fix it.
         info(f"{model_name} returned no content for {file}")
-        break
+        break   # empty candidate; a bigger model will not fix it
 
     exception(f"Error generating README for {file}: {last_error}")
     return f"# {file}\n\nDocumentation could not be generated for this file."
@@ -331,11 +323,11 @@ def LookFolder(base: str) -> None:
 
 
 def Look(include: str, exclude: str) -> None:
-    """Apply the user's include/exclude filters.
+    """Fold --include / --exclude into the filter lists.
 
-    These were inverted: `--include foo` appended foo to the *skip* list and
-    `--exclude foo` removed it, so both flags did the opposite of their help
-    text. They now mean what they say.
+    --include forces a name back in whatever else says; --exclude adds it to the
+    skip set, or to the extension list when it starts with a dot. Both were
+    previously inverted and did the opposite of their help text.
     """
     try:
         for item in (i.strip().lower() for i in include.split(',')):
@@ -359,10 +351,11 @@ def Look(include: str, exclude: str) -> None:
 
 
 def IsValid(entry: str, is_dir: bool = False) -> bool:
-    """Return True when a file/folder name passes the configured filters.
+    """Decide whether one directory entry is worth reading.
 
-    Matching is by whole path segment, not substring. `--include` forces a name
-    back in and wins over every other rule.
+    Matches whole path segments, never substrings, so `out` no longer removes
+    routes.py and `lib` no longer removes library.ts. --include wins over every
+    other rule. Rejected names are recorded in `skipped` for the run summary.
     """
     name = entry.lower()
 
@@ -387,8 +380,7 @@ def IsValid(entry: str, is_dir: bool = False) -> bool:
         skipped.append(entry)
         return False
 
-    # A file sharing a name with a skipped directory (e.g. `build.py`, `out.go`)
-    # is still source and is kept; only the bare name is rejected.
+    # `build.py` and `out.go` survive; only a bare `build` or `out` does not.
     if name in avoid:
         skipped.append(entry)
         return False
