@@ -1,7 +1,9 @@
 from argparse import ArgumentParser, Namespace
 from logging import INFO, WARNING, basicConfig, exception, getLogger, info
-from os import chdir, curdir, getcwd, listdir, makedirs, scandir
+from getpass import getpass
+from os import chdir, curdir, environ, getcwd, listdir, makedirs, scandir
 from os.path import abspath, dirname, exists, getsize, isdir, join, splitext
+from sys import stdin
 from typing import List, Optional, Set
 
 from google.genai import Client
@@ -388,6 +390,29 @@ def IsValid(entry: str, is_dir: bool = False) -> bool:
     return True
 
 
+def resolve_api_key(explicit: str = '') -> str:
+    """Find a Gemini key: flag, then environment, then an interactive prompt.
+
+    The prompt is only reached on a terminal. Without a TTY this raises instead
+    of blocking forever, which is what made the tool unusable in CI. getpass
+    keeps the key out of the scrollback.
+    """
+    if explicit:
+        return explicit.strip()
+
+    for var in ('GEMINI_API_KEY', 'GOOGLE_API_KEY'):
+        value = environ.get(var, '').strip()
+        if value:
+            info(f"Using API key from ${var}")
+            return value
+
+    if not stdin.isatty():
+        raise SystemExit(
+            "No API key. Pass --api-key or set GEMINI_API_KEY."
+        )
+    return getpass("Paste your Google Gemini API Key: ").strip()
+
+
 def main() -> None:
     """CLI entrypoint for docs generation workflow."""
     try:
@@ -445,7 +470,13 @@ def main() -> None:
             "--include",
             type=str,
             default='',
-            help="Folders, files, extensionse to include ((e.g., docs, ext, setting, config)"
+            help="Folders, files, extensions to force include (e.g., tests, build)"
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default='',
+            help="Gemini API key (else $GEMINI_API_KEY, else prompt)"
         )
 
         global client
@@ -472,7 +503,7 @@ def main() -> None:
             f"keywords: {args.keywords}"
         )
 
-        client = Client(api_key=input("Paste your Google Gemini API Key here:").strip())
+        client = Client(api_key=resolve_api_key(args.api_key))
         print(f"📁 Starting in: {args.path}")
         makedirs(DOCS_BASE, exist_ok=True)
         chdir(args.path)
