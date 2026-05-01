@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from devdocs.errors import StorageError
-from devdocs.index import Database, SCHEMA_VERSION
+from devdocs.index import SCHEMA_VERSION, Database
 
 
 class TestMigrations(unittest.TestCase):
@@ -63,17 +63,15 @@ class TestBehaviour(unittest.TestCase):
         self.assertEqual(mode.lower(), "wal")
 
     def test_foreign_keys_are_enforced(self) -> None:
-        with self.assertRaises(StorageError):
-            with self.db.transaction() as conn:
-                conn.execute(
-                    "INSERT INTO run_item(run_id, source, kind) VALUES('ghost','a','file')"
-                )
+        with self.assertRaises(StorageError), self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO run_item(run_id, source, kind) VALUES('ghost','a','file')"
+            )
 
     def test_transaction_rolls_back_on_error(self) -> None:
-        with self.assertRaises(RuntimeError):
-            with self.db.transaction() as conn:
-                conn.execute("INSERT INTO run(id, started_at) VALUES('r1', 1.0)")
-                raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError), self.db.transaction() as conn:
+            conn.execute("INSERT INTO run(id, started_at) VALUES('r1', 1.0)")
+            raise RuntimeError("boom")
         count = self.db.connection.execute("SELECT count(*) FROM run").fetchone()[0]
         self.assertEqual(count, 0)
 
@@ -85,8 +83,8 @@ class TestBehaviour(unittest.TestCase):
             )
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM run WHERE id='r1'")
-        count = self.db.connection.execute("SELECT count(*) FROM run_item").fetchone()[0]
-        self.assertEqual(count, 0)
+        rows = self.db.connection.execute("SELECT count(*) FROM run_item")
+        self.assertEqual(rows.fetchone()[0], 0)
 
     def test_concurrent_writers_all_commit(self) -> None:
         errors: list[str] = []

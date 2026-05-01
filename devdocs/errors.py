@@ -12,14 +12,14 @@ rules as the Python API.
 from __future__ import annotations
 
 __all__ = [
-    "DevDocsError",
-    "ConfigError",
     "AuthError",
+    "BudgetExceeded",
+    "ConfigError",
+    "DevDocsError",
+    "ModelNotFound",
+    "ParseError",
     "ProviderError",
     "RateLimited",
-    "ModelNotFound",
-    "BudgetExceeded",
-    "ParseError",
     "StorageError",
     "exit_code_for",
 ]

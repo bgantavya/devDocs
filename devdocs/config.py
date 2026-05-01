@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,7 @@ def load_config(
     overrides: dict[str, Any] | None = None,
     *,
     config_file: Path | None = None,
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> Config:
     """Build a Config from defaults, then the file, then flags.
 
@@ -165,7 +166,6 @@ def load_config(
     means the flag was absent, so it never masks a configured value. `env` is
     injectable so tests need not mutate os.environ.
     """
-    env = os.environ if env is None else env
     config = Config()
     known = {f.name for f in fields(Config)} - {"sources", "key_source"}
 
@@ -196,7 +196,7 @@ def resolve_api_key(
     config: Config,
     *,
     explicit: str = "",
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
     demo_key: str | None = None,
 ) -> tuple[str, KeySource]:
     """Find a usable API key and say where it came from.
@@ -205,13 +205,13 @@ def resolve_api_key(
     file, then the bundled demo key. The demo key is last and is reported as
     shared so the caller can warn; it exists so a first run needs no signup.
     """
-    env = os.environ if env is None else env
+    environment: Mapping[str, str] = os.environ if env is None else env
 
     if explicit.strip():
         return explicit.strip(), KeySource("flag")
 
     for var in _ENV_KEYS.get(config.provider, ()):
-        value = env.get(var, "").strip()
+        value = environment.get(var, "").strip()
         if value:
             return value, KeySource("env", var)
 

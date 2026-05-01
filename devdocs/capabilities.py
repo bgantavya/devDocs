@@ -13,8 +13,8 @@ from __future__ import annotations
 import sqlite3
 import ssl
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 __all__ = ["Capability", "Report", "probe_all"]
 
@@ -135,7 +135,6 @@ def _sqlite_threads() -> Capability:
 
 def _tls() -> Capability:
     """TLS 1.3 is not required, but its absence dates the interpreter."""
-    context = ssl.create_default_context()
     has13 = getattr(ssl, "HAS_TLSv1_3", False)
     return Capability(
         "tls",

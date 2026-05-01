@@ -5,6 +5,6 @@ Repositories receive that connection and never open, commit, or migrate on
 their own, so there is exactly one schema and one transaction boundary.
 """
 
-from devdocs.index.db import Database, MIGRATIONS, SCHEMA_VERSION
+from devdocs.index.db import MIGRATIONS, SCHEMA_VERSION, Database
 
-__all__ = ["Database", "MIGRATIONS", "SCHEMA_VERSION"]
+__all__ = ["MIGRATIONS", "SCHEMA_VERSION", "Database"]
