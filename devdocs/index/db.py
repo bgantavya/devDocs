@@ -21,7 +21,7 @@ from pathlib import Path
 
 from devdocs.errors import StorageError
 
-__all__ = ["Database", "MIGRATIONS", "SCHEMA_VERSION"]
+__all__ = ["MIGRATIONS", "SCHEMA_VERSION", "Database"]
 
 # Append only. Index + 1 is the user_version a migration produces.
 MIGRATIONS: tuple[str, ...] = (

@@ -51,7 +51,8 @@ class TestPrecedence(unittest.TestCase):
         self.assertEqual(config.quality, "balanced")
 
     def test_bare_table_without_devdocs_section(self) -> None:
-        config = load_config(config_file=write_config('provider = "anthropic"\n'), env={})
+        path = write_config('provider = "anthropic"\n')
+        config = load_config(config_file=path, env={})
         self.assertEqual(config.provider, "anthropic")
 
     def test_hyphenated_keys_map_to_underscores(self) -> None:

@@ -40,6 +40,15 @@ dependencies = [
   "httpx"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.16",
+  "mypy>=1.19",
+  "bandit>=1.8",
+  "pip-audit>=2.9",
+  "coverage>=7.10",
+]
+
 [project.urls]
 Homepage = "https://github.com/bgantavya/devDocs"
 Repository = "https://github.com/bgantavya/devDocs"
@@ -50,5 +59,31 @@ Documentation = "https://github.com/bgantavya/devDocs#readme"
 devDocs = "devdocs.legacy:main"
 
 [tool.setuptools]
-packages = ["devdocs"]
+packages = ["devdocs", "devdocs.index"]
 include-package-data = true
+
+[tool.setuptools.package-data]
+devdocs = ["py.typed"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+extend-exclude = ["devdocs/legacy.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["devdocs"]
+# legacy.py is the frozen v3 entry point and is not held to strict typing.
+exclude = ["devdocs/legacy\\.py$"]
+
+[tool.coverage.run]
+source = ["devdocs"]
+omit = ["devdocs/legacy.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
