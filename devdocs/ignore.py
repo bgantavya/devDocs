@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-__all__ = ["Rule", "GitignoreMatcher"]
+__all__ = ["GitignoreMatcher", "Rule"]
 
 
 def _translate(pattern: str) -> str:
@@ -118,9 +118,7 @@ class Rule:
         stripped = stripped.replace("\\ ", " ")
 
         negated = stripped.startswith("!")
-        if negated:
-            stripped = stripped[1:]
-        elif stripped.startswith("\\!"):
+        if negated or stripped.startswith("\\!"):
             stripped = stripped[1:]
 
         dir_only = stripped.endswith("/")
@@ -158,7 +156,9 @@ class GitignoreMatcher:
         return cls([rule for rule in parsed if rule is not None])
 
     @classmethod
-    def from_root(cls, root: Path, *, extra: list[str] | None = None) -> GitignoreMatcher:
+    def from_root(
+        cls, root: Path, *, extra: list[str] | None = None
+    ) -> GitignoreMatcher:
         """Collect every .gitignore under `root`, plus `.git/info/exclude`.
 
         Nested files are recorded with their directory as `base` so their rules
