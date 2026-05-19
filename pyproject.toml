@@ -59,7 +59,7 @@ Documentation = "https://github.com/bgantavya/devDocs#readme"
 devDocs = "devdocs.legacy:main"
 
 [tool.setuptools]
-packages = ["devdocs", "devdocs.index"]
+packages = ["devdocs", "devdocs.index", "devdocs.parse"]
 include-package-data = true
 
 [tool.setuptools.package-data]

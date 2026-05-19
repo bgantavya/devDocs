@@ -13,6 +13,7 @@ and signatures rather than free text.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -43,12 +44,15 @@ class SymbolKind(StrEnum):
 class Confidence(StrEnum):
     """How far to trust the facts from this file.
 
-    EXACT means a real parser produced them. DEGRADED means a fallback did, so
-    the symbol table may be incomplete and the renderer must not claim
-    completeness. FAILED means nothing usable came out.
+    EXACT means a real parser produced them. HEURISTIC means a pattern scanner
+    did: every name it reports is real, but it can miss unusual declarations.
+    DEGRADED means a fallback ran after the real parser failed, so the symbol
+    table may be incomplete and the renderer must not claim completeness.
+    FAILED means nothing usable came out.
     """
 
     EXACT = "exact"
+    HEURISTIC = "heuristic"
     DEGRADED = "degraded"
     FAILED = "failed"
 
@@ -149,21 +153,46 @@ class Parser(Protocol):
 
 
 _REGISTRY: dict[str, Parser] = {}
+_BUILTINS: dict[str, bool] = {"loaded": False}
+_BUILTINS_LOCK = threading.Lock()
 
 
-def register(parser: Parser) -> Parser:
+def register(parser: Parser, *, replace: bool = True) -> Parser:
     """Register a parser for each language it declares. Returns it unchanged.
 
-    Usable as a decorator on the class, since it hands the object back.
+    A user registration replaces whatever is there. Built-ins pass
+    `replace=False`, because they load lazily and may run *after* a user has
+    already registered their own parser for the same language.
     """
     for language in parser.languages:
-        _REGISTRY[language] = parser
+        if replace or language not in _REGISTRY:
+            _REGISTRY[language] = parser
     return parser
 
 
+def _load_builtins() -> None:
+    """Import the built-in parser modules once; each registers on import.
+
+    Deferred to first use because those modules import this package, so
+    importing them at the top would be circular. The flag is set under a lock
+    and only once the imports finish, so a thread arriving mid-import waits
+    for a full registry instead of reading an empty one, and a failed import
+    is retried on the next call.
+    """
+    if _BUILTINS["loaded"]:
+        return
+    with _BUILTINS_LOCK:
+        if _BUILTINS["loaded"]:
+            return
+        from devdocs.parse import languages, python  # noqa: F401
+        _BUILTINS["loaded"] = True
+
+
 def get_parser(language: str) -> Parser | None:
+    _load_builtins()
     return _REGISTRY.get(language)
 
 
 def supported_languages() -> tuple[str, ...]:
+    _load_builtins()
     return tuple(sorted(_REGISTRY))
