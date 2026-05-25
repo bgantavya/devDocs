@@ -19,6 +19,7 @@ __all__ = [
     "ModelNotFound",
     "ParseError",
     "ProviderError",
+    "QuotaExhausted",
     "RateLimited",
     "StorageError",
     "exit_code_for",
@@ -56,7 +57,13 @@ class AuthError(DevDocsError):
 
 
 class ProviderError(DevDocsError):
-    """Provider failed for a reason that is not the caller's fault."""
+    """Provider or network failed for a reason that is not the caller's fault.
+
+    `retryable` decides whether a second attempt can help. By default it
+    follows the status: none (a network failure), 429 and 5xx are worth
+    retrying; other 4xx are not. Pass it explicitly when the status alone
+    misleads, e.g. a TLS certificate failure has no status but never heals.
+    """
 
     exit_code = 4
 
@@ -67,10 +74,18 @@ class ProviderError(DevDocsError):
         status: int | None = None,
         provider: str | None = None,
         hint: str | None = None,
+        retryable: bool | None = None,
     ) -> None:
         super().__init__(message, hint=hint)
         self.status = status
         self.provider = provider
+        self._retryable = retryable
+
+    @property
+    def retryable(self) -> bool:
+        if self._retryable is not None:
+            return self._retryable
+        return self.status is None or self.status == 429 or self.status >= 500
 
 
 class RateLimited(ProviderError):
@@ -94,6 +109,43 @@ class ModelNotFound(ProviderError):
     """404 for a model id. Retired for the rest of the run rather than retried."""
 
     exit_code = 6
+
+    def __init__(
+        self, message: str, *, status: int | None = 404, provider: str | None = None
+    ) -> None:
+        super().__init__(message, status=status, provider=provider, retryable=False)
+
+
+class QuotaExhausted(ProviderError):
+    """A daily or plan quota is used up. Waiting minutes will not help.
+
+    Distinct from RateLimited so the run stops cleanly and can resume from the
+    ledger tomorrow, instead of sleeping inside a request until a timeout.
+    The default hint names a command the CLI accepts: `devdocs generate`
+    resumes by default. A 402 is a billing problem, which no wait fixes.
+    """
+
+    exit_code = 10
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = 429,
+        provider: str | None = None,
+        hint: str | None = None,
+    ) -> None:
+        if hint is None:
+            hint = (
+                "fix the account's billing, then run `devdocs generate` again "
+                "(it resumes where it stopped)"
+                if status == 402 else
+                "run `devdocs generate` again once the quota resets (it resumes "
+                "where it stopped), or use a paid key"
+            )
+        super().__init__(
+            message, status=status, provider=provider, retryable=False, hint=hint
+        )
 
 
 class BudgetExceeded(DevDocsError):
