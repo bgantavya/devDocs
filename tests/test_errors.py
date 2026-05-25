@@ -12,14 +12,15 @@ from devdocs.errors import (
     ModelNotFound,
     ParseError,
     ProviderError,
+    QuotaExhausted,
     RateLimited,
     StorageError,
     exit_code_for,
 )
 
-ALL = (
+ALL: tuple[type[DevDocsError], ...] = (
     DevDocsError, ConfigError, AuthError, ProviderError, RateLimited,
-    ModelNotFound, BudgetExceeded, ParseError, StorageError,
+    ModelNotFound, BudgetExceeded, ParseError, StorageError, QuotaExhausted,
 )
 
 
@@ -30,10 +31,10 @@ class TestExitCodes(unittest.TestCase):
 
     def test_codes_are_stable(self) -> None:
         # Changing any of these is a breaking change for callers.
-        expected = {
+        expected: dict[type[DevDocsError], int] = {
             DevDocsError: 1, ConfigError: 2, AuthError: 3, ProviderError: 4,
             RateLimited: 5, ModelNotFound: 6, BudgetExceeded: 7, ParseError: 8,
-            StorageError: 9,
+            StorageError: 9, QuotaExhausted: 10,
         }
         for cls, code in expected.items():
             self.assertEqual(cls.exit_code, code, cls.__name__)
@@ -54,8 +55,30 @@ class TestHierarchy(unittest.TestCase):
             self.assertTrue(issubclass(cls, DevDocsError))
 
     def test_provider_failures_share_a_base(self) -> None:
-        for cls in (RateLimited, ModelNotFound):
+        for cls in (RateLimited, ModelNotFound, QuotaExhausted):
             self.assertTrue(issubclass(cls, ProviderError))
+
+
+class TestRetryable(unittest.TestCase):
+    def test_network_failure_without_status_is_retryable(self) -> None:
+        self.assertTrue(ProviderError("dns").retryable)
+
+    def test_rate_limit_and_server_errors_are_retryable(self) -> None:
+        self.assertTrue(RateLimited("slow", status=429).retryable)
+        self.assertTrue(ProviderError("down", status=503).retryable)
+        self.assertTrue(ProviderError("overloaded", status=529).retryable)
+
+    def test_client_errors_are_not(self) -> None:
+        self.assertFalse(ProviderError("bad request", status=400).retryable)
+        self.assertFalse(ModelNotFound("no such model").retryable)
+
+    def test_explicit_flag_overrides_status(self) -> None:
+        # A certificate failure has no status but will never heal on retry.
+        self.assertFalse(ProviderError("tls", retryable=False).retryable)
+
+    def test_spent_quota_is_not_retryable(self) -> None:
+        self.assertFalse(QuotaExhausted("daily limit").retryable)
+        self.assertFalse(QuotaExhausted("billing", status=402).retryable)
 
 
 class TestPayload(unittest.TestCase):
