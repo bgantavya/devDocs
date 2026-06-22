@@ -61,8 +61,10 @@ Documentation = "https://github.com/bgantavya/devDocs#readme"
 devDocs = "devdocs.legacy:main"
 
 [tool.setuptools]
-packages = ["devdocs", "devdocs.index", "devdocs.llm", "devdocs.parse"]
 include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["devdocs*"]
 
 [tool.setuptools.package-data]
 devdocs = ["py.typed"]
