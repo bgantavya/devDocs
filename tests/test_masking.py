@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
+from devdocs.issues import comment_syntax
 from devdocs.parse import get_parser
 from devdocs.parse.languages import SPECS
 from devdocs.parse.masking import Masked, Syntax, mask
@@ -377,8 +378,10 @@ class TestRust(MaskCase):
 
 
 def _syntaxes() -> list[Syntax]:
-    """Every syntax the scanner's languages use."""
-    return [spec.syntax for spec in SPECS]
+    """Every syntax in use: the scanner's languages and the comment-only ones."""
+    found = [spec.syntax for spec in SPECS]
+    found += [comment_syntax(name) for name in ("shell", "lua", "sql", "unknown")]
+    return found
 
 
 class TestLinearTime(unittest.TestCase):
