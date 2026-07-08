@@ -67,7 +67,7 @@ include-package-data = true
 include = ["devdocs*"]
 
 [tool.setuptools.package-data]
-devdocs = ["py.typed"]
+devdocs = ["py.typed", "prompts/*.md"]
 
 [tool.ruff]
 line-length = 88
