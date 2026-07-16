@@ -88,6 +88,22 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config({"max_cost": -1.0}, config_file=None, env={})
 
+    def test_rejects_a_cost_that_is_not_a_number(self) -> None:
+        # Regression: TOML, the flag and the environment all accept nan and
+        # inf, which passed validation and crashed Budget() with a raw error.
+        for value in ("nan", "inf", "-inf"):
+            path = write_config(f"max_cost = {value}\n")
+            with self.subTest(file=value), self.assertRaises(ConfigError):
+                load_config(config_file=path, env={})
+            with self.subTest(env=value), self.assertRaises(ConfigError):
+                load_config(config_file=None, env={"DEVDOCS_MAX_COST": value})
+            with self.subTest(flag=value), self.assertRaises(ConfigError):
+                load_config({"max_cost": float(value)}, config_file=None, env={})
+
+    def test_rejects_negative_requests(self) -> None:
+        with self.assertRaises(ConfigError):
+            load_config({"max_requests": -1}, config_file=None, env={})
+
     def test_unknown_option_names_the_valid_ones(self) -> None:
         path = write_config("[devdocs]\nprovder = 1\n")
         with self.assertRaises(ConfigError) as caught:
@@ -106,7 +122,52 @@ class TestValidation(unittest.TestCase):
             load_config(config_file=path, env={})
 
 
+class TestEnvironment(unittest.TestCase):
+    def test_env_overrides_file_and_flag_overrides_env(self) -> None:
+        path = write_config('[devdocs]\nquality = "high"\nmax_cost = 1.0\n')
+        env = {"DEVDOCS_QUALITY": "balanced", "DEVDOCS_MAX_COST": "2.5"}
+        config = load_config({"max_cost": 0.1}, config_file=path, env=env)
+        self.assertEqual(config.quality, "balanced")
+        self.assertEqual(config.origin_of("quality"), "env")
+        self.assertEqual(config.max_cost, 0.1)
+        self.assertEqual(config.origin_of("max_cost"), "flag")
+
+    def test_env_values_are_typed(self) -> None:
+        env = {
+            "DEVDOCS_FREE_TIER": "off",
+            "DEVDOCS_CONCURRENCY": "8",
+            "DEVDOCS_EXCLUDE": "vendor, dist",
+            "DEVDOCS_PROVIDER": "anthropic-sdk",
+        }
+        config = load_config(config_file=None, env=env)
+        self.assertFalse(config.free_tier)
+        self.assertEqual(config.concurrency, 8)
+        self.assertEqual(config.exclude, ("vendor", "dist"))
+        self.assertEqual(config.provider, "anthropic-sdk")
+
+    def test_bad_env_values_name_the_variable(self) -> None:
+        for name, value in (("DEVDOCS_FREE_TIER", "maybe"),
+                            ("DEVDOCS_CONCURRENCY", "four")):
+            with self.subTest(name=name), self.assertRaises(ConfigError) as caught:
+                load_config(config_file=None, env={name: value})
+            self.assertIn(name, str(caught.exception))
+
+    def test_blank_env_values_are_ignored(self) -> None:
+        config = load_config(config_file=None, env={"DEVDOCS_QUALITY": "  "})
+        self.assertEqual(config.origin_of("quality"), "default")
+
+    def test_the_key_never_enters_config_from_env(self) -> None:
+        config = load_config(config_file=None, env={"DEVDOCS_API_KEY": "secret"})
+        self.assertEqual(config.api_key, "")
+
+
 class TestKeyResolution(unittest.TestCase):
+    def test_sdk_provider_reads_the_anthropic_variable(self) -> None:
+        key, source = resolve_api_key(
+            Config(provider="anthropic-sdk"), env={"ANTHROPIC_API_KEY": "ak"}
+        )
+        self.assertEqual((key, source.detail), ("ak", "ANTHROPIC_API_KEY"))
+
     def test_flag_wins_and_is_stripped(self) -> None:
         key, source = resolve_api_key(Config(), explicit="  k  ", env={})
         self.assertEqual(key, "k")
