@@ -12,6 +12,7 @@ and is never a silent default.
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -29,7 +30,11 @@ CONFIG_FILENAME = "devdocs.toml"
 _ENV_KEYS: dict[str, tuple[str, ...]] = {
     "gemini": ("DEVDOCS_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "anthropic": ("DEVDOCS_API_KEY", "ANTHROPIC_API_KEY"),
+    "anthropic-sdk": ("DEVDOCS_API_KEY", "ANTHROPIC_API_KEY"),
 }
+
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,7 @@ class Config:
     path: Path = Path(".")
     out: Path = Path("docs")
     provider: str = "gemini"
+    model: str = ""                  # pin one model for every call
     quality: str = "cheap"           # "cheap" | "balanced" | "high"
     include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
@@ -61,6 +67,8 @@ class Config:
     free_tier: bool = True           # pace requests to stay inside free limits
     per_file: bool = False           # v3-compatible one-doc-per-file layout
     formats: tuple[str, ...] = ("markdown",)
+    name: str = ""                   # project name; else read from its manifest
+    description: str = ""
     api_key: str = ""
     key_source: KeySource | None = None
     sources: dict[str, str] = field(default_factory=dict)
@@ -71,7 +79,7 @@ class Config:
 
 
 _QUALITY = {"cheap", "balanced", "high"}
-_PROVIDERS = {"gemini", "anthropic"}
+_PROVIDERS = set(_ENV_KEYS)
 _FORMATS = {"markdown", "html", "pdf"}
 
 
@@ -131,6 +139,23 @@ def _coerce(name: str, value: Any, current: Any) -> Any:
     return str(value)
 
 
+def _from_env(name: str, raw: str, current: Any) -> Any:
+    """Parse an environment string into the shape `_coerce` expects."""
+    text = raw.strip()
+    if isinstance(current, bool):
+        if text.lower() in _TRUE:
+            return True
+        if text.lower() in _FALSE:
+            return False
+        raise ConfigError(f"DEVDOCS_{name.upper()} must be true or false")
+    if isinstance(current, int | float) and not isinstance(current, bool):
+        try:
+            return int(text) if isinstance(current, int) else float(text)
+        except ValueError:
+            raise ConfigError(f"DEVDOCS_{name.upper()} must be a number") from None
+    return text
+
+
 def _validate(config: Config) -> None:
     if config.provider not in _PROVIDERS:
         raise ConfigError(
@@ -148,8 +173,17 @@ def _validate(config: Config) -> None:
             f"unknown format(s): {', '.join(sorted(unknown))}",
             hint=f"choose from: {', '.join(sorted(_FORMATS))}",
         )
+    # TOML, argparse and float() all accept nan and inf.
+    if not math.isfinite(config.max_cost):
+        raise ConfigError(
+            f"max_cost must be a number of dollars, not {config.max_cost}",
+            hint="use 0 for no cost ceiling",
+        )
     if config.max_cost < 0:
         raise ConfigError("max_cost cannot be negative")
+    if config.max_requests < 0:
+        raise ConfigError("max_requests cannot be negative",
+                          hint="use 0 for no request limit")
     if config.concurrency < 1:
         raise ConfigError("concurrency must be at least 1")
 
@@ -181,6 +215,16 @@ def load_config(
                 )
             setattr(config, name, _coerce(name, value, getattr(config, name)))
             config.sources[name] = "file"
+
+    # Keys are resolved apart by `resolve_api_key`, so never land in Config.
+    environment: Mapping[str, str] = os.environ if env is None else env
+    for name in sorted(known - {"api_key"}):
+        raw = environment.get(f"DEVDOCS_{name.upper()}", "")
+        if not raw.strip():
+            continue
+        current = getattr(config, name)
+        setattr(config, name, _coerce(name, _from_env(name, raw, current), current))
+        config.sources[name] = "env"
 
     for name, value in (overrides or {}).items():
         if value is None or name not in known:
