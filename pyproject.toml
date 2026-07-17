@@ -1,23 +1,24 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# 77+ for PEP 639 license expressions.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "devDocs"
-version = "3.0.0"
-description = "AI-powered CLI tool that builds professional '*.md' documentation files of a project for internal teams using the Google Gemini API."
+dynamic = ["version"]
+description = "Documentation from source code: exact facts from parsers, model prose only where it adds something, on a hard budget. No dependencies."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = "MIT"
+license-files = ["LICENSE"]
 
 authors = [
   { name = "Gantavya Bansal", email = "gantavyaoo@gmail.com" }
 ]
 
 keywords = [
-  "cli", "documentation", "readme", "generator", 
-  "google-gemini", "ai", "markdown", "docs-generator", 
-  "auto-readme", "open-source"
+  "cli", "documentation", "docs-generator", "llm", "gemini", "claude",
+  "markdown", "static-analysis", "code-documentation", "zero-dependency",
 ]
 
 classifiers = [
@@ -25,20 +26,20 @@ classifiers = [
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Intended Audience :: Information Technology",
-  "Topic :: Documentation",
-  "Topic :: Software Development :: Code Generators",
-  "Topic :: Software Development :: Documentation",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.11",
-  "Operating System :: OS Independent"
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Documentation",
+  "Topic :: Software Development :: Documentation",
+  "Typing :: Typed",
 ]
 
-dependencies = [
-  "google-genai",
-  "httpx"
-]
+# None, by design: everything runs on the standard library.
+dependencies = []
 
 [project.optional-dependencies]
 # Anthropic's official SDK, as an alternative to the built-in raw-HTTP client.
@@ -58,10 +59,10 @@ Issues = "https://github.com/bgantavya/devDocs/issues"
 Documentation = "https://github.com/bgantavya/devDocs#readme"
 
 [project.scripts]
-devDocs = "devdocs.legacy:main"
+devdocs = "devdocs.cli:main"
 
-[tool.setuptools]
-include-package-data = true
+[tool.setuptools.dynamic]
+version = { attr = "devdocs.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["devdocs*"]
@@ -72,7 +73,6 @@ devdocs = ["py.typed", "prompts/*.md"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
-extend-exclude = ["devdocs/legacy.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
@@ -81,8 +81,6 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 python_version = "3.11"
 strict = true
 files = ["devdocs"]
-# legacy.py is the frozen v3 entry point and is not held to strict typing.
-exclude = ["devdocs/legacy\\.py$"]
 
 # Optional extra: type-checked as Any when it is not installed.
 [[tool.mypy.overrides]]
@@ -91,7 +89,7 @@ ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["devdocs"]
-omit = ["devdocs/legacy.py"]
+branch = true
 
 [tool.coverage.report]
 fail_under = 85
