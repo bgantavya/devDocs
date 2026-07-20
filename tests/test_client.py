@@ -477,6 +477,7 @@ class TestRetiredModels(ClientCase):
 class TestResponseCache(unittest.TestCase):
     def setUp(self) -> None:
         self.db = Database(":memory:")
+        self.addCleanup(self.db.close)
         self.cache = ResponseCache(self.db)
 
     def request(self, **overrides: Any) -> Request:
@@ -522,6 +523,7 @@ class TestResponseCache(unittest.TestCase):
 class TestRunLedger(unittest.TestCase):
     def setUp(self) -> None:
         self.db = Database(":memory:")
+        self.addCleanup(self.db.close)
         self.ledger = RunLedger(self.db)
         self.items = [
             LedgerItem("a.py", "file", "h1"),
@@ -579,7 +581,9 @@ class TestRunLedger(unittest.TestCase):
 
 class TestDailyUsage(unittest.TestCase):
     def test_counts_accumulate_per_model_and_day(self) -> None:
-        usage = DailyUsage(Database(":memory:"))
+        db = Database(":memory:")
+        self.addCleanup(db.close)
+        usage = DailyUsage(db)
         usage.record("m", cost=0.1, day="2026-06-01")
         usage.record("m", cost=0.1, day="2026-06-01")
         usage.record("m", day="2026-06-02")
