@@ -134,6 +134,12 @@ class TestMigrations(unittest.TestCase):
         with Database(nested) as db:
             self.assertTrue(db.path.exists())
 
+    def test_chunk_vectors_record_their_model(self) -> None:
+        # ChunkStore keys a vector by model and size; the column must exist.
+        with Database(self.path):
+            pass
+        self.assertIn("model", columns(self.path, "chunk"))
+
 
 class TestAtomicMigrations(unittest.TestCase):
     """A migration and its version bump commit together or not at all."""
