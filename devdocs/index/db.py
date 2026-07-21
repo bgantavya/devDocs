@@ -102,6 +102,11 @@ MIGRATIONS: tuple[str, ...] = (
         PRIMARY KEY (model, day)
     );
     """,
+    # 3 — the embedding model behind each stored vector, which ChunkStore
+    # needs to tell a stale vector from a current one of the same size
+    """
+    ALTER TABLE chunk ADD COLUMN model TEXT NOT NULL DEFAULT '';
+    """,
 )
 
 SCHEMA_VERSION = len(MIGRATIONS)
