@@ -1,4 +1,4 @@
-"""Chunking, and lexical and vector search over the chunks."""
+"""Chunking, lexical and vector search, and structural context."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import unittest
 from array import array
 from pathlib import Path
 
+from devdocs.context import StructuralContext, masked_source
+from devdocs.graph import FileNode, ModuleNode, ProjectGraph
 from devdocs.index.chunk import chunk_file
 from devdocs.index.search import LexicalIndex, VectorIndex, fuse, terms
 from devdocs.parse import get_parser
@@ -119,6 +121,72 @@ class TestVectors(unittest.TestCase):
 
     def test_fuse(self) -> None:
         self.assertEqual(fuse(["a", "b", "c"], ["b", "c", "d"])[:2], ["b", "c"])
+
+
+class TestStructural(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = ProjectGraph(
+            files={
+                "shop/money.py": FileNode("shop/money.py", "python", "shop",
+                                          dependents=("shop/cart.py",)),
+                "shop/cart.py": FileNode("shop/cart.py", "python", "shop",
+                                         internal=("shop/money.py",),
+                                         entry_point="runs as a script"),
+            },
+            modules={"shop": ModuleNode("shop", ("shop/cart.py", "shop/money.py"))},
+        )
+        self.context = StructuralContext(
+            self.graph,
+            {"shop/money.py": facts("shop/money.py", MONEY),
+             "shop/cart.py": facts("shop/cart.py", CART)},
+            {"shop/money.py": MONEY, "shop/cart.py": CART},
+        )
+
+    def test_uses_skip_imports_comments_and_strings(self) -> None:
+        uses = self.context.uses("shop/money.py")
+        self.assertEqual([(u.line, u.symbol) for u in uses], [(6, "parse_amount")])
+        self.assertIn("parse_amount(price)", uses[0].text)
+
+    def test_defines_lists_signatures_of_what_is_used(self) -> None:
+        defined = self.context.defines("shop/cart.py")
+        self.assertEqual([d.symbol for d in defined], ["Money", "parse_amount"])
+        self.assertIn("def parse_amount(text: str) -> Money", defined[1].text)
+        self.assertIn('Read "12.50" as 1250 cents.', defined[1].text)
+
+    def test_budget_is_respected(self) -> None:
+        self.assertEqual(self.context.for_file("shop/cart.py", budget_tokens=5), [])
+
+    def test_lines_are_spread_over_importers(self) -> None:
+        till = (
+            "from shop.money import Money, parse_amount\n"
+            "a = parse_amount('1')\nb = Money(2)\n"
+            "c = Money(3)\nd = parse_amount('4')\n"
+        )
+        graph = ProjectGraph(files={
+            "shop/money.py": FileNode("shop/money.py", "python", "shop",
+                                      dependents=("shop/till.py", "shop/cart.py")),
+            "shop/till.py": FileNode("shop/till.py", "python", "shop"),
+            "shop/cart.py": FileNode("shop/cart.py", "python", "shop"),
+        })
+        context = StructuralContext(
+            graph, {"shop/money.py": facts("shop/money.py", MONEY)},
+            {"shop/money.py": MONEY, "shop/till.py": till, "shop/cart.py": CART},
+        )
+        uses = [(u.source, u.line) for u in context.uses("shop/money.py")]
+        self.assertEqual(
+            uses, [("shop/till.py", 2), ("shop/till.py", 3), ("shop/cart.py", 6)]
+        )
+
+    def test_entry_bodies(self) -> None:
+        bodies = self.context.entry_bodies()
+        self.assertEqual(bodies[0].source, "shop/cart.py")
+        self.assertIn("class Cart", bodies[0].text)
+
+    def test_masking_keeps_positions(self) -> None:
+        masked = masked_source(CART, "python")
+        self.assertEqual(len(masked), len(CART))
+        self.assertNotIn("comment only", masked)
+        self.assertIn("parse_amount(price)", masked)
 
 
 if __name__ == "__main__":
