@@ -1,4 +1,5 @@
-"""Chunking, lexical and vector search, and structural context."""
+"""Chunking, lexical and vector search, structural context and the retriever
+that combines them."""
 
 from __future__ import annotations
 
@@ -8,11 +9,12 @@ import unittest
 from array import array
 from pathlib import Path
 
-from devdocs.context import StructuralContext, masked_source
+from devdocs.context import Snippet, StructuralContext, masked_source
 from devdocs.graph import FileNode, ModuleNode, ProjectGraph
 from devdocs.index.chunk import chunk_file
 from devdocs.index.search import LexicalIndex, VectorIndex, fuse, terms
 from devdocs.parse import get_parser
+from devdocs.retrieve import Retriever
 
 MONEY = '''"""Money as integer cents."""
 
@@ -187,6 +189,106 @@ class TestStructural(unittest.TestCase):
         self.assertEqual(len(masked), len(CART))
         self.assertNotIn("comment only", masked)
         self.assertIn("parse_amount(price)", masked)
+
+
+REPORT = '''"""Daily sales totals, in integer cents."""
+
+
+def cents_report(amounts: list[int]) -> str:
+    """Format a list of amounts in cents as a money report."""
+    return ", ".join(f"{a / 100:.2f}" for a in amounts)
+'''
+
+# Unrelated files, so term rarity is what it would be in a real repository.
+FILLER = {
+    f"util/f{n}.py": (
+        f'"""Helpers number {n} for {word}."""\n\n\n'
+        f"def {word}_{n}(path: str) -> str:\n"
+        f'    """Normalise the {word} path."""\n    return path.strip()\n'
+    )
+    for n, word in enumerate(
+        ["paths", "strings", "logging", "retry", "config", "clock", "colour", "files"]
+    )
+}
+
+
+class TestRetriever(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sources = {"shop/money.py": MONEY, "shop/cart.py": CART,
+                        "reports/sales.py": REPORT, **FILLER}
+        self.facts = {rel: facts(rel, text) for rel, text in self.sources.items()}
+        nodes = {
+            rel: FileNode(rel, "python", rel.split("/")[0]) for rel in self.sources
+        }
+        nodes["shop/money.py"] = FileNode("shop/money.py", "python", "shop",
+                                          dependents=("shop/cart.py",))
+        nodes["shop/cart.py"] = FileNode("shop/cart.py", "python", "shop",
+                                         internal=("shop/money.py",))
+        self.structural = StructuralContext(
+            ProjectGraph(files=nodes), self.facts, self.sources
+        )
+        self.chunks = [
+            chunk for rel in sorted(self.sources)
+            for chunk in chunk_file(rel, self.sources[rel], self.facts[rel])
+        ]
+
+    def test_file_context_is_exact_first_then_related(self) -> None:
+        retriever = Retriever(self.structural, chunks=self.chunks,
+                              lexical=LexicalIndex(self.chunks))
+        found = retriever.for_file("shop/money.py", self.facts["shop/money.py"])
+        self.assertEqual([(s.kind, s.source) for s in found], [
+            ("uses", "shop/cart.py"),
+            ("related", "reports/sales.py"),
+            ("related", "reports/sales.py"),
+        ])
+        self.assertEqual(found[2].text, "def cents_report(amounts: list[int]) -> str:")
+
+    def test_module_context_comes_from_elsewhere(self) -> None:
+        retriever = Retriever(self.structural, chunks=self.chunks,
+                              lexical=LexicalIndex(self.chunks))
+        found = retriever.for_module(("shop/cart.py", "shop/money.py"), self.facts)
+        self.assertTrue(found)
+        self.assertTrue(all(s.source == "reports/sales.py" for s in found))
+
+    def test_semantic_neighbours_need_no_query_embedding(self) -> None:
+        def vector(source: str) -> array[float]:
+            near = {"shop/money.py": (1.0, 0.0, 0.0),
+                    "reports/sales.py": (0.8, 0.6, 0.0),
+                    "shop/cart.py": (0.9, 0.0, 0.1)}
+            return array("f", near.get(source, (0.0, 0.0, 1.0)))
+
+        vectors = {chunk.id: vector(chunk.source) for chunk in self.chunks}
+        index = VectorIndex(list(vectors), list(vectors.values()))
+        retriever = Retriever(self.structural, chunks=self.chunks, vectors=index,
+                              vector_of=vectors)
+        found = retriever.for_file("shop/money.py", self.facts["shop/money.py"])
+        related = {s.source for s in found if s.kind == "related"}
+        self.assertEqual(related, {"reports/sales.py"})   # cart.py is a neighbour
+
+    def test_rich_exact_context_needs_no_related_code(self) -> None:
+        exact = [Snippet("shop/cart.py", n, f"use {n}", "uses", "Money")
+                 for n in (1, 2, 3)]
+
+        class Rich(StructuralContext):
+            def for_file(
+                self, relpath: str, *, budget_tokens: int = 600
+            ) -> list[Snippet]:
+                return exact
+
+        rich = Rich(self.structural.graph, self.facts, self.sources)
+        retriever = Retriever(rich, chunks=self.chunks,
+                              lexical=LexicalIndex(self.chunks))
+        self.assertEqual(
+            retriever.for_file("shop/money.py", self.facts["shop/money.py"]), exact
+        )
+
+    def test_structure_alone_and_the_budget(self) -> None:
+        retriever = Retriever(self.structural)
+        self.assertEqual([s.kind for s in retriever.for_file(
+            "shop/money.py", self.facts["shop/money.py"])], ["uses"])
+        self.assertEqual(retriever.for_module(("shop/cart.py",), self.facts), [])
+        self.assertEqual(retriever.for_file(
+            "shop/money.py", self.facts["shop/money.py"], budget_tokens=0), [])
 
 
 if __name__ == "__main__":
