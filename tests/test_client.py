@@ -120,6 +120,38 @@ class TestHappyPath(ClientCase):
         self.assertEqual(DailyUsage(self.db).requests("gemini-2.5-flash-lite"), 1)
 
 
+class TestIdentity(ClientCase):
+    def test_an_answer_is_cached_under_its_identity(self) -> None:
+        client, model = self.make({LITE: ok(LITE)})
+        client.complete(Tier.FILE, "SYS", "file A + context 1", identity="file A")
+        again = client.complete(Tier.FILE, "SYS", "file A + context 2",
+                                identity="file A")
+        self.assertTrue(again.cached)
+        self.assertEqual(len(model.calls), 1)
+
+    def test_quote_and_cached_read_the_same_identity(self) -> None:
+        client, _ = self.make({LITE: ok(LITE)})
+        client.complete(Tier.FILE, "SYS", "file A + context 1", identity="file A")
+        quote = client.quote(Tier.FILE, "SYS", "file A + context 2", identity="file A")
+        self.assertTrue(quote.cached)
+        hit = client.cached(Tier.FILE, "SYS", "file A + context 2", identity="file A")
+        self.assertIsNotNone(hit)
+        self.assertIsNone(client.cached(Tier.FILE, "SYS", "file A + context 2"))
+
+    def test_the_prompt_sent_is_the_full_one(self) -> None:
+        sent: list[str] = []
+
+        class Recording(Scripted):
+            def generate(self, request: Request) -> Completion:
+                sent.append(request.prompt)
+                return super().generate(request)
+
+        client, _ = self.make({LITE: ok(LITE)})
+        client.model = Recording({LITE: ok(LITE)})
+        client.complete(Tier.FILE, "SYS", "file A + context", identity="file A")
+        self.assertEqual(sent, ["file A + context"])
+
+
 class TestEscalation(ClientCase):
     def test_empty_answer_climbs_one_rung(self) -> None:
         client, _ = self.make({

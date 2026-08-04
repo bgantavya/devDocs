@@ -116,6 +116,12 @@ class LLMClient:
         assert self.cache is not None
         return self.cache.key(request, provider=self.model.provider)
 
+    def _keyed(
+        self, info: ModelInfo, system: str, text: str, max_output: int
+    ) -> str:
+        """The cache key of a call whose prompt is identified by `text`."""
+        return self._key(self._request(info, system, text, max_output, ""))
+
     def discover(self) -> set[str]:
         """Ask the provider which models this key can use, and route only to those.
 
@@ -181,7 +187,13 @@ class LLMClient:
         )
 
     def quote(
-        self, tier: Tier, system: str, prompt: str, *, max_output_tokens: int = 800
+        self,
+        tier: Tier,
+        system: str,
+        prompt: str,
+        *,
+        max_output_tokens: int = 800,
+        identity: str | None = None,
     ) -> Quote:
         """Price a call the way `complete` would make it, without sending it.
 
@@ -193,9 +205,10 @@ class LLMClient:
         self._thaw()
         candidates = self.router.candidates(tier)
         if self.cache is not None:
+            text = prompt if identity is None else identity
             for info in candidates:
-                request = self._request(info, system, prompt, max_output_tokens, "")
-                if self.cache.get(self._key(request)) is not None:
+                key = self._keyed(info, system, text, max_output_tokens)
+                if self.cache.get(key) is not None:
                     return Quote(info.id, 0, 0, 0.0, cached=True)
         info = self._rungs(tier, candidates)[0]
         request = self._request(info, system, prompt, max_output_tokens, "")
@@ -212,6 +225,7 @@ class LLMClient:
         *,
         max_output_tokens: int = 800,
         accept: Callable[[str], bool] | None = None,
+        identity: str | None = None,
     ) -> Completion | None:
         """The answer `complete` would return from the cache, without sending.
 
@@ -223,24 +237,23 @@ class LLMClient:
         def usable(completion: Completion) -> bool:
             return completion.ok and (accept is None or accept(completion.text or ""))
 
+        text = prompt if identity is None else identity
         return self._cached(
-            self.router.candidates(tier), system, prompt, max_output_tokens, "", usable
+            self.router.candidates(tier), system, text, max_output_tokens, usable
         )
 
     def _cached(
         self,
         candidates: list[ModelInfo],
         system: str,
-        prompt: str,
+        text: str,
         max_output_tokens: int,
-        tag: str,
         usable: Callable[[Completion], bool],
     ) -> Completion | None:
         if self.cache is None:
             return None
         for info in candidates:
-            request = self._request(info, system, prompt, max_output_tokens, tag)
-            hit = self.cache.get(self._key(request))
+            hit = self.cache.get(self._keyed(info, system, text, max_output_tokens))
             if hit is not None and usable(hit):
                 return hit
         return None
@@ -254,12 +267,15 @@ class LLMClient:
         max_output_tokens: int = 800,
         tag: str = "",
         accept: Callable[[str], bool] | None = None,
+        identity: str | None = None,
     ) -> Completion:
         """Get a completion for `prompt` as cheaply as the rules allow.
 
         `accept` lets the caller reject text that arrived but is unusable to
         it (unparseable, empty after cleaning); a rejected answer escalates
-        like an empty one and is never cached. Returns a Completion whose
+        like an empty one and is never cached. `identity`, when given, is what
+        the answer is cached under instead of `prompt`, so reference material
+        that changes often does not void it. Returns a Completion whose
         `text` may be None (blocked, refused, or no rung produced anything).
         Raises AuthError, BudgetExceeded, QuotaExhausted (also once quota has
         retired every model the request could use) and non-retryable
@@ -271,7 +287,8 @@ class LLMClient:
         def usable(completion: Completion) -> bool:
             return completion.ok and (accept is None or accept(completion.text or ""))
 
-        hit = self._cached(candidates, system, prompt, max_output_tokens, tag, usable)
+        text = prompt if identity is None else identity
+        hit = self._cached(candidates, system, text, max_output_tokens, usable)
         if hit is not None:
             self._emit("cache-hit", hit.model, tag)
             return hit
@@ -312,7 +329,9 @@ class LLMClient:
 
             if usable(completion):
                 if self.cache is not None:
-                    self.cache.put(self._key(request), completion)
+                    self.cache.put(
+                        self._keyed(rung, system, text, max_output_tokens), completion
+                    )
                 return completion
             last = completion
             if completion.finish in _TERMINAL:
