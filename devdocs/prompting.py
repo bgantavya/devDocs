@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from importlib import resources
 
 from devdocs.compose import docstring_summary, first_sentence
+from devdocs.context import Snippet
 from devdocs.graph import FileNode, ProjectGraph, is_stdlib
 from devdocs.llm.budget import estimate_tokens
 from devdocs.llm.catalog import Tier
@@ -91,6 +92,13 @@ class Prompt:
     system: str
     user: str
     max_output_tokens: int
+    identity: str = ""        # `user` without retrieved context, if it has any
+
+    @property
+    def cache_text(self) -> str:
+        """What a cached answer is keyed on: the prompt minus retrieved
+        context, so an edit to a neighbour does not buy this answer again."""
+        return self.identity or self.user
 
 
 def system_prompt(kind: str) -> str:
@@ -157,9 +165,10 @@ class PromptBuilder:
         facts: FileFacts,
         source: str,
         node: FileNode | None,
+        context: Sequence[Snippet] = (),
     ) -> Prompt:
         """The prompt for one file: its place in the graph, the symbols to
-        describe, and its source trimmed to `source_tokens`."""
+        describe, retrieved context, and its source trimmed to `source_tokens`."""
         lines = self._project()
         loc = facts.loc or (source.count("\n") + 1 if source else 0)
         shape = ", ".join(
@@ -178,10 +187,10 @@ class PromptBuilder:
             notes = [_one_line(note) for note in facts.notes if note.strip()]
             lines.append("; ".join([f"Parse: {facts.confidence.value}", *notes]))
         lines.append(f"Describe: {', '.join(plan.describe) or _NO_SYMBOLS}")
+        at = len(lines)
 
         text, cut = excerpt(source, facts, self.source_tokens)
-        longest = max((len(run) for run in _BACKTICKS.findall(text)), default=0)
-        fence = "`" * max(3, longest + 1)
+        fence = _fence(text)
         lines += [
             "",
             "Source (excerpt; bodies trimmed to fit):" if cut else "Source:",
@@ -189,12 +198,17 @@ class PromptBuilder:
             *([text] if text else []),
             fence,
         ]
+        reference = _context(
+            "How other files use this one, and what it calls (for its role; "
+            "do not describe them):", context,
+        )
         return Prompt(
             kind="file",
             key=plan.relpath,
             tier=Tier.FILE,
             system=system_prompt("file"),
-            user="\n".join(lines),
+            user="\n".join([*lines[:at], *reference, *lines[at:]]),
+            identity="\n".join(lines) if reference else "",
             max_output_tokens=min(1400, max(256, 200 + 45 * len(plan.describe))),
         )
 
@@ -204,6 +218,7 @@ class PromptBuilder:
         graph: ProjectGraph,
         summaries: Mapping[str, str],
         facts: Mapping[str, FileFacts],
+        context: Sequence[Snippet] = (),
     ) -> Prompt:
         """`summaries` maps each file to its one-sentence purpose, if known.
         Past 100 files, the most imported are listed and the rest counted."""
@@ -245,12 +260,16 @@ class PromptBuilder:
         lines += _block("Entry points:", entries, _ENTRY_POINTS)
         lines += _listed("Submodules", self._submodules(graph).get(plan.path, []),
                          _SUBMODULES)
+        reference = _context(
+            "Related code elsewhere (reference only; do not describe it):", context
+        )
         return Prompt(
             kind="module",
             key=plan.path,
             tier=Tier.MODULE,
             system=system_prompt("module"),
-            user="\n".join(lines),
+            user="\n".join([*lines, *reference]),
+            identity="\n".join(lines) if reference else "",
             max_output_tokens=600,
         )
 
@@ -259,6 +278,7 @@ class PromptBuilder:
         graph: ProjectGraph,
         summaries: Mapping[str, str],
         languages: Mapping[str, int],
+        context: Sequence[Snippet] = (),
     ) -> Prompt:
         """`summaries` maps each module to its one-sentence purpose, if known;
         `languages` counts documentable files per language."""
@@ -307,12 +327,18 @@ class PromptBuilder:
         packages = _packages(graph)[:_PACKAGES]
         if packages:
             lines.append(f"External packages: {', '.join(packages)}")
+        reference: list[str] = []
+        for snippet in context:
+            fence = _fence(snippet.text)
+            reference += ["", f"Entry point code ({snippet.source}:{snippet.line}; "
+                          "FLOW follows its order):", fence, snippet.text, fence]
         return Prompt(
             kind="architecture",
             key="",
             tier=Tier.ARCHITECTURE,
             system=system_prompt("architecture"),
-            user="\n".join(lines),
+            user="\n".join([*lines, *reference]),
+            identity="\n".join(lines) if reference else "",
             max_output_tokens=1500,
         )
 
@@ -380,6 +406,24 @@ def _block(title: str, rows: Sequence[str], limit: int) -> list[str]:
     if len(rows) > limit:
         block.append(f"- and {len(rows) - limit} more")
     return block
+
+
+def _context(title: str, snippets: Sequence[Snippet]) -> list[str]:
+    """Retrieved lines as `- path:line kind name: code`, or nothing. Marked
+    as reference so the reply describes this file, not its neighbours."""
+    if not snippets:
+        return []
+    rows = []
+    for snippet in snippets:
+        label = f"{snippet.kind} {snippet.symbol}".strip()
+        rows.append(f"- {snippet.source}:{snippet.line} {label}: {snippet.text}")
+    return ["", title, *rows]
+
+
+def _fence(text: str) -> str:
+    """A code fence longer than any backtick run inside `text`."""
+    longest = max((len(run) for run in _BACKTICKS.findall(text)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 def _file_entry(relpath: str, summary: str, facts: FileFacts | None) -> str:

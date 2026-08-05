@@ -16,6 +16,7 @@ import unittest
 from importlib import resources
 from pathlib import Path
 
+from devdocs.context import Snippet
 from devdocs.graph import FileNode, ModuleNode, ProjectGraph
 from devdocs.llm.budget import estimate_tokens
 from devdocs.llm.catalog import Tier
@@ -1379,6 +1380,67 @@ class ArchitecturePromptTest(unittest.TestCase):
             ).user,
             "",
         )
+
+
+class ContextTest(unittest.TestCase):
+    """Retrieved context goes into the prompt but never into its identity."""
+
+    USE = Snippet("api/orders.py", 12, "cart.total()", "uses", "Cart")
+    DEF = Snippet("lib/money.py", 3, "class Money(int)", "defines", "Money")
+    PLAN = FilePlan("shop/cart.py", 7.5, 0.6, Mode.PROSE, "r", ("Cart.total",))
+
+    def test_file_context_sits_between_the_facts_and_the_source(self) -> None:
+        builder = PromptBuilder(project="shop")
+        node = FilePromptTest.NODE
+        plain = builder.file(self.PLAN, CART_FACTS, CART, node)
+        rich = builder.file(self.PLAN, CART_FACTS, CART, node, [self.USE, self.DEF])
+        block = "\n\n" + "\n".join([
+            "How other files use this one, and what it calls (for its role; "
+            "do not describe them):",
+            "- api/orders.py:12 uses Cart: cart.total()",
+            "- lib/money.py:3 defines Money: class Money(int)",
+        ])
+        head, _, tail = plain.user.partition("\n\nSource:")
+        self.assertEqual(rich.user, f"{head}{block}\n\nSource:{tail}")
+        self.assertEqual(rich.cache_text, plain.user)
+        self.assertEqual((plain.identity, plain.cache_text), ("", plain.user))
+
+    def test_changed_context_keeps_the_identity(self) -> None:
+        builder = PromptBuilder(project="shop")
+        node = FilePromptTest.NODE
+        moved = dataclasses.replace(self.USE, line=40)
+        first = builder.file(self.PLAN, CART_FACTS, CART, node, [self.USE])
+        second = builder.file(self.PLAN, CART_FACTS, CART, node, [moved])
+        self.assertNotEqual(first.user, second.user)
+        self.assertEqual(first.cache_text, second.cache_text)
+
+    def test_module_context_comes_last(self) -> None:
+        builder = PromptBuilder(project="shop")
+        related = Snippet("web/views.py", 8, "def checkout(request):", "related",
+                          "checkout")
+        plain = builder.module(SHOP_MODULE, SHOP, SHOP_SUMMARIES, SHOP_FACTS)
+        rich = builder.module(SHOP_MODULE, SHOP, SHOP_SUMMARIES, SHOP_FACTS, [related])
+        self.assertEqual(rich.user, plain.user + "\n\n" + "\n".join([
+            "Related code elsewhere (reference only; do not describe it):",
+            "- web/views.py:8 related checkout: def checkout(request):",
+        ]))
+        self.assertEqual(rich.cache_text, plain.user)
+
+    def test_entry_point_code_is_fenced_past_its_backticks(self) -> None:
+        body = 'def main():\n    print("```")'
+        entry = Snippet("shop/cli.py", 4, body, "entry", "main")
+        prompt = PromptBuilder(project="p").architecture(
+            ProjectGraph(), {}, {}, [entry]
+        )
+        self.assertEqual(prompt.user, "\n".join([
+            "Project: p",
+            "",
+            "Entry point code (shop/cli.py:4; FLOW follows its order):",
+            "````",
+            body,
+            "````",
+        ]))
+        self.assertEqual(prompt.cache_text, "Project: p")
 
 
 if __name__ == "__main__":
