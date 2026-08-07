@@ -76,6 +76,18 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config({"quality": "ultra"}, config_file=None, env={})
 
+    def test_rejects_unknown_context(self) -> None:
+        with self.assertRaises(ConfigError):
+            load_config({"context": "deep"}, config_file=None, env={})
+
+    def test_semantic_context_needs_gemini(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            load_config({"context": "semantic", "provider": "anthropic"},
+                        config_file=None, env={})
+        self.assertIn("Gemini", caught.exception.message)
+        config = load_config({"context": "semantic"}, config_file=None, env={})
+        self.assertEqual(config.context, "semantic")
+
     def test_rejects_unknown_format(self) -> None:
         with self.assertRaises(ConfigError):
             load_config({"formats": ["xml"]}, config_file=None, env={})
