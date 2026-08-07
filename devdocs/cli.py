@@ -87,6 +87,8 @@ def _run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", choices=PROVIDERS)
     parser.add_argument("--model", help="use this one model for every call")
     parser.add_argument("--quality", choices=("cheap", "balanced", "high"))
+    parser.add_argument("--context", choices=("off", "standard", "semantic"),
+                        help="retrieved cross-file context (default: standard, free)")
     parser.add_argument("--max-cost", type=float, metavar="USD",
                         help="stop before spending more than this (0: no limit)")
     parser.add_argument("--max-requests", type=int, metavar="N")
@@ -164,6 +166,7 @@ def _config(args: argparse.Namespace) -> Config:
         "provider": getattr(args, "provider", None),
         "model": getattr(args, "model", None),
         "quality": getattr(args, "quality", None),
+        "context": getattr(args, "context", None),
         "max_cost": getattr(args, "max_cost", None),
         "max_requests": getattr(args, "max_requests", None),
         "concurrency": getattr(args, "concurrency", None),
@@ -335,7 +338,8 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
         out.result("\n".join(lines), {**data, "config": str(err)})
         return 2
     lines.append(f"ok config               provider={config.provider} "
-                 f"quality={config.quality} max_cost=${config.max_cost:g}")
+                 f"quality={config.quality} context={config.context} "
+                 f"max_cost=${config.max_cost:g}")
     age = (date.today() - date.fromisoformat(PRICES_CHECKED)).days
     if age > 180:
         lines.append(f"!! prices               checked {PRICES_CHECKED}, {age} days "
@@ -375,6 +379,7 @@ _TEMPLATE = """\
 [devdocs]
 provider = "{provider}"       # gemini | anthropic | anthropic-sdk
 quality = "cheap"            # cheap | balanced | high
+# context = "standard"       # off | standard | semantic (Gemini embeddings)
 max_cost = 0.50              # USD ceiling per run; 0 disables it
 out = "docs"
 # model = ""                 # pin one model for every call
