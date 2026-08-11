@@ -1,7 +1,8 @@
 """A run: scan, parse, plan, ask, compose, render — resumably and on budget.
 
 `Pipeline.prepare` does everything that costs nothing: the scan, parsing,
-the import graph, git history, the plan and the known-issue sweep. `price`
+the import graph, git history, the plan, the known-issue sweep and the
+retrieval indexes that give each prompt its cross-file context. `price`
 builds every prompt the plan implies, quotes it against the catalog and the
 response cache, and cuts the plan to the budget. `estimate` stops there;
 `run` goes on to send exactly what was priced, so an estimate describes the
@@ -32,6 +33,7 @@ from pathlib import Path
 from devdocs import __version__
 from devdocs.compose import Composer, Prose, docstring_summary, first_sentence
 from devdocs.config import Config
+from devdocs.context import StructuralContext
 from devdocs.errors import (
     AuthError,
     BudgetExceeded,
@@ -41,8 +43,10 @@ from devdocs.errors import (
 )
 from devdocs.graph import GraphBuilder, ProjectGraph
 from devdocs.history import FileHistory, GitHistory
+from devdocs.index.chunk import chunk_file
 from devdocs.index.db import Database
 from devdocs.index.ledger import ItemStatus, LedgerItem, RunLedger, config_fingerprint
+from devdocs.index.search import LexicalIndex
 from devdocs.issues import Issue, find_issues
 from devdocs.llm import Completion
 from devdocs.llm.client import CallEvent, LLMClient
@@ -53,6 +57,7 @@ from devdocs.render import OutputWriter, Renderer, WriteReport
 from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
 from devdocs.render.style import StyleGuard, acceptable, parse_reply
+from devdocs.retrieve import Retriever
 from devdocs.scan import Scanner, SourceFile
 
 __all__ = [
@@ -95,6 +100,7 @@ class Prepared:
     skipped: dict[str, str]
     languages: dict[str, int]
     prompts: dict[tuple[str, str], Prompt] = field(default_factory=dict)
+    retriever: Retriever | None = None
 
 
 @dataclass(frozen=True)
@@ -267,6 +273,7 @@ class Pipeline:
             skipped=scan.skipped,
             languages=languages,
         )
+        prepared.retriever = self._retriever(prepared)
         self.log(
             f"scanned {len(scan.files)} files, {len(documentable)} documentable, "
             f"{plan.calls()} model calls planned ({time.monotonic() - started:.1f}s)"
@@ -280,9 +287,29 @@ class Pipeline:
         except OSError:
             return ""
 
+    # -- retrieval ---------------------------------------------------------
+
+    def _retriever(self, prepared: Prepared) -> Retriever | None:
+        """Structural and lexical retrieval over the project, both free."""
+        if self.config.context == "off":
+            return None
+        chunks = [
+            chunk
+            for rel in sorted(prepared.files)
+            for chunk in chunk_file(
+                rel, prepared.sources.get(rel, ""), prepared.facts.get(rel)
+            )
+        ]
+        return Retriever(
+            StructuralContext(prepared.graph, prepared.facts, prepared.sources),
+            chunks=chunks,
+            lexical=LexicalIndex(chunks),
+        )
+
     # -- prompts and prices ------------------------------------------------
 
     def _file_prompts(self, prepared: Prepared) -> Iterator[Prompt]:
+        retriever = prepared.retriever
         for plan in prepared.plan.prose_files():
             facts = prepared.facts.get(plan.relpath)
             if facts is None:
@@ -290,20 +317,29 @@ class Pipeline:
             yield self.builder.file(
                 plan, facts, prepared.sources.get(plan.relpath, ""),
                 prepared.graph.file(plan.relpath),
+                retriever.for_file(plan.relpath, facts) if retriever else (),
             )
 
     def _module_prompts(
         self, prepared: Prepared, summaries: Mapping[str, str]
     ) -> Iterator[Prompt]:
+        retriever = prepared.retriever
         for plan in prepared.plan.prose_modules():
-            yield self.builder.module(plan, prepared.graph, summaries, prepared.facts)
+            yield self.builder.module(
+                plan, prepared.graph, summaries, prepared.facts,
+                retriever.for_module(plan.files, prepared.facts) if retriever else (),
+            )
 
     def _architecture_prompt(
         self, prepared: Prepared, summaries: Mapping[str, str]
     ) -> Prompt | None:
         if prepared.plan.architecture is not Mode.PROSE:
             return None
-        return self.builder.architecture(prepared.graph, summaries, prepared.languages)
+        retriever = prepared.retriever
+        return self.builder.architecture(
+            prepared.graph, summaries, prepared.languages,
+            retriever.for_architecture() if retriever else (),
+        )
 
     def _docstring_summaries(self, prepared: Prepared) -> dict[str, str]:
         return {
@@ -331,6 +367,7 @@ class Pipeline:
             result = client.quote(
                 prompt.tier, prompt.system, prompt.user,
                 max_output_tokens=prompt.max_output_tokens,
+                identity=prompt.cache_text,
             )
             costs[(prompt.kind, prompt.key)] = 0.0 if result.cached else result.cost
             estimate.items.append(PricedItem(
@@ -399,7 +436,7 @@ class Pipeline:
             )
             summary.run_id, summary.resumed = ledger.start(fingerprint, resume=resume)
             ledger.plan(summary.run_id, [
-                LedgerItem(key or kind, kind, _sha(p.system + p.user))
+                LedgerItem(key or kind, kind, _sha(p.system + p.cache_text))
                 for (kind, key), p in sorted(prepared.prompts.items())
             ])
 
@@ -573,6 +610,7 @@ class Pipeline:
             max_output_tokens=prompt.max_output_tokens,
             tag=prompt.key or prompt.kind,
             accept=self._acceptor(prompt, guard, allowed),
+            identity=prompt.cache_text,
         )
         return self._prose(prompt, guard, allowed, completion)
 
@@ -584,6 +622,7 @@ class Pipeline:
             prompt.tier, prompt.system, prompt.user,
             max_output_tokens=prompt.max_output_tokens,
             accept=self._acceptor(prompt, guard, allowed),
+            identity=prompt.cache_text,
         )
         return self._prose(prompt, guard, allowed, completion)
 
