@@ -196,5 +196,37 @@ class TestEstimate(PipelineCase):
         self.assertEqual(estimate.cost, 0.0)
 
 
+class TestContext(PipelineCase):
+    def file_prompt(self, relpath: str) -> str:
+        return next(r.prompt for r in self.model.calls if r.tag == relpath)
+
+    def test_prompts_carry_how_a_file_is_used(self) -> None:
+        pipeline = self.pipeline()
+        pipeline.run(pipeline.prepare())
+        prompt = self.file_prompt("shop/cart.py")
+        self.assertIn("- shop/cli.py:6 uses Cart: Cart()", prompt)
+        self.assertIn("- shop/money.py:3 defines Money: class Money(int) — "
+                      "An amount in cents.", prompt)
+        self.assertLess(prompt.index("How other files use"), prompt.index("Source:"))
+
+    def test_context_can_be_turned_off(self) -> None:
+        pipeline = self.pipeline(context="off")
+        pipeline.run(pipeline.prepare())
+        self.assertNotIn("How other files use", self.file_prompt("shop/cart.py"))
+
+    def test_an_edit_elsewhere_does_not_buy_a_file_again(self) -> None:
+        first = self.pipeline()
+        first.run(first.prepare())
+        cli = self.tmp / "shop" / "cli.py"
+        cli.write_text(cli.read_text("utf-8").replace(
+            "    Cart()\n", "    # build the basket\n    Cart().total()\n"
+        ), encoding="utf-8")
+        calls = len(self.model.calls)
+        second = self.pipeline()
+        second.run(second.prepare())
+        # cart.py's context changed with cli.py, but its answer is still valid.
+        self.assertEqual([r.tag for r in self.model.calls[calls:]], ["shop/cli.py"])
+
+
 if __name__ == "__main__":
     unittest.main()
