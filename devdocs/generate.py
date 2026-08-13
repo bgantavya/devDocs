@@ -43,13 +43,16 @@ from devdocs.errors import (
 )
 from devdocs.graph import GraphBuilder, ProjectGraph
 from devdocs.history import FileHistory, GitHistory
-from devdocs.index.chunk import chunk_file
+from devdocs.index.chunk import ChunkStore, chunk_file
 from devdocs.index.db import Database
+from devdocs.index.embed import Embeddings
 from devdocs.index.ledger import ItemStatus, LedgerItem, RunLedger, config_fingerprint
-from devdocs.index.search import LexicalIndex
+from devdocs.index.search import LexicalIndex, VectorIndex
 from devdocs.issues import Issue, find_issues
-from devdocs.llm import Completion
+from devdocs.llm import Completion, Embedder
+from devdocs.llm.catalog import assume, find
 from devdocs.llm.client import CallEvent, LLMClient
+from devdocs.llm.providers import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 from devdocs.parse import Confidence, FileFacts, get_parser
 from devdocs.plan import Plan, Planner, PlannerOptions, fit_to_budget
 from devdocs.prompting import Prompt, PromptBuilder
@@ -74,6 +77,9 @@ _QUALITY = {
     "balanced": PlannerOptions(coverage=0.35, min_prose_files=40),
     "high": PlannerOptions(coverage=0.6, min_prose_files=60, include_documented=True),
 }
+
+# Semantic context may claim at most this share of either limit.
+_EMBED_SHARE = 0.5
 
 _JS_GLOBALS = frozenset({
     "Array", "ArrayBuffer", "Boolean", "Date", "Error", "JSON", "Map", "Math",
@@ -112,6 +118,7 @@ class PricedItem:
     output_tokens: int
     cost: float          # worst case: the full output cap is used
     cached: bool
+    requests: int = 1
 
 
 @dataclass
@@ -121,7 +128,7 @@ class Estimate:
 
     @property
     def requests(self) -> int:
-        return sum(1 for item in self.items if not item.cached)
+        return sum(item.requests for item in self.items if not item.cached)
 
     @property
     def cached(self) -> int:
@@ -290,21 +297,85 @@ class Pipeline:
     # -- retrieval ---------------------------------------------------------
 
     def _retriever(self, prepared: Prepared) -> Retriever | None:
-        """Structural and lexical retrieval over the project, both free."""
+        """Structural and lexical retrieval, both free. In semantic mode the
+        chunks are also synced to the store, where a vector paid for once
+        stays valid until its chunk changes, and the stored ones are used."""
         if self.config.context == "off":
             return None
-        chunks = [
-            chunk
+        by_file = {
+            rel: chunk_file(rel, prepared.sources.get(rel, ""), prepared.facts.get(rel))
             for rel in sorted(prepared.files)
-            for chunk in chunk_file(
-                rel, prepared.sources.get(rel, ""), prepared.facts.get(rel)
-            )
-        ]
-        return Retriever(
+        }
+        chunks = [chunk for group in by_file.values() for chunk in group]
+        retriever = Retriever(
             StructuralContext(prepared.graph, prepared.facts, prepared.sources),
             chunks=chunks,
             lexical=LexicalIndex(chunks),
         )
+        embeddings = self._embeddings()
+        if embeddings is not None:
+            for rel, group in by_file.items():
+                embeddings.store.replace(rel, group)
+            embeddings.store.prune(by_file)
+            self._attach(retriever, embeddings)
+        return retriever
+
+    def _embeddings(self) -> Embeddings | None:
+        if self.config.context != "semantic" or self.db is None:
+            return None
+        info = find(EMBEDDING_MODEL) or assume(EMBEDDING_MODEL, "gemini")
+        embeddings = Embeddings(
+            ChunkStore(self.db), model=info, dims=EMBEDDING_DIMENSIONS
+        )
+        client = self.client
+        if client is not None:
+            embeddings.budget = client.budget
+            if isinstance(client.model, Embedder):
+                embeddings.embedder = client.model
+                embeddings.dims = client.model.dimensions
+                embeddings.limiter = client.limiter(info)
+        return embeddings
+
+    @staticmethod
+    def _attach(retriever: Retriever, embeddings: Embeddings) -> None:
+        ids, vectors = embeddings.vectors()
+        if ids:
+            retriever.vectors = VectorIndex(ids, vectors)
+            retriever.vector_of = dict(zip(ids, vectors, strict=True))
+
+    def _embedding_fits(self, requests: int, cost: float) -> bool:
+        """Whether embedding leaves the documents most of each limit."""
+        config = self.config
+        if config.max_cost and cost > config.max_cost * _EMBED_SHARE:
+            return False
+        return not config.max_requests or requests <= config.max_requests * _EMBED_SHARE
+
+    def _embed(self, prepared: Prepared) -> None:
+        """Embed the chunks that lack a vector, if that fits the limits.
+
+        A stop on budget or quota costs only semantic hits: the vectors
+        stored so far are used and the run goes on.
+        """
+        embeddings = self._embeddings()
+        if embeddings is None or prepared.retriever is None:
+            return
+        quote = embeddings.quote()
+        if not quote.chunks:
+            return
+        if not self._embedding_fits(quote.requests, quote.cost):
+            self.log(
+                f"semantic context skipped: embedding {quote.chunks} chunks could "
+                f"cost ${quote.cost:.4f}, over half the limits; raise --max-cost "
+                "or use --context standard"
+            )
+            return
+        try:
+            done, spent = embeddings.update()
+        except (BudgetExceeded, QuotaExhausted) as err:
+            self.log(f"semantic context: {err.message}; using the vectors stored")
+        else:
+            self.log(f"embedded {done} chunks (${spent:.4f})")
+        self._attach(prepared.retriever, embeddings)
 
     # -- prompts and prices ------------------------------------------------
 
@@ -348,14 +419,15 @@ class Pipeline:
             if rel in prepared.files and facts.module_docstring
         }
 
-    def price(self, prepared: Prepared) -> Estimate:
+    def price(self, prepared: Prepared, *, embedding: bool = True) -> Estimate:
         """Quote every planned call and cut the plan to the budget.
 
         Prompts are built as a run would build them. Module prompts carry the
         file purposes a run would have by then, read back from the cache where
         those answers exist and taken from docstrings where they do not yet;
         the architecture prompt likewise. So an estimate after a run is free
-        exactly when the run would be.
+        exactly when the run would be. With `embedding`, the vectors semantic
+        context still needs are quoted too, and their cost held back.
         """
         client = self._client()
         guard = StyleGuard(known=self._known(prepared))
@@ -394,10 +466,28 @@ class Pipeline:
         if overview is not None:
             quote(overview)
 
+        embeddings = self._embeddings() if embedding else None
+        if embeddings is not None:
+            need = embeddings.quote()
+            if need.chunks and self._embedding_fits(need.requests, need.cost):
+                estimate.items.insert(0, PricedItem(
+                    "embed", "", embeddings.model.id, need.tokens, 0, need.cost,
+                    False, requests=need.requests,
+                ))
+
+        # What is already spent or held back for embedding is not the plan's.
+        held = [i for i in estimate.items if i.kind == "embed"]
+        held_cost = client.budget.spent + sum(i.cost for i in held)
+        held_requests = client.budget.requests + sum(i.requests for i in held)
+        max_cost = self.config.max_cost
+        if max_cost:
+            max_cost = max(max_cost - held_cost, 1e-9)
         cached = sum(1 for item in estimate.items if item.cached)
-        limit = self.config.max_requests + cached if self.config.max_requests else 0
+        limit = 0
+        if self.config.max_requests:
+            limit = max(self.config.max_requests - held_requests, 1) + cached
         estimate.demoted = fit_to_budget(
-            prepared.plan, costs, max_cost=self.config.max_cost, max_requests=limit
+            prepared.plan, costs, max_cost=max_cost, max_requests=limit
         )
         if estimate.demoted:
             dropped = set(estimate.demoted)
@@ -426,7 +516,8 @@ class Pipeline:
         the ledger leaves the run resumable.
         """
         client = self._client()
-        self.price(prepared)
+        self._embed(prepared)
+        self.price(prepared, embedding=False)
         summary = RunSummary()
         ledger = RunLedger(self.db) if self.db is not None else None
         if ledger is not None:
