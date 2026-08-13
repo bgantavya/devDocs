@@ -7,11 +7,13 @@ client, composition, rendering and writing end to end.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from devdocs.config import Config
 from devdocs.generate import Pipeline
@@ -98,7 +100,7 @@ class PipelineCase(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.model = TaggedModel()
 
-    def pipeline(self, **overrides: object) -> Pipeline:
+    def pipeline(self, *, log: Any = None, **overrides: object) -> Pipeline:
         config = Config(path=self.tmp, **overrides)  # type: ignore[arg-type]
         client = LLMClient(
             self.model,
@@ -109,7 +111,7 @@ class PipelineCase(unittest.TestCase):
             retry=RetryPolicy(base_delay=0),
             free_tier=False,
         )
-        return Pipeline(config, client=client, db=self.db)
+        return Pipeline(config, client=client, db=self.db, log=log)
 
     def docs(self) -> dict[str, str]:
         out = self.tmp / "docs"
@@ -196,6 +198,26 @@ class TestEstimate(PipelineCase):
         self.assertEqual(estimate.cost, 0.0)
 
 
+class EmbeddingModel(TaggedModel):
+    """The tagged model plus an embeddings endpoint that counts its batches."""
+
+    dimensions = 8
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[str]] = []
+
+    def embed(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
+        self.batches.append(list(texts))
+        vectors = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode()).digest()
+            raw = [byte - 127.5 for byte in digest[: self.dimensions]]
+            norm = sum(v * v for v in raw) ** 0.5
+            vectors.append([v / norm for v in raw])
+        return vectors
+
+
 class TestContext(PipelineCase):
     def file_prompt(self, relpath: str) -> str:
         return next(r.prompt for r in self.model.calls if r.tag == relpath)
@@ -226,6 +248,40 @@ class TestContext(PipelineCase):
         second.run(second.prepare())
         # cart.py's context changed with cli.py, but its answer is still valid.
         self.assertEqual([r.tag for r in self.model.calls[calls:]], ["shop/cli.py"])
+
+
+class TestSemanticContext(PipelineCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.model = EmbeddingModel()
+
+    def test_chunks_are_embedded_once(self) -> None:
+        first = self.pipeline(context="semantic")
+        summary = first.run(first.prepare())
+        self.assertEqual(len(self.model.batches), 1)
+        self.assertEqual(summary.requests, len(self.model.calls) + 1)
+
+        again = self.pipeline(context="semantic")
+        summary = again.run(again.prepare())
+        self.assertEqual(len(self.model.batches), 1)
+        self.assertEqual(summary.requests, 0)
+
+    def test_estimate_quotes_the_embedding_without_buying_it(self) -> None:
+        pipeline = self.pipeline(context="semantic")
+        estimate = pipeline.estimate(pipeline.prepare())
+        embed = estimate.items[0]
+        self.assertEqual((embed.kind, embed.model, embed.requests),
+                         ("embed", "gemini-embedding-001", 1))
+        self.assertGreater(embed.cost, 0.0)
+        self.assertEqual(self.model.batches, [])
+
+    def test_embedding_never_takes_most_of_the_budget(self) -> None:
+        messages: list[str] = []
+        pipeline = self.pipeline(context="semantic", max_cost=0.00001,
+                                 log=messages.append)
+        pipeline.run(pipeline.prepare())
+        self.assertEqual(self.model.batches, [])
+        self.assertTrue(any("semantic context skipped" in m for m in messages))
 
 
 if __name__ == "__main__":

@@ -277,7 +277,7 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
     by_kind: dict[str, int] = {}
     for item in estimate.items:
         if not item.cached:
-            by_kind[item.kind] = by_kind.get(item.kind, 0) + 1
+            by_kind[item.kind] = by_kind.get(item.kind, 0) + item.requests
     lines = [
         f"{len(plan.files)} files: {len(plan.prose_files())} with prose, "
         f"{len(plan.files) - len(plan.prose_files())} from facts alone",
