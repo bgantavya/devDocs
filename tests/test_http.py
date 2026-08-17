@@ -517,12 +517,21 @@ class TestUnsendable(LocalCase):
         self.assertEqual(server.requests, 0)
 
     def test_malformed_urls_are_provider_errors(self) -> None:
+        resolver = self.enterContext(mock.patch("socket.getaddrinfo"))
         for url in ("https://api.example:99999/", "https://[::1/", "api.example/v1",
                     "ftp://api.example/", "https://bad..host/",
+                    "https://" + "a" * 64 + ".example/", "https://[::zz]/",
                     "http://127.0.0.1:1/models/a b"):
             with self.subTest(url), self.assertRaises(ProviderError) as caught:
                 self.transport.request("GET", url)
             self.assertFalse(caught.exception.retryable)
+        resolver.assert_not_called()   # refused before the resolver, never slowly
+
+    def test_well_formed_hosts_are_accepted(self) -> None:
+        for host in ("api.example", "API.Example.", "127.0.0.1", "[::1]",
+                     "[fe80::1%25en0]", "bücher.example", "my_host.internal"):
+            with self.subTest(host):
+                self.assertEqual(http_module._split(f"https://{host}/v1")[3], "/v1")
 
 
 class TestProxy(TransportCase):
@@ -571,8 +580,10 @@ class TestProxy(TransportCase):
         self.assertNotIn("guess", str(caught.exception))
 
     def test_unusable_proxy_settings_fail_without_echoing_them(self) -> None:
+        resolver = self.enterContext(mock.patch("socket.getaddrinfo"))
         for proxy in ("http://user:hunter2@proxy.example:abc",
                       "http://user:hunter2@proxy.example:99999",
+                      "http://user:hunter2@proxy..example:8080",
                       "socks5://user:hunter2@proxy.example:1080"):
             with (
                 self.subTest(proxy),
@@ -582,6 +593,7 @@ class TestProxy(TransportCase):
                 self.transport.request("GET", "https://api.example/v1/models")
             self.assertFalse(caught.exception.retryable)
             self.assertNotIn("hunter2", str(caught.exception))
+        resolver.assert_not_called()
 
 
 class TestTLS(unittest.TestCase):
