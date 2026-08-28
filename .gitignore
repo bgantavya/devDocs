@@ -44,6 +44,12 @@ htmlcov/
 .env.local
 .env.*.local
 
+# npm wrapper: prepack copies these in
+node_modules/
+npm/python/
+npm/LICENSE
+npm/*.tgz
+
 # devdocs: its own state, and its docs output
 .devdocs/
 docs/

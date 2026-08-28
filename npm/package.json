@@ -26,11 +26,21 @@
   "license": "MIT",
   "author": "Gantavya Bansal",
   "type": "commonjs",
+  "bin": {
+    "devdocs": "bin/devdocs.js"
+  },
   "files": [
-    "lib"
+    "bin",
+    "lib",
+    "scripts/postinstall.js",
+    "python",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepack": "node scripts/bundle.js",
+    "postinstall": "node scripts/postinstall.js"
   },
   "engines": {
     "node": "^20.17.0 || >=22.9.0"
