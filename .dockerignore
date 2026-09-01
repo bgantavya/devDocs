@@ -1,4 +1,8 @@
-.github
-.vscode
-.code
-dist
+# Allow-list: the build context is only what the wheel is built from.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!devdocs/
+**/__pycache__
+**/*.pyc
