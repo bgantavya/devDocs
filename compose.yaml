@@ -1,0 +1,34 @@
+# devdocs in a container, run against the current directory ($PWD, mounted at
+# /work; PowerShell and cmd export no PWD: there, this file's directory).
+# DEVDOCS_UID and DEVDOCS_GID (default 1000) make docs/ and .devdocs/ yours;
+# API keys and DEVDOCS_PROVIDER pass through from the shell:
+#   export DEVDOCS_UID=$(id -u) DEVDOCS_GID=$(id -g)
+#   docker compose -f path/to/devDocs/compose.yaml run --rm devdocs estimate
+# The image is pulled from ghcr.io, or built from this checkout if that fails.
+# Stopping sends SIGINT and allows 150 s before SIGKILL: in-flight calls (120 s
+# HTTP timeout) finish and are cached, then the pages are written.
+services:
+  devdocs:
+    image: ghcr.io/bgantavya/devdocs:latest
+    build: .
+    working_dir: /work
+    volumes:
+      - "${PWD:-.}:/work"
+    user: "${DEVDOCS_UID:-1000}:${DEVDOCS_GID:-1000}"
+    environment:
+      - DEVDOCS_API_KEY
+      - GEMINI_API_KEY
+      - GOOGLE_API_KEY
+      - ANTHROPIC_API_KEY
+      - DEVDOCS_PROVIDER
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 150s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command: ["generate"]
