@@ -1,0 +1,24 @@
+# Secret scanning (CI security job): gitleaks' default rules, two narrow waivers.
+
+[extend]
+useDefault = true
+
+# `secret` holds a v3 demo Gemini key that Google has revoked; the maintainer
+# has chosen to keep the file for now.
+[[allowlists]]
+description = "secret: v3 demo Gemini key, revoked by Google, kept for now"
+paths = ['''^secret$''']
+
+# Self-signed key for the 127.0.0.1 TLS test server, trusted by nothing.
+# In history since 52d19ea. Waives that key alone, matched by the start of its
+# base64 body, in the module and its bytecode; any other key there is reported.
+[[allowlists]]
+description = "tests/test_http.py: self-signed test key"
+targetRules = ["private-key"]
+condition = "AND"
+paths = [
+  '''^tests/test_http\.py$''',
+  '''^tests/__pycache__/test_http\.[^/]+\.pyc$''',
+]
+regexTarget = "match"
+regexes = ['''MHcCAQEEIGo\+ZbPDyTfJNhi2RTg/N8rrmxdceVoVnzjOOzFTYxQJ''']
