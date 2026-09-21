@@ -74,6 +74,13 @@ class TestUrlPath(unittest.TestCase):
             with self.subTest(char=char):
                 self.assertEqual(url_path(char), expected)
 
+    def test_sub_delimiters_are_encoded_too(self) -> None:
+        # Regression: Markdown's copy kept them, and CommonMark reads a
+        # character reference in a link destination, so `f&ouml;.py` linked
+        # to `fö.py`; the HTML copy encoded them all.
+        self.assertEqual(url_path("f&ouml;.py.md"), "f%26ouml%3B.py.md")
+        self.assertEqual(url_path("!$'*+,;=@"), "%21%24%27%2A%2B%2C%3B%3D%40")
+
     def test_a_scheme_never_survives(self) -> None:
         self.assertEqual(url_path("javascript:alert(1).py.html"),
                          "javascript%3Aalert%281%29.py.html")

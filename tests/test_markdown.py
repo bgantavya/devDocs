@@ -4,8 +4,11 @@ front matter and byte-for-byte determinism."""
 from __future__ import annotations
 
 import json
+import re
 import unittest
+from html import unescape
 from typing import Any
+from urllib.parse import unquote
 
 from devdocs.render import Renderer
 from devdocs.render.markdown import MarkdownRenderer
@@ -612,6 +615,16 @@ class TestLinks(unittest.TestCase):
         )
         piped = file_doc("a|b.py")
         self.assertIn(r"| [a\|b.py](a%7Cb.py.md) | |", render(piped)["README.md"])
+
+    def test_a_destination_cannot_hold_a_character_reference(self) -> None:
+        # Regression: `&` and `;` stayed in destinations, where CommonMark
+        # reads `&ouml;` as ö, so `f&ouml;.py`'s page was linked as `fö.py`.
+        home = render(file_doc("f&ouml;.py"), file_doc("c++ @x.py"))["README.md"]
+        self.assertIn(r"| [f\&ouml;.py](f%26ouml%3B.py.md) | |", home)
+        self.assertIn("| [c++ @x.py](c%2B%2B%20%40x.py.md) | |", home)
+        # files the links open: references decoded, then %-escapes
+        opened = [unquote(unescape(d)) for d in re.findall(r"\]\((.*?)\)", home)]
+        self.assertEqual(opened, ["c++ @x.py.md", "f&ouml;.py.md"])
 
 
 class TestEscaping(unittest.TestCase):

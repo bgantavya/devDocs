@@ -2,8 +2,8 @@
 
 Inline code is read by CommonMark's rule for code spans wherever prose is
 rendered or cleaned, so the style guard never edits a span Markdown shows as
-code. Links between pages are relative paths, with what a link destination
-cannot carry percent-encoded and the rest left legible.
+code. Links between pages are relative paths, percent-encoded so neither a
+browser nor a Markdown renderer reads syntax in a file name.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from urllib.parse import quote
 __all__ = ["code_spans", "relpath", "url_path"]
 
 _TICKS = re.compile(r"`+")
-_URL_SAFE = frozenset(string.ascii_letters + string.digits + "-._~/!$&'*+,;=@")
+_URL_SAFE = frozenset(string.ascii_letters + string.digits + "-._~/")
 
 
 def code_spans(text: str) -> Iterator[tuple[bool, str]]:
@@ -66,12 +66,15 @@ def relpath(path: str, start: str) -> str:
 
 
 def url_path(path: str) -> str:
-    """`path` as a relative URL: all but unreserved ASCII, `/`, `!$&'*+,;=@`
-    and printable non-ASCII percent-encoded as UTF-8, so the path stays
-    legible.
+    """`path` as a relative URL: all but unreserved ASCII, `/` and printable
+    non-ASCII percent-encoded as UTF-8.
 
-    A byte a file name could not decode, held as a `surrogateescape`
-    surrogate, is encoded as itself; any other lone surrogate, as U+FFFD.
+    That leaves nothing a browser or a Markdown renderer reads as syntax: no
+    `:` to pass for a scheme, no `#` or `?` to cut the path short, no `%` to
+    read as an escape, no `&` to open a character reference, no space or
+    bracket to end a link. A byte a file name could not decode, held as a
+    `surrogateescape` surrogate, is encoded as itself; any other lone
+    surrogate, as U+FFFD.
     """
     return "".join(
         char
