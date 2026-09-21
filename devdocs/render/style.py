@@ -25,13 +25,14 @@ guard never edits: every rewrite works on the prose around them.
 
 from __future__ import annotations
 
-import bisect
 import re
 import unicodedata
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import islice
+
+from devdocs.render.text import code_spans
 
 __all__ = ["Reply", "StyleGuard", "acceptable", "parse_reply"]
 
@@ -69,7 +70,6 @@ _PREAMBLE = re.compile(
     r"|below\s+(?:is|are))\b",
     re.IGNORECASE,
 )
-_TICKS = re.compile(r"`+")
 _ENDED = (".", "!", "?", ":", ";", ",")
 
 
@@ -321,36 +321,9 @@ def _lead(lines: Sequence[str]) -> str:
 def _squash(text: str) -> str:
     """`text` on one line with single spaces; code spans keep their spacing."""
     return "".join(
-        chunk if code else re.sub(r"\s+", " ", chunk) for code, chunk in _spans(text)
+        chunk if code else re.sub(r"\s+", " ", chunk)
+        for code, chunk in code_spans(text)
     ).strip()
-
-
-def _spans(text: str) -> Iterator[tuple[bool, str]]:
-    """Split `text` into plain runs and code spans, by CommonMark's rule.
-
-    A run of n backticks opens a span that the next run of exactly n closes;
-    an opener with no closer is literal text.
-    """
-    runs = [match.span() for match in _TICKS.finditer(text)]
-    by_length: dict[int, list[int]] = {}
-    for position, (start, end) in enumerate(runs):
-        by_length.setdefault(end - start, []).append(position)
-    done = current = 0
-    while current < len(runs):
-        start, end = runs[current]
-        same = by_length[end - start]
-        later = bisect.bisect_right(same, current)
-        if later == len(same):
-            current += 1
-            continue
-        closer = same[later]
-        if start > done:
-            yield False, text[done:start]
-        done = runs[closer][1]
-        yield True, text[start:done]
-        current = closer + 1
-    if done < len(text):
-        yield False, text[done:]
 
 
 @dataclass(frozen=True)
@@ -732,7 +705,7 @@ class _Text:
         """Protect the code spans of `text`, scrubbing the prose between them."""
         body: list[str] = []
         spans: list[str] = []
-        for code, chunk in _spans(text):
+        for code, chunk in code_spans(text):
             if code:
                 body.append(_SLOT)
                 spans.append(chunk)
