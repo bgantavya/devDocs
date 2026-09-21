@@ -16,13 +16,10 @@ identical bytes, and a regeneration diffs only where something changed.
 
 from __future__ import annotations
 
-import bisect
 import json
 import posixpath
 import re
-import string
-from collections.abc import Iterable, Iterator, Mapping, Sequence
-from urllib.parse import quote
+from collections.abc import Iterable, Mapping, Sequence
 
 from devdocs.render.model import (
     SECTION_ORDER,
@@ -35,6 +32,7 @@ from devdocs.render.model import (
     Section,
     SymbolDoc,
 )
+from devdocs.render.text import code_spans, relpath, url_path
 
 __all__ = ["MarkdownRenderer"]
 
@@ -60,7 +58,6 @@ _BLOCK = re.compile(
 _CLOSING = re.compile(r"(^|\s)(#+)$")
 _INFO = re.compile(r"[\s`]+")
 _SURROGATE = re.compile("[\ud800-\udfff]")
-_URL_SAFE = frozenset(string.ascii_letters + string.digits + "-._~/!$&'*+,;=@")
 
 
 class MarkdownRenderer:
@@ -187,11 +184,11 @@ class _Page:
         target = self.index.get(link.target) if link.target else None
         if target is None:
             return None
-        fragment = f"#{_url(link.anchor)}" if link.anchor else ""
+        fragment = f"#{url_path(link.anchor)}" if link.anchor else ""
         if fragment and target.path == self.path:
             return fragment
-        page = _relpath(f"{target.path}{self.extension}", self.directory)
-        return _url(page) + fragment
+        page = relpath(f"{target.path}{self.extension}", self.directory)
+        return url_path(page) + fragment
 
     def link(self, link: Link) -> str:
         href = self.href(link)
@@ -453,41 +450,12 @@ def _inline(text: str, *, link: bool = False) -> str:
     inert beside a space or a surrogate could otherwise open a list or HTML.
     """
     parts: list[str] = []
-    for code, chunk in _spans(_SURROGATE.sub("?", text).strip()):
+    for code, chunk in code_spans(_SURROGATE.sub("?", text).strip()):
         if code:
             parts.append(" ".join(chunk.splitlines()))
         else:
             parts.append(_escape(_BREAK.sub(" ", chunk), link=link))
     return "".join(parts)
-
-
-def _spans(text: str) -> Iterator[tuple[bool, str]]:
-    """Split `text` into plain runs and code spans, by CommonMark's rule.
-
-    A run of n backticks opens a span that the next run of exactly n closes;
-    an opener with no closer is literal text.
-    """
-    runs = [match.span() for match in _BACKTICKS.finditer(text)]
-    by_length: dict[int, list[int]] = {}
-    for position, (start, end) in enumerate(runs):
-        by_length.setdefault(end - start, []).append(position)
-
-    done = current = 0
-    while current < len(runs):
-        start, end = runs[current]
-        same = by_length[end - start]
-        later = bisect.bisect_right(same, current)
-        if later == len(same):
-            current += 1
-            continue
-        closer = same[later]
-        if start > done:
-            yield False, text[done:start]
-        done = runs[closer][1]
-        yield True, text[start:done]
-        current = closer + 1
-    if done < len(text):
-        yield False, text[done:]
 
 
 def _escape(text: str, *, link: bool) -> str:
@@ -547,35 +515,3 @@ def _code(text: str) -> str:
     )
     pad = " " if padded else ""
     return f"{ticks}{pad}{text}{pad}{ticks}"
-
-
-# -- link destinations -----------------------------------------------------
-
-
-def _relpath(path: str, start: str) -> str:
-    """`posixpath.relpath(path, start)` for page paths, without reading the cwd."""
-    target = [p for p in posixpath.normpath(path).split("/") if p not in ("", ".")]
-    origin = [p for p in posixpath.normpath(start).split("/") if p not in ("", ".")]
-    shared = 0
-    for mine, theirs in zip(target, origin, strict=False):
-        if mine != theirs:
-            break
-        shared += 1
-    return "/".join([".."] * (len(origin) - shared) + target[shared:]) or "."
-
-
-def _url(path: str) -> str:
-    """Percent-encode what a link destination cannot carry; keep the rest legible."""
-    return "".join(
-        char
-        if char in _URL_SAFE or (not char.isascii() and char.isprintable())
-        else _percent(char)
-        for char in path
-    )
-
-
-def _percent(char: str) -> str:
-    try:
-        return quote(char, safe="", errors="surrogateescape")
-    except UnicodeEncodeError:
-        return "%EF%BF%BD"
