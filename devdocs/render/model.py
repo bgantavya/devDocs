@@ -217,12 +217,18 @@ class DocSet:
         return self._by_id.get(doc_id)
 
     def by_kind(self, kind: DocKind) -> list[Document]:
-        return [d for d in self.documents if d.kind is kind]
+        """The documents of `kind`, in reading order."""
+        return [d for d in self.sorted() if d.kind is kind]
 
     def sorted(self) -> list[Document]:
-        """Documents in a stable reading order: architecture, modules, files."""
-        rank = {DocKind.ARCHITECTURE: 0, DocKind.MODULE: 1, DocKind.FILE: 2}
-        return sorted(self.documents, key=lambda d: (rank[d.kind], d.path))
+        """Documents in reading order: the architecture, the modules by
+        directory, then the files by source path (by title without one).
+
+        Every home page follows it, and so does the manifest. A tie falls
+        to the id, so the order never depends on the order documents were
+        added in.
+        """
+        return sorted(self.documents, key=_reading_key)
 
     def to_dict(self, *, include_run: bool = True) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -291,6 +297,24 @@ class Layout:
     @staticmethod
     def home() -> str:
         return "README"
+
+
+# -- reading order ---------------------------------------------------------------
+
+_RANK = {DocKind.ARCHITECTURE: 0, DocKind.MODULE: 1, DocKind.FILE: 2}
+
+
+def _reading_key(document: Document) -> tuple[int, str, str, str]:
+    """`DocSet.sorted`'s key: kind, the name the home page lists the
+    document by, then path and id. A module's directory sorts its parent
+    first, which its page path (`<dir>/index`) would not."""
+    if document.kind is DocKind.MODULE:
+        name = document.meta.source
+    elif document.kind is DocKind.FILE:
+        name = document.meta.source or document.title
+    else:
+        name = ""
+    return (_RANK[document.kind], name, document.path, document.id)
 
 
 # -- JSON encoding ---------------------------------------------------------------
