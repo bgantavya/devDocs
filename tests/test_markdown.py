@@ -1154,6 +1154,18 @@ graph LR
         self.assertEqual(MarkdownRenderer().render(reversed_set), first)
         self.assertEqual(list(first), sorted(first))
 
+    def test_documents_that_tie_are_listed_and_written_by_id(self) -> None:
+        # Regression: documents alike in kind, source and path kept the order
+        # they were added in, which set the README's rows and the page kept.
+        twins = [Document(f"file:{name}", DocKind.FILE, "x.py", "x.py",
+                          summary=f"Twin {name}.", meta=DocMeta(source="x.py"))
+                 for name in ("b", "a")]
+        pages = render(*twins)
+        self.assertEqual(render(*twins[::-1]), pages)
+        self.assertIn("| [x.py](x.py.md) | Twin a. |\n| [x.py](x.py.md) | Twin b. |",
+                      pages["README.md"])
+        self.assertIn('id: "file:b"', pages["x.py.md"])
+
     def test_undecodable_names_degrade_instead_of_raising(self) -> None:
         pages = MarkdownRenderer().render(DocSet(project="demo", documents=[
             file_doc("bad\udcff.py", Section("purpose", "Purpose", text=("\ud800",))),

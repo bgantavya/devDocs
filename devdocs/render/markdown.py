@@ -127,14 +127,12 @@ class MarkdownRenderer:
 
         architecture = docset.by_kind(DocKind.ARCHITECTURE)
         if architecture:
-            document = min(architecture, key=lambda d: d.path)
+            document = architecture[0]
             line = page.link(Link("Architecture", document.id))
             summary = _inline(document.summary)
             blocks.append(f"{line} — {summary}" if summary else line)
 
-        modules = sorted(
-            docset.by_kind(DocKind.MODULE), key=lambda d: (d.meta.source, d.path)
-        )
+        modules = docset.by_kind(DocKind.MODULE)
         if modules:
             blocks.append(_heading(2, "Modules"))
             blocks.append(_table(("Module", "Summary"), [
@@ -142,10 +140,7 @@ class MarkdownRenderer:
                 for d in modules
             ]))
 
-        files = sorted(
-            docset.by_kind(DocKind.FILE),
-            key=lambda d: (d.meta.source or d.title, d.path),
-        )
+        files = docset.by_kind(DocKind.FILE)
         if files:
             blocks.append(_heading(2, "Files"))
             blocks.append(_table(("File", "Summary"), [
