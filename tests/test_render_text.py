@@ -53,6 +53,12 @@ class TestRelpath(unittest.TestCase):
             with self.subTest(path=path, start=start):
                 self.assertEqual(relpath(path, start), expected)
 
+    def test_the_file_name_stays_where_a_directory_on_the_way_shares_it(self) -> None:
+        # The PDF's copy kept the name; the Markdown and HTML copies gave the
+        # directory itself, "." or "..".
+        self.assertEqual(relpath("a.md", "a.md"), "../a.md")
+        self.assertEqual(relpath("pkg/a", "pkg/a/b"), "../../a")
+
     def test_nothing_to_point_at_is_here(self) -> None:
         self.assertEqual(relpath("", "."), ".")
         self.assertEqual(relpath(".", ""), ".")

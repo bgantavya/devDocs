@@ -54,11 +54,12 @@ def code_spans(text: str) -> Iterator[tuple[bool, str]]:
 def relpath(path: str, start: str) -> str:
     """File `path` relative to directory `start`, both POSIX paths from one
     root, from the strings alone where `posixpath.relpath` would read the
-    cwd."""
+    cwd. The file's own name always stays, even where a directory on the way
+    to `start` has that name."""
     target = [p for p in posixpath.normpath(path).split("/") if p not in ("", ".")]
     origin = [p for p in posixpath.normpath(start).split("/") if p not in ("", ".")]
     shared = 0
-    for mine, theirs in zip(target, origin, strict=False):
+    for mine, theirs in zip(target[:-1], origin, strict=False):
         if mine != theirs:
             break
         shared += 1
