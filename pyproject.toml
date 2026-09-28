@@ -68,7 +68,7 @@ version = { attr = "devdocs.__version__" }
 include = ["devdocs*"]
 
 [tool.setuptools.package-data]
-devdocs = ["py.typed", "prompts/*.md"]
+devdocs = ["py.typed", "prompts/*.md", "render/assets/*"]
 
 [tool.ruff]
 line-length = 88
