@@ -1,14 +1,14 @@
 """The text helpers every renderer shares: CommonMark code spans, relative
-links between pages and URL encoding. Each was copied into two or three
-renderers before, and the copies had drifted; these tests hold the one
-behaviour they all get now."""
+links between pages, URL encoding and the file-name fold. Each was copied
+into two or three renderers before, and the copies had drifted; these tests
+hold the one behaviour they all get now."""
 
 from __future__ import annotations
 
 import string
 import unittest
 
-from devdocs.render.text import code_spans, relpath, url_path
+from devdocs.render.text import code_spans, code_text, folded, relpath, url_path
 
 
 class TestCodeSpans(unittest.TestCase):
@@ -31,11 +31,38 @@ class TestCodeSpans(unittest.TestCase):
     def test_a_run_of_another_length_is_content(self) -> None:
         self.assertEqual(self.split("`a``b` `c`"), [(True, "`a``b`"), (False, " "),
                                                    (True, "`c`")])
+        self.assertEqual(code_text("`a``b`"), "a``b")
 
     def test_text_may_be_all_code_or_none(self) -> None:
         self.assertEqual(self.split("`a`"), [(True, "`a`")])
         self.assertEqual(self.split(""), [])
         self.assertEqual(self.split("plain"), [(False, "plain")])
+
+
+class TestCodeText(unittest.TestCase):
+    def test_backticks_and_one_padding_space_each_side_go(self) -> None:
+        self.assertEqual(code_text("`a`"), "a")
+        self.assertEqual(code_text("`` `x` ``"), "`x`")
+        self.assertEqual(code_text("`  a  `"), " a ")
+        self.assertEqual(code_text("` a`"), " a")      # padding on one side stays
+
+    def test_content_of_spaces_alone_is_kept(self) -> None:
+        self.assertEqual(code_text("` `"), " ")
+        self.assertEqual(code_text("`   `"), "   ")
+
+    def test_only_spaces_count_as_padding(self) -> None:
+        # Regression: the PDF's copy took ` \t ` for spaces alone and kept its
+        # padding; CommonMark strips it, as the HTML copy did.
+        self.assertEqual(code_text("` \t `"), "\t")
+        self.assertEqual(code_text("`\ta\t`"), "\ta\t")
+
+    def test_a_line_break_is_a_space_before_padding_is_judged(self) -> None:
+        # Regression: both copies dropped a break before the closing
+        # backticks, so `` a<LF>`` showed " a" where CommonMark shows "a".
+        self.assertEqual(code_text("`` a\n``"), "a")
+        self.assertEqual(code_text("`a\nb`"), "a b")
+        self.assertEqual(code_text("`a\r\nb`"), "a b")
+        self.assertEqual(code_text("`\na\n`"), "a")
 
 
 class TestRelpath(unittest.TestCase):
@@ -97,6 +124,31 @@ class TestUrlPath(unittest.TestCase):
     def test_undecodable_bytes_and_lone_surrogates_degrade(self) -> None:
         self.assertEqual(url_path("bad\udcff.py"), "bad%FF.py")
         self.assertEqual(url_path("odd\ud800.py"), "odd%EF%BF%BD.py")
+
+
+class TestFolded(unittest.TestCase):
+    def test_case_and_normalization_fold_alike(self) -> None:
+        same = [
+            ("Index.html", "index.html"),
+            ("caf\xe9.py", "cafe\u0301.py"),  # NFC and NFD
+            ("CAF\xc9.PY", "cafe\u0301.py"),
+            ("\u212a.py", "k.py"),  # Kelvin sign
+            ("Stra\xdfe.py", "STRASSE.py"),  # folds more: a suffix
+        ]
+        for first, second in same:
+            with self.subTest(first=first, second=second):
+                self.assertEqual(folded(first), folded(second))
+
+    def test_other_names_stay_apart(self) -> None:
+        for first, second in (("a.py", "b.py"), ("cafe.py", "caf\xe9.py"),
+                              ("a/b.py", "a-b.py")):
+            with self.subTest(first=first, second=second):
+                self.assertNotEqual(folded(first), folded(second))
+
+    def test_folding_twice_changes_nothing(self) -> None:
+        for name in ("Caf\xe9", "\u1e9e", "\u0390", "\ufb01le"):
+            with self.subTest(name=name):
+                self.assertEqual(folded(folded(name)), folded(name))
 
 
 if __name__ == "__main__":

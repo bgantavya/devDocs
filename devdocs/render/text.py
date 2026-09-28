@@ -1,9 +1,11 @@
 """Text helpers the renderers share, each defined once.
 
 Inline code is read by CommonMark's rule for code spans wherever prose is
-rendered or cleaned, so the style guard never edits a span Markdown shows as
-code. Links between pages are relative paths, percent-encoded so neither a
-browser nor a Markdown renderer reads syntax in a file name.
+rendered or cleaned, so a span shows the same text in Markdown and HTML and
+the style guard never edits one. Links between pages are relative paths,
+percent-encoded so neither a browser nor a Markdown renderer reads syntax in a
+file name. Output file names are compared the way the file systems macOS and
+Windows use by default compare them, so no two outputs land on one file.
 """
 
 from __future__ import annotations
@@ -12,10 +14,11 @@ import bisect
 import posixpath
 import re
 import string
+import unicodedata
 from collections.abc import Iterator
 from urllib.parse import quote
 
-__all__ = ["code_spans", "relpath", "url_path"]
+__all__ = ["code_spans", "code_text", "folded", "relpath", "url_path"]
 
 _TICKS = re.compile(r"`+")
 _URL_SAFE = frozenset(string.ascii_letters + string.digits + "-._~/")
@@ -26,7 +29,7 @@ def code_spans(text: str) -> Iterator[tuple[bool, str]]:
 
     A run of n backticks opens a span that the next run of exactly n closes;
     an opener with no closer is literal text. A span keeps its backticks, so
-    the pieces join back into `text`.
+    the pieces join back into `text`; `code_text` gives what one shows.
     """
     runs = [match.span() for match in _TICKS.finditer(text)]
     by_length: dict[int, list[int]] = {}
@@ -49,6 +52,18 @@ def code_spans(text: str) -> Iterator[tuple[bool, str]]:
         current = closer + 1
     if done < len(text):
         yield False, text[done:]
+
+
+def code_text(span: str) -> str:
+    """What code span `span`, backticks included, shows by CommonMark's rule:
+    each line break a space, then one space off each end when both ends have
+    one and something other than spaces is left."""
+    span = " ".join(span.splitlines())
+    ticks = len(span) - len(span.lstrip("`"))
+    inner = span[ticks:len(span) - ticks]
+    if inner[:1] == inner[-1:] == " " and inner.strip(" "):
+        return inner[1:-1]
+    return inner
 
 
 def relpath(path: str, start: str) -> str:
@@ -90,3 +105,12 @@ def _percent(char: str) -> str:
         return quote(char, safe="", errors="surrogateescape")
     except UnicodeEncodeError:   # a lone surrogate that stands for no byte
         return "%EF%BF%BD"
+
+
+def folded(name: str) -> str:
+    """`name` by Unicode's canonical caseless match, so names that differ
+    only in case or normalization fold alike: macOS stores such names as one
+    file by default, and Windows those that differ in case. Folding more than
+    a file system does costs at most a needless suffix; folding less loses a
+    file."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
