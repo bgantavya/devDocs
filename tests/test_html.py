@@ -31,7 +31,10 @@ from devdocs.render.model import (
     Section,
     SymbolDoc,
 )
+from devdocs.render.pdf import PdfRenderer
+from devdocs.render.pdf.check import PdfFile
 from tests.test_markdown import file_doc, shop, sym
+from tests.test_pdf import shown
 
 HOSTILE = "</script><img src=x onerror=alert(1)>"
 SITE_POLICY = ("default-src 'none'; style-src 'self'; script-src 'self'; "
@@ -190,8 +193,8 @@ def stylesheet(css: str = "") -> dict[tuple[str, str], dict[str, str]]:
     """A stylesheet's declarations, the shipped one's by default, by (the
     block around them, or "" at the top level, and selector), each selector
     of a list on its own and later declarations winning. An @media block is
-    named by its condition, any other by its at-rule: enough CSS for blocks
-    of plain rules."""
+    named by its condition, any other by its at-rule, as `@page book` holds
+    `@bottom-center`: enough CSS for blocks of plain rules."""
     css = css or text_of(HtmlRenderer().render(shop()), "assets/style.css")
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
     rules: dict[tuple[str, str], dict[str, str]] = {}
@@ -662,6 +665,28 @@ class TestBook(unittest.TestCase):
         self.assertIn("@page", style)
         self.assertIn("break-before: page", style)
         self.assertIn("@media print", style)
+
+    def test_every_page_carries_the_folio_the_builtin_engine_prints(self) -> None:
+        """Chrome and WeasyPrint printed the book without page numbers. The
+        book is a named page whose foot reads "Page N of M", in the size and
+        grey of the built-in engine's folio; a site page printed alone, not
+        being one, has none."""
+        book = text_of(self.files, "book.html")
+        rules = stylesheet(book.split("<style>")[1].split("</style>")[0])
+        folio = rules.get(("@page book", "@bottom-center"), {})
+        self.assertEqual(folio.get("content"),
+                         '"Page " counter(page) " of " counter(pages)')
+        content = PdfFile(PdfRenderer().render(shop())["shop.pdf"]).content(1)
+        (builtin,) = [item for item in shown(content) if item.text.startswith(b"Page ")]
+        *_, grey = re.findall(rb"([\d.]+) ([\d.]+) ([\d.]+) rg",
+                              content[:content.index(b"(Page ")])
+        self.assertEqual(folio["font-size"], f"{builtin.size:g}pt")
+        self.assertEqual(folio["color"],
+                         "#" + "".join(f"{round(float(c) * 255):02x}" for c in grey))
+        self.assertEqual(rules[("", ".book")]["page"], "book")
+        self.assertEqual(self.page.find("body"), [{"class": "book"}])
+        site = HtmlRenderer().render(shop())
+        self.assertEqual(page_of(site, "index.html").find("body"), [{}])
 
 
 class TestSecurityPolicy(unittest.TestCase):

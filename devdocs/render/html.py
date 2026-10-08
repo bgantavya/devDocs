@@ -8,8 +8,9 @@ navigation: breadcrumbs, a sidebar and an "On this page" list. Book mode
 writes everything into one self-contained `book.html` (stylesheet inlined,
 diagrams as inline SVG, nothing fetched) for an external PDF engine: the
 home page's overview, then every document in reading order, each starting a
-new page, with links turned into in-page anchors. It sets page margins but
-no page size, which the engine chooses, or a `@page` rule added to the page.
+new page, with links turned into in-page anchors. It sets page margins and a
+folio, "Page N of M" as the built-in PDF engine prints it, but no page size,
+which the engine chooses, or a `@page` rule added to the page.
 
 Names. A document's page is `<path>.html`. The root module's path, `index`,
 is the home page's name, so its page is `root.html`; should two documents

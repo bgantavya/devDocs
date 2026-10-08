@@ -700,6 +700,21 @@ svg.diagram .node text {
   margin: 18mm 16mm 20mm;
 }
 
+/* The book's folio, as the built-in PDF engine sets it; the named page keeps
+   it off a site page printed alone. */
+@page book {
+  @bottom-center {
+    content: "Page " counter(page) " of " counter(pages);
+    color: #6b737d;
+    font-family: var(--sans);
+    font-size: 7.5pt;
+  }
+}
+
+.book {
+  page: book;
+}
+
 @media print {
   :root {
     color-scheme: light;
