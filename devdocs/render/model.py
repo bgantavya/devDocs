@@ -224,9 +224,9 @@ class DocSet:
         """Documents in reading order: the architecture, the modules by
         directory, then the files by source path (by title without one).
 
-        Every home page and book follows it, and so does the manifest. A tie
-        falls to the id, so the order never depends on the order documents
-        were added in.
+        Every home page, book, contents and bookmark list follows it, and so
+        does the manifest. A tie falls to the id, so the order never depends
+        on the order documents were added in.
         """
         return sorted(self.documents, key=_reading_key)
 

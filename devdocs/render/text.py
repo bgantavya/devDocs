@@ -1,8 +1,8 @@
 """Text helpers the renderers share, each defined once.
 
 Inline code is read by CommonMark's rule for code spans wherever prose is
-rendered or cleaned, so a span shows the same text in Markdown and HTML and
-the style guard never edits one. Links between pages are relative paths,
+rendered or cleaned, so a span shows the same text in Markdown, HTML and PDF
+and the style guard never edits one. Links between pages are relative paths,
 percent-encoded so neither a browser nor a Markdown renderer reads syntax in a
 file name. Output file names are compared the way the file systems macOS and
 Windows use by default compare them, so no two outputs land on one file.
