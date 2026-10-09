@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import posixpath
 import re
+from collections import Counter
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ from devdocs.render.model import (
     SymbolDoc,
 )
 from devdocs.render.style import Reply
+from devdocs.render.text import folded
 from devdocs.scan import SourceFile
 
 __all__ = [
@@ -57,6 +59,9 @@ LANGUAGE_NAMES = {
 }
 
 _MAX_LINKS = 8
+# Top-level names no file's page may take: the Markdown home, the
+# architecture's, and HTML's and PDF's home (`index`) and root module (`root`).
+_RESERVED = (Layout.home(), Layout.architecture(), "index", "root")
 _SENTENCE_END = re.compile(
     r"(?<![A-Z])(?<!\be\.g)(?<!\bi\.e)(?<!\betc)(?<!\bvs)[.!?](?=\s|$)"
 )
@@ -164,14 +169,28 @@ class Composer:
         self.hashes = hashes
         self.modules = frozenset(modules)
         self.layout = layout or Layout()
-        self._collisions = self._colliding_stems()
+        self._collisions = self._colliding_files()
 
-    def _colliding_stems(self) -> frozenset[str]:
-        seen: dict[str, list[str]] = {}
-        for relpath in self.files:
-            stem = relpath.rpartition(".")[0] or relpath
-            seen.setdefault(stem, []).append(relpath)
-        return frozenset(p for group in seen.values() if len(group) > 1 for p in group)
+    def _colliding_files(self) -> frozenset[str]:
+        """The files whose document path keeps the source's extension.
+
+        The per-file layout drops it only where the shorter path, compared
+        as `folded` compares names, is no other file's, no module page's and
+        none a renderer takes (`_RESERVED`). A kept path can be another
+        file's shorter one (`App.svelte` beside `App.svelte.ts`), which then
+        keeps its extension too.
+        """
+        short = {rel: folded(self.layout.file(rel)) for rel in self.files}
+        taken = {folded(path) for path in _RESERVED}
+        taken.update(folded(self.layout.module(path)) for path in self.modules)
+        counts = Counter(short.values())
+        found = {rel for rel, path in short.items()
+                 if path in taken or counts[path] > 1}
+        kept = {folded(self.layout.file(rel, collides=True)) for rel in found}
+        while more := {rel for rel, path in short.items() if path in kept} - found:
+            found |= more
+            kept |= {folded(self.layout.file(rel, collides=True)) for rel in more}
+        return frozenset(found)
 
     # -- links -------------------------------------------------------------
 

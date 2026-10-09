@@ -275,7 +275,8 @@ class Layout:
 
     The default mirrors the source tree and keeps the extension, so
     `a/b.py` and `a/b.ts` cannot collide. `per_file` reproduces the v3 layout
-    (`a/b.md`), keeping the extension only where two sources would collide.
+    (`a/b.md`), keeping the extension where the shorter path is another
+    file's, a module page's or one a renderer takes, as `Composer` finds.
     """
 
     per_file: bool = False
