@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import unittest
 from pathlib import Path
 
@@ -16,8 +17,12 @@ from devdocs.graph import FileNode, ModuleNode, ProjectGraph
 from devdocs.issues import Issue
 from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind
 from devdocs.plan import FilePlan, ModulePlan
-from devdocs.render.model import DocKind, Layout, Mode
+from devdocs.render.html import HtmlRenderer
+from devdocs.render.markdown import MarkdownRenderer
+from devdocs.render.model import DocKind, DocSet, Layout, Mode
+from devdocs.render.pdf import PdfRenderer
 from devdocs.render.style import Reply
+from devdocs.render.text import folded
 from devdocs.scan import Role, SourceFile
 
 
@@ -87,6 +92,33 @@ def composer(**kwargs: object) -> Composer:
 
 def plan(relpath: str, mode: Mode = Mode.PROSE) -> FilePlan:
     return FilePlan(relpath, 5.0, 0.5, mode, "test", describe=("Client.send",))
+
+
+def per_file(*relpaths: str) -> DocSet:
+    """What a per-file run composes for `relpaths`: a document per file, one
+    per directory, as the planner groups files into modules, and the
+    architecture."""
+    modules: dict[str, list[str]] = {}
+    for relpath in relpaths:
+        modules.setdefault(posixpath.dirname(relpath), []).append(relpath)
+    c = Composer(
+        project="p", files={rel: source(rel) for rel in relpaths}, facts={},
+        graph=ProjectGraph(), hashes={}, modules=modules,
+        layout=Layout(per_file=True),
+    )
+    docset = DocSet("p")
+    for relpath in relpaths:
+        docset.add(c.file(plan(relpath, Mode.STUB), None))
+    for path, members in modules.items():
+        docset.add(c.module(ModulePlan(path, tuple(members), 1.0, Mode.STUB, "t"),
+                            None, {}))
+    docset.add(c.architecture(None, {}, {"python": len(relpaths)}))
+    return docset
+
+
+def file_paths(docset: DocSet) -> dict[str, str]:
+    """Each file document's path, by its source."""
+    return {d.meta.source: d.path for d in docset.by_kind(DocKind.FILE)}
 
 
 class TestFileDocuments(unittest.TestCase):
@@ -175,6 +207,11 @@ class TestFileDocuments(unittest.TestCase):
                       [item.text for item in facts_section.items])
         self.assertEqual(doc.meta.confidence, "degraded")
 
+
+class TestPerFileLayout(unittest.TestCase):
+    """The v3 layout drops a source's extension, except where that would put
+    two documents, or a document and a page a renderer writes, in one file."""
+
     def test_per_file_layout_keeps_extensions_only_on_collision(self) -> None:
         c = Composer(
             project="p",
@@ -188,6 +225,74 @@ class TestFileDocuments(unittest.TestCase):
         self.assertEqual(
             paths, {"a/x.py": "a/x.py", "a/x.ts": "a/x.ts", "a/y.py": "a/y"}
         )
+
+    def test_an_index_file_keeps_its_extension_beside_its_module_page(self) -> None:
+        """Also where the directory's name changes when folded, as `Button/`
+        does: module pages are compared folded too."""
+        docset = per_file("index.js", "src/index.js", "src/util.js",
+                          "Button/index.tsx", "Button/Button.tsx")
+        self.assertEqual(file_paths(docset), {
+            "index.js": "index.js", "src/index.js": "src/index.js",
+            "src/util.js": "src/util", "Button/index.tsx": "Button/index.tsx",
+            "Button/Button.tsx": "Button/Button",
+        })
+        self.assertEqual(sorted(d.path for d in docset.by_kind(DocKind.MODULE)),
+                         ["Button/index", "index", "src/index"])
+
+    def test_names_differing_only_in_case_or_normalization_collide(self) -> None:
+        """macOS stores `Cart.md` and `cart.md` as one file by default, and
+        the two encodings of `café.md` too; Windows the first two."""
+        docset = per_file("Cart.py", "cart.go", "caf\u00e9.py", "cafe\u0301.go",
+                          "lib/Index.ts", "lib/util.ts")
+        self.assertEqual(file_paths(docset), {
+            "Cart.py": "Cart.py", "cart.go": "cart.go",
+            "caf\u00e9.py": "caf\u00e9.py", "cafe\u0301.go": "cafe\u0301.go",
+            "lib/Index.ts": "lib/Index.ts", "lib/util.ts": "lib/util",
+        })
+
+    def test_paths_keep_clear_of_the_pages_renderers_name(self) -> None:
+        """The Markdown home, the architecture, and the HTML home and root
+        module page (PDF's too) are top-level names; deeper down they are free."""
+        docset = per_file("readme.py", "architecture.py", "Root.py", "Index.ts",
+                          "src/readme.py", "src/architecture.py", "src/root.py")
+        self.assertEqual(file_paths(docset), {
+            "readme.py": "readme.py", "architecture.py": "architecture.py",
+            "Root.py": "Root.py", "Index.ts": "Index.ts",
+            "src/readme.py": "src/readme", "src/architecture.py": "src/architecture",
+            "src/root.py": "src/root",
+        })
+        bare = Composer(project="p", files={"index.js": source("index.js")},
+                        facts={}, graph=ProjectGraph(), hashes={}, modules=[],
+                        layout=Layout(per_file=True))     # no root module page
+        self.assertEqual(bare.file(plan("index.js", Mode.STUB), None).path, "index.js")
+
+    def test_a_kept_extension_moves_a_file_that_would_take_its_path(self) -> None:
+        """And so on down the chain, each link compared folded: the last
+        file here moves only on a second pass."""
+        self.assertEqual(file_paths(per_file("App.svelte", "App.svelte.ts")), {
+            "App.svelte": "App", "App.svelte.ts": "App.svelte",
+        })
+        docset = per_file("App.svelte", "App.ts", "App.svelte.ts", "App.svelte.ts.js")
+        self.assertEqual(file_paths(docset), {
+            "App.svelte": "App.svelte", "App.ts": "App.ts",
+            "App.svelte.ts": "App.svelte.ts", "App.svelte.ts.js": "App.svelte.ts.js",
+        })
+
+    def test_every_document_gets_its_own_page_in_every_format(self) -> None:
+        """Markdown keys pages by path, so a shared path lost a document."""
+        docset = per_file("index.js", "src/index.js", "src/Index.ts", "src/util.js",
+                          "Lib/index.ts", "readme.py", "architecture.py", "Root.py",
+                          "root.go")
+        pages = MarkdownRenderer().render(docset)
+        self.assertEqual(len(pages), len(docset.documents) + 1)     # README.md
+        self.assertEqual(len({folded(page) for page in pages}), len(pages))
+
+        # none numbered apart: home `index`, root module `root`, the rest by path
+        paths = [d.path for d in docset.documents if d.id != "module:"]
+        html = [p for p in HtmlRenderer().render(docset) if p.endswith(".html")]
+        self.assertCountEqual(html, [f"{p}.html" for p in [*paths, "index", "root"]])
+        pdf = PdfRenderer(split=True).render(docset)
+        self.assertCountEqual(pdf, [f"pdf/{p}.pdf" for p in [*paths, "index", "root"]])
 
 
 class TestModuleAndArchitecture(unittest.TestCase):
