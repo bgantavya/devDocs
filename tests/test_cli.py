@@ -123,6 +123,15 @@ class TestEstimate(CliCase):
         self.assertEqual(code, 0)
         self.assertIn("shop/cart.py", out)
 
+    def test_excludes_from_flags_apply(self) -> None:
+        # Regression: list flags were refused by the config, exiting 2.
+        code, out, _ = self.run_cli("estimate", str(self.root), "--explain",
+                                    "--exclude", "shop/cli.py,shop/money.py")
+        self.assertEqual(code, 0)
+        self.assertIn("shop/cart.py", out)
+        self.assertNotIn("shop/cli.py", out)
+        self.assertNotIn("shop/money.py", out)
+
 
 class TestInitAndCache(CliCase):
     def test_init_writes_config_and_ignores_state(self) -> None:

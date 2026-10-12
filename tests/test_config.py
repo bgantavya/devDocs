@@ -66,6 +66,14 @@ class TestPrecedence(unittest.TestCase):
         self.assertEqual(load_config(config_file=path, env={}).exclude,
                          ("vendor", "build"))
 
+    def test_list_flags_arrive_as_tuples(self) -> None:
+        # Regression: the CLI hands list flags over as tuples, which were
+        # refused, so every --include, --exclude and --format exited 2.
+        config = load_config({"exclude": ("vendor",), "formats": ("html", "pdf")},
+                             config_file=None, env={})
+        self.assertEqual(config.exclude, ("vendor",))
+        self.assertEqual(config.formats, ("html", "pdf"))
+
 
 class TestValidation(unittest.TestCase):
     def test_rejects_unknown_provider(self) -> None:
