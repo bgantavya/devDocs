@@ -123,7 +123,7 @@ def _coerce(name: str, value: Any, current: Any) -> Any:
     if isinstance(current, tuple):
         if isinstance(value, str):
             return tuple(part.strip() for part in value.split(",") if part.strip())
-        if isinstance(value, list):
+        if isinstance(value, list | tuple):   # TOML arrays; flags arrive as tuples
             return tuple(str(item) for item in value)
         raise ConfigError(f"{name} must be a list or comma-separated string")
     if isinstance(current, bool):
