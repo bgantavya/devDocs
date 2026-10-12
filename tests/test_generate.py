@@ -253,17 +253,18 @@ class TestContext(PipelineCase):
 class TestSemanticContext(PipelineCase):
     def setUp(self) -> None:
         super().setUp()
-        self.model = EmbeddingModel()
+        self.embedder = EmbeddingModel()
+        self.model = self.embedder
 
     def test_chunks_are_embedded_once(self) -> None:
         first = self.pipeline(context="semantic")
         summary = first.run(first.prepare())
-        self.assertEqual(len(self.model.batches), 1)
+        self.assertEqual(len(self.embedder.batches), 1)
         self.assertEqual(summary.requests, len(self.model.calls) + 1)
 
         again = self.pipeline(context="semantic")
         summary = again.run(again.prepare())
-        self.assertEqual(len(self.model.batches), 1)
+        self.assertEqual(len(self.embedder.batches), 1)
         self.assertEqual(summary.requests, 0)
 
     def test_estimate_quotes_the_embedding_without_buying_it(self) -> None:
@@ -273,14 +274,14 @@ class TestSemanticContext(PipelineCase):
         self.assertEqual((embed.kind, embed.model, embed.requests),
                          ("embed", "gemini-embedding-001", 1))
         self.assertGreater(embed.cost, 0.0)
-        self.assertEqual(self.model.batches, [])
+        self.assertEqual(self.embedder.batches, [])
 
     def test_embedding_never_takes_most_of_the_budget(self) -> None:
         messages: list[str] = []
         pipeline = self.pipeline(context="semantic", max_cost=0.00001,
                                  log=messages.append)
         pipeline.run(pipeline.prepare())
-        self.assertEqual(self.model.batches, [])
+        self.assertEqual(self.embedder.batches, [])
         self.assertTrue(any("semantic context skipped" in m for m in messages))
 
 
