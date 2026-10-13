@@ -153,6 +153,22 @@ class TestGenerate(CliCase):
                                     "--quiet", env=chrome)
         self.assertEqual(code, 0, err)
 
+    def test_pdf_options_without_pdf_output_are_config_errors(self) -> None:
+        # Regression: they were ignored, and the run wrote Markdown alone.
+        for flags in (["--pdf-engine", "chrome"], ["--split"], ["--no-split"],
+                      ["--page-size", "letter", "--format", "html"]):
+            with self.subTest(flags):
+                code, _, err = self.run_cli("generate", str(self.root), "--api-key",
+                                            "k", *flags)
+                self.assertEqual(code, 2)
+                self.assertIn(f"{flags[0]} applies only to PDF output", err)
+                self.assertIn("add --format pdf", err)
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--page-size", "letter", "--split")
+        self.assertEqual(code, 2)
+        self.assertIn("--page-size, --split apply only to PDF output", err)
+        self.assertEqual(self.model.calls, [])
+
 
 class TestEstimate(CliCase):
     def test_estimate_needs_no_key_and_sends_nothing(self) -> None:
