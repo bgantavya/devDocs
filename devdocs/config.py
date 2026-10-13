@@ -184,6 +184,9 @@ def _validate(config: Config) -> None:
             "semantic context needs Gemini embeddings",
             hint='use context = "standard" with Anthropic, or provider = "gemini"',
         )
+    if not config.formats:   # an empty flag, variable or list would write nothing
+        raise ConfigError("no output format configured",
+                          hint=f"choose one or more of: {', '.join(FORMATS)}")
     unknown = set(config.formats) - _FORMATS
     if unknown:
         raise ConfigError(
