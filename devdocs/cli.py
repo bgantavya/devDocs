@@ -35,6 +35,7 @@ from devdocs.llm.budget import Budget, Router
 from devdocs.llm.catalog import CATALOG, PRICES_CHECKED, Tier, catalogued
 from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.factory import PROVIDERS, OfflineModel, make_provider
+from devdocs.render import PDF_ENGINES
 
 __all__ = ["build_parser", "main"]
 
@@ -80,10 +81,27 @@ def _csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def _run_options(parser: argparse.ArgumentParser) -> None:
+def _output_options(parser: argparse.ArgumentParser) -> None:
+    """The project, where its documents go, and in which formats."""
     parser.add_argument("path", nargs="?", default=None,
                         help="project root (default: current directory)")
     parser.add_argument("--out", help="output directory, relative to the project")
+    parser.add_argument("--format", action="append", type=_csv, default=None,
+                        dest="formats", metavar="FORMAT",
+                        help="markdown, html or pdf; repeat or comma-separate "
+                             "(default: markdown)")
+    parser.add_argument("--pdf-engine", choices=PDF_ENGINES,
+                        help="builtin (default), or chrome or weasyprint "
+                             "for all of Unicode")
+    parser.add_argument("--page-size", metavar="SIZE",
+                        help="PDF paper: A4 (default) or Letter")
+    parser.add_argument("--split", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="one PDF per document instead of one book")
+
+
+def _run_options(parser: argparse.ArgumentParser) -> None:
+    _output_options(parser)
     parser.add_argument("--provider", choices=PROVIDERS)
     parser.add_argument("--model", help="use this one model for every call")
     parser.add_argument("--quality", choices=("cheap", "balanced", "high"))
@@ -97,8 +115,6 @@ def _run_options(parser: argparse.ArgumentParser) -> None:
                         metavar="PATTERN", help="force paths in, despite ignores")
     parser.add_argument("--exclude", action="append", type=_csv, default=None,
                         metavar="PATTERN", help="extra gitignore-style excludes")
-    parser.add_argument("--format", action="append", type=_csv, default=None,
-                        dest="formats", metavar="FORMAT")
     parser.add_argument("--per-file", action="store_true", default=None,
                         help="v3 layout: docs/<dir>/<name>.md")
     parser.add_argument("--paid", action="store_true",
@@ -173,6 +189,9 @@ def _config(args: argparse.Namespace) -> Config:
         "include": _flatten(getattr(args, "include", None)),
         "exclude": _flatten(getattr(args, "exclude", None)),
         "formats": _flatten(getattr(args, "formats", None)),
+        "pdf_engine": getattr(args, "pdf_engine", None),
+        "pdf_split": getattr(args, "split", None),
+        "page_size": getattr(args, "page_size", None),
         "per_file": getattr(args, "per_file", None),
         "name": getattr(args, "name", None),
         "description": getattr(args, "description", None),
@@ -230,10 +249,10 @@ def _generate(args: argparse.Namespace, out: _Output) -> int:
     key = _key(config, args.api_key, out)
     with _state(config) as db:
         client = _client(config, db, out, key=key)
-        available = client.discover()
-        out.info(f"{config.provider}: {len(available)} models available to this key")
         pipeline = Pipeline(config, client=client, db=db, log=out.info,
                             project=config.name, description=config.description)
+        available = client.discover()
+        out.info(f"{config.provider}: {len(available)} models available to this key")
         prepared = pipeline.prepare()
         summary = pipeline.run(prepared, resume=not args.no_resume)
 
@@ -252,6 +271,7 @@ def _generate(args: argparse.Namespace, out: _Output) -> int:
         lines.append(f"failed {kind} {item or '(project)'}: {error}")
     if summary.degraded:
         lines.append(f"partial symbol tables: {', '.join(summary.degraded[:10])}")
+    lines.extend(_warnings(summary.warnings))
     data = asdict(summary)
     out.result("\n".join(lines), data)
 
@@ -260,6 +280,17 @@ def _generate(args: argparse.Namespace, out: _Output) -> int:
     if summary.stopped == "quota":
         return 10
     return 4 if summary.failed else 0
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}{'' if number == 1 else 's'}"
+
+
+def _warnings(warnings: Sequence[str]) -> list[str]:
+    """A result line counting rendering warnings, which the log details."""
+    if not warnings:
+        return []
+    return [f"{_count(len(warnings), 'rendering warning')}; --json lists them all"]
 
 
 def _estimate(args: argparse.Namespace, out: _Output) -> int:
@@ -382,6 +413,10 @@ quality = "cheap"            # cheap | balanced | high
 # context = "standard"       # off | standard | semantic (Gemini embeddings)
 max_cost = 0.50              # USD ceiling per run; 0 disables it
 out = "docs"
+# formats = ["markdown"]     # any of markdown, html, pdf
+# pdf_engine = "builtin"     # builtin, or chrome | weasyprint for all of Unicode
+# pdf_split = false          # one PDF per document instead of one book
+# page_size = "A4"           # A4 | Letter
 # model = ""                 # pin one model for every call
 # include = ["scripts"]      # force paths in despite ignores
 # exclude = ["examples/"]    # extra gitignore-style excludes

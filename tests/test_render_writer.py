@@ -1,5 +1,5 @@
 """The output writer: atomic writes, quiet re-runs, and pruning that only ever
-touches files devdocs itself generated."""
+touches files devdocs itself generated; and the registry of formats."""
 
 from __future__ import annotations
 
@@ -13,8 +13,22 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from devdocs.render import MANIFEST, OutputWriter, WriteReport
+from devdocs.errors import ConfigError
+from devdocs.render import (
+    FORMATS,
+    MANIFEST,
+    PAGE_SIZES,
+    PDF_ENGINES,
+    OutputWriter,
+    Renderer,
+    WriteReport,
+    renderer_for,
+)
+from devdocs.render.html import HtmlRenderer
+from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet, RunInfo
+from devdocs.render.pdf import PdfRenderer, external, layout
+from tests.test_markdown import shop
 
 
 class WriterCase(unittest.TestCase):
@@ -292,6 +306,53 @@ class TestPruning(WriterCase):
             report = self.write({"b.md": b"B\n"})
         self.assertEqual(report.removed, [])
         self.assertTrue((self.out / "a.md").is_file())
+
+
+class TestRegistry(unittest.TestCase):
+    def test_each_format_has_its_renderer(self) -> None:
+        for fmt, kind in (("markdown", MarkdownRenderer), ("html", HtmlRenderer),
+                          ("pdf", PdfRenderer)):
+            with self.subTest(fmt):
+                renderer = renderer_for(fmt)
+                self.assertIsInstance(renderer, kind)
+                self.assertIsInstance(renderer, Renderer)
+                self.assertEqual(renderer.format, fmt)
+        self.assertEqual(FORMATS, ("markdown", "html", "pdf"))
+
+    def test_html_is_the_site(self) -> None:
+        files = renderer_for("html").render(shop())
+        self.assertIn("index.html", files)
+        self.assertNotIn("book.html", files)
+
+    def test_pdf_options_reach_the_renderer(self) -> None:
+        renderer = renderer_for("pdf", split=True, page_size="Letter")
+        assert isinstance(renderer, PdfRenderer)
+        self.assertEqual((renderer.split, renderer.page_size, renderer.engine),
+                         (True, "Letter", "builtin"))
+        with mock.patch.object(external, "find", return_value="/bin/chrome"):
+            renderer = renderer_for("pdf", pdf_engine="chrome")
+        assert isinstance(renderer, PdfRenderer)
+        self.assertEqual(renderer.engine, "chrome")
+
+    def test_unknown_formats_and_options_are_configuration_errors(self) -> None:
+        for fmt, page_size, engine in (("docx", "A4", "builtin"),
+                                       ("pdf", "A5", "builtin"),
+                                       ("pdf", "A4", "pandoc")):
+            with self.subTest(fmt=fmt, page_size=page_size, engine=engine), \
+                    self.assertRaises(ConfigError):
+                renderer_for(fmt, page_size=page_size, pdf_engine=engine)
+
+    def test_a_missing_external_engine_fails_when_the_renderer_is_made(self) -> None:
+        with mock.patch.object(external, "find", return_value=None), \
+                self.assertRaises(ConfigError) as caught:
+            renderer_for("pdf", pdf_engine="weasyprint")
+        self.assertIn("weasyprint PDF engine is not installed", str(caught.exception))
+        with mock.patch.object(external, "find", side_effect=AssertionError):
+            renderer_for("pdf")   # builtin needs nothing installed
+
+    def test_the_pdf_choices_are_the_pdf_renderers_own(self) -> None:
+        self.assertEqual(PDF_ENGINES, external.ENGINES)
+        self.assertEqual(PAGE_SIZES, tuple(layout.PAGE_SIZES))
 
 
 if __name__ == "__main__":

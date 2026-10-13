@@ -1,8 +1,12 @@
 """Turning a `DocSet` into files on disk.
 
 `Renderer` is the third extension point, beside `Parser` and `ChatModel`: a
-format is one class that maps a DocSet to `{relative path: bytes}`. Markdown
-ships first; HTML and PDF render the same model.
+format is one class that maps a DocSet to `{relative path: bytes}`.
+`renderer_for` is the registry of the formats that ship: `markdown`, the
+default; `html`, a static site; and `pdf`, one bound book or one file per
+document. Each is imported only when asked for, so a run that writes
+Markdown never loads the PDF engine. Their files never collide, as each
+format names its own with its own extensions.
 
 Writing is shared by every format and is careful in three ways. A file whose
 bytes are unchanged is not rewritten, so timestamps and diffs stay quiet. Each
@@ -25,22 +29,70 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from devdocs.errors import ConfigError
 from devdocs.render.model import DocSet
 
-__all__ = ["MANIFEST", "OutputWriter", "Renderer", "WriteReport"]
+__all__ = [
+    "FORMATS",
+    "MANIFEST",
+    "PAGE_SIZES",
+    "PDF_ENGINES",
+    "OutputWriter",
+    "Renderer",
+    "WriteReport",
+    "renderer_for",
+]
 
 MANIFEST = "index.json"
+FORMATS = ("markdown", "html", "pdf")
+PDF_ENGINES = ("builtin", "chrome", "weasyprint")
+PAGE_SIZES = ("A4", "Letter")
 
 _DRIVE = re.compile(r"[A-Za-z]:")
 
 
 @runtime_checkable
 class Renderer(Protocol):
+    """One output format. A renderer may also keep `warnings: list[str]`,
+    refilled by each `render`, for what its format could not show; the
+    pipeline reports them."""
+
     format: str
 
     def render(self, docset: DocSet) -> dict[str, bytes]:
         """Every output file for `docset`, keyed by POSIX path under the out dir."""
         ...
+
+
+def renderer_for(
+    fmt: str, *, split: bool = False, page_size: str = "A4", pdf_engine: str = "builtin"
+) -> Renderer:
+    """The renderer for format `fmt`; the other options apply to PDF only.
+
+    Raises ConfigError for an unknown format or PDF option, and for an
+    external PDF engine this machine lacks: a run then fails before it buys
+    anything, not after.
+    """
+    if fmt == "markdown":
+        from devdocs.render.markdown import MarkdownRenderer
+
+        return MarkdownRenderer()
+    if fmt == "html":
+        from devdocs.render.html import HtmlRenderer
+
+        return HtmlRenderer()
+    if fmt == "pdf":
+        from devdocs.render.pdf import PdfRenderer, external
+
+        renderer = PdfRenderer(split=split, page_size=page_size, engine=pdf_engine)
+        if pdf_engine != "builtin" and external.find(pdf_engine) is None:
+            raise ConfigError(
+                f"the {pdf_engine} PDF engine is not installed",
+                hint="install it or use --pdf-engine builtin",
+            )
+        return renderer
+    raise ConfigError(f"unknown format {fmt!r}",
+                      hint=f"choose from: {', '.join(FORMATS)}")
 
 
 @dataclass
