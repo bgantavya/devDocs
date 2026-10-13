@@ -15,7 +15,10 @@ from typing import Any
 from unittest import mock
 
 from devdocs import __version__, cli
+from devdocs.config import load_config
 from devdocs.errors import AuthError
+from devdocs.render.pdf import external
+from devdocs.render.pdf.check import PdfFile, check
 from tests.test_generate import PROJECT, TaggedModel
 
 _KEYS = ("DEVDOCS_", "GEMINI_", "GOOGLE_", "ANTHROPIC_")
@@ -38,10 +41,11 @@ class CliCase(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
         self.model = TaggedModel()
 
-    def run_cli(self, *argv: str, model: Any = None) -> tuple[int, str, str]:
+    def run_cli(self, *argv: str, model: Any = None,
+                env: dict[str, str] | None = None) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         fake = model if model is not None else self.model
-        with clean_env(), \
+        with clean_env(**(env or {})), \
                 mock.patch.object(cli, "make_provider", return_value=fake), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(list(argv))
@@ -95,6 +99,60 @@ class TestGenerate(CliCase):
         self.assertIn("deprecated", err)
         self.assertTrue((self.root / "manual" / "shop" / "cart.md").is_file())
 
+    def test_formats_reach_the_pipeline(self) -> None:
+        code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--format", "html", "--format", "markdown,pdf",
+                                    "--page-size", "letter", "--json", "--quiet")
+        self.assertEqual(code, 0)
+        docs = self.root / "docs"
+        for page in ("README.md", "index.html", "assets/style.css", "shop.pdf"):
+            self.assertTrue((docs / page).is_file(), page)
+        book = (docs / "shop.pdf").read_bytes()
+        self.assertEqual(check(book), [])
+        self.assertEqual(PdfFile(book).page(0)["MediaBox"], [0, 0, 612, 792])
+        self.assertEqual(json.loads(out)["warnings"], [])
+
+    def test_only_the_formats_asked_for_are_written(self) -> None:
+        code, _, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                  "--format", "pdf", "--split", "--quiet")
+        self.assertEqual(code, 0)
+        docs = self.root / "docs"
+        self.assertTrue((docs / "pdf" / "index.pdf").is_file())
+        self.assertTrue((docs / "pdf" / "shop" / "cart.py.pdf").is_file())
+        self.assertFalse((docs / "README.md").exists())
+
+    def test_impossible_pdf_options_are_config_errors(self) -> None:
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--format", "pdf", "--pdf-engine", "chrome",
+                                    "--split")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot split", err)
+        with mock.patch.object(external, "find", return_value=None):
+            code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                        "--format", "pdf", "--pdf-engine", "chrome")
+        self.assertEqual(code, 2)
+        self.assertIn("chrome PDF engine is not installed", err)
+        self.assertEqual(self.model.calls, [])
+
+    def test_no_split_overrides_the_file(self) -> None:
+        # Regression: --split could only say yes, so the file always won.
+        (self.root / "devdocs.toml").write_text("pdf_split = true\n", "utf-8")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--format", "pdf", "--no-split", "--quiet")
+        self.assertEqual(code, 0, err)
+        docs = self.root / "docs"
+        self.assertTrue((docs / "shop.pdf").is_file())
+        self.assertFalse((docs / "pdf").exists())
+
+    def test_a_split_file_does_not_break_commands_without_pdf(self) -> None:
+        (self.root / "devdocs.toml").write_text("pdf_split = true\n", "utf-8")
+        chrome = {"DEVDOCS_PDF_ENGINE": "chrome"}
+        code, _, err = self.run_cli("cache", "stats", str(self.root), env=chrome)
+        self.assertEqual(code, 0, err)
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", env=chrome)
+        self.assertEqual(code, 0, err)
+
 
 class TestEstimate(CliCase):
     def test_estimate_needs_no_key_and_sends_nothing(self) -> None:
@@ -145,6 +203,20 @@ class TestInitAndCache(CliCase):
         code, _, err = self.run_cli("init", str(self.root))
         self.assertEqual(code, 2)
         self.assertIn("already exists", err)
+
+    def test_every_option_the_template_mentions_is_valid(self) -> None:
+        self.run_cli("init", str(self.root))
+        text = (self.root / "devdocs.toml").read_text("utf-8")
+        for option in ("formats", "pdf_engine", "pdf_split", "page_size"):
+            self.assertIn(f"# {option} = ", text)
+        uncommented = "\n".join(
+            line.removeprefix("# ") if " = " in line else line
+            for line in text.splitlines()
+        )
+        path = self.root / "uncommented.toml"
+        path.write_text(uncommented, encoding="utf-8")
+        config = load_config(config_file=path, env={})
+        self.assertEqual((config.formats, config.page_size), (("markdown",), "A4"))
 
     def test_cache_stats_and_clear(self) -> None:
         self.run_cli("generate", str(self.root), "--api-key", "k", "--quiet")

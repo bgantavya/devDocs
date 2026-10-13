@@ -14,6 +14,9 @@ modules') — most valuable first, so a budget or quota stop cuts the least
 useful work. Every paid answer is cached the moment it lands and every item
 is recorded in the run ledger, so an interrupted run writes what it has,
 stubs the rest, and resumes next time without paying twice.
+
+Rendering comes last and costs nothing: one renderer per configured format
+turns the composed documents into files.
 """
 
 from __future__ import annotations
@@ -56,8 +59,7 @@ from devdocs.llm.providers import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 from devdocs.parse import Confidence, FileFacts, get_parser
 from devdocs.plan import Plan, Planner, PlannerOptions, fit_to_budget
 from devdocs.prompting import Prompt, PromptBuilder
-from devdocs.render import OutputWriter, Renderer, WriteReport
-from devdocs.render.markdown import MarkdownRenderer
+from devdocs.render import OutputWriter, Renderer, WriteReport, renderer_for
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
 from devdocs.render.style import StyleGuard, acceptable, parse_reply
 from devdocs.retrieve import Retriever
@@ -80,6 +82,13 @@ _QUALITY = {
 
 # Semantic context may claim at most this share of either limit.
 _EMBED_SHARE = 0.5
+
+_SHOWN_WARNINGS = 10     # per renderer in the log; summaries keep them all
+# What a format's warnings mean, and how to avoid them.
+_WARNINGS = {
+    "pdf": ("characters outside the built-in fonts were printed as '?'",
+            "for all of Unicode, use --pdf-engine chrome or --pdf-engine weasyprint"),
+}
 
 _JS_GLOBALS = frozenset({
     "Array", "ArrayBuffer", "Boolean", "Date", "Error", "JSON", "Map", "Math",
@@ -162,6 +171,7 @@ class RunSummary:
     stopped: str = ""        # "" | "budget" | "quota" | "interrupted"
     failed: list[tuple[str, str, str]] = field(default_factory=list)
     degraded: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     written: WriteReport = field(default_factory=WriteReport)
 
 
@@ -199,8 +209,11 @@ def _sha(text: str) -> str:
 class Pipeline:
     """One configured run over one project.
 
-    `client` is required for `price`, `estimate` and `run`; `prepare` needs
-    none. `log` receives one-line progress messages for the CLI.
+    `client` is required for `price`, `estimate` and `run`; `prepare` and
+    `write` need none. `log` receives one-line progress messages for the
+    CLI. Without `renderers`, there is one per configured format, built now
+    so that a missing PDF engine fails before any call. `warnings` describe
+    the last write.
     """
 
     def __init__(
@@ -219,8 +232,11 @@ class Pipeline:
         self.db = db
         self.root = Path(config.path).resolve()
         self.renderers = list(renderers) if renderers is not None else [
-            MarkdownRenderer()
+            renderer_for(fmt, split=config.pdf_split, page_size=config.page_size,
+                         pdf_engine=config.pdf_engine)
+            for fmt in dict.fromkeys(config.formats)
         ]
+        self.warnings: list[str] = []
         self.log = log or (lambda message: None)
         self.project = project or project_name(self.root)
         self.description = description
@@ -566,6 +582,7 @@ class Pipeline:
             cost_usd=round(budget.spent, 6),
         )
         summary.written = self.write(docset)
+        summary.warnings = list(self.warnings)
         summary.documents = len(docset.documents)
         summary.prose = sum(1 for d in docset.documents if d.meta.mode is Mode.PROSE)
         summary.stubs = summary.documents - summary.prose
@@ -807,11 +824,41 @@ class Pipeline:
             ))
         return docset
 
+    @property
+    def out(self) -> Path:
+        """The output directory: `config.out`, under the root when relative."""
+        return self.root / self.config.out
+
     def write(self, docset: DocSet) -> WriteReport:
-        out = Path(self.config.out)
-        if not out.is_absolute():
-            out = self.root / out
+        """Render `docset` in every format and write the files to `out`.
+
+        Rendering never calls a model. What a renderer could not show is
+        logged and kept in `warnings`.
+        """
+        files = self._render(docset)
+        return OutputWriter(self.out).write(files, docset)
+
+    def _render(self, docset: DocSet) -> dict[str, bytes]:
+        """Every format's files; refills `warnings`."""
         files: dict[str, bytes] = {}
+        self.warnings = []
         for renderer in self.renderers:
             files.update(renderer.render(docset))
-        return OutputWriter(out).write(files, docset)
+            self.warnings += self._logged_warnings(renderer)
+        return files
+
+    def _logged_warnings(self, renderer: Renderer) -> list[str]:
+        """`renderer`'s warnings from its last render, logged in one message:
+        what they mean, the first few, and how to avoid them."""
+        warnings = [str(warning) for warning in getattr(renderer, "warnings", ())]
+        if not warnings:
+            return []
+        meaning, remedy = _WARNINGS.get(renderer.format, ("warnings", ""))
+        lines = [f"{renderer.format}: {meaning} ({len(warnings)}):"]
+        lines += [f"  {warning}" for warning in warnings[:_SHOWN_WARNINGS]]
+        if len(warnings) > _SHOWN_WARNINGS:
+            lines.append(f"  and {len(warnings) - _SHOWN_WARNINGS} more")
+        if remedy:
+            lines.append(f"  {remedy}")
+        self.log("\n".join(lines))
+        return warnings

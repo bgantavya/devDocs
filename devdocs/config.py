@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from devdocs.errors import ConfigError
+from devdocs.render import FORMATS, PAGE_SIZES, PDF_ENGINES
 
 __all__ = ["Config", "KeySource", "load_config", "resolve_api_key"]
 
@@ -68,6 +69,9 @@ class Config:
     free_tier: bool = True           # pace requests to stay inside free limits
     per_file: bool = False           # v3-compatible one-doc-per-file layout
     formats: tuple[str, ...] = ("markdown",)
+    pdf_engine: str = "builtin"      # "builtin" | "chrome" | "weasyprint"
+    pdf_split: bool = False          # one PDF per document, not one book
+    page_size: str = "A4"            # "A4" | "Letter"
     name: str = ""                   # project name; else read from its manifest
     description: str = ""
     api_key: str = ""
@@ -82,7 +86,8 @@ class Config:
 _QUALITY = {"cheap", "balanced", "high"}
 _CONTEXT = {"off", "standard", "semantic"}
 _PROVIDERS = set(_ENV_KEYS)
-_FORMATS = {"markdown", "html", "pdf"}
+_FORMATS = set(FORMATS)
+_PAGE_SIZES = {size.casefold(): size for size in PAGE_SIZES}   # "letter" -> "Letter"
 
 
 def find_config_file(start: Path) -> Path | None:
@@ -185,6 +190,22 @@ def _validate(config: Config) -> None:
             f"unknown format(s): {', '.join(sorted(unknown))}",
             hint=f"choose from: {', '.join(sorted(_FORMATS))}",
         )
+    if config.pdf_engine not in PDF_ENGINES:
+        raise ConfigError(
+            f"unknown PDF engine {config.pdf_engine!r}",
+            hint=f"choose one of: {', '.join(PDF_ENGINES)}",
+        )
+    if config.page_size not in PAGE_SIZES:
+        raise ConfigError(
+            f"unknown page size {config.page_size!r}",
+            hint=f"choose one of: {', '.join(PAGE_SIZES)}",
+        )
+    if "pdf" in config.formats and config.pdf_split and config.pdf_engine != "builtin":
+        raise ConfigError(
+            f"the {config.pdf_engine} PDF engine prints one book and cannot split it",
+            hint="split with the builtin engine (--pdf-engine builtin), or print "
+                 "one book (--no-split, or pdf_split = false)",
+        )
     # TOML, argparse and float() all accept nan and inf.
     if not math.isfinite(config.max_cost):
         raise ConfigError(
@@ -244,6 +265,7 @@ def load_config(
         setattr(config, name, _coerce(name, value, getattr(config, name)))
         config.sources[name] = "flag"
 
+    config.page_size = _PAGE_SIZES.get(config.page_size.casefold(), config.page_size)
     _validate(config)
     return config
 

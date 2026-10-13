@@ -75,6 +75,79 @@ class TestPrecedence(unittest.TestCase):
         self.assertEqual(config.formats, ("html", "pdf"))
 
 
+class TestOutputSettings(unittest.TestCase):
+    def test_defaults(self) -> None:
+        config = load_config(config_file=None, env={})
+        self.assertEqual(config.formats, ("markdown",))
+        self.assertEqual((config.pdf_engine, config.pdf_split, config.page_size),
+                         ("builtin", False, "A4"))
+
+    def test_from_the_file_with_either_spelling(self) -> None:
+        path = write_config('[devdocs]\nformats = ["markdown", "html", "pdf"]\n'
+                            'pdf-engine = "chrome"\npage_size = "Letter"\n')
+        config = load_config(config_file=path, env={})
+        self.assertEqual(config.formats, ("markdown", "html", "pdf"))
+        self.assertEqual((config.pdf_engine, config.page_size), ("chrome", "Letter"))
+        self.assertEqual(config.origin_of("pdf_engine"), "file")
+        path = write_config("[devdocs]\npdf_split = true\n")
+        self.assertTrue(load_config(config_file=path, env={}).pdf_split)
+
+    def test_from_the_environment_and_flags(self) -> None:
+        env = {"DEVDOCS_FORMATS": "html, pdf", "DEVDOCS_PDF_SPLIT": "yes",
+               "DEVDOCS_PAGE_SIZE": "Letter"}
+        config = load_config({"page_size": "A4"}, config_file=None, env=env)
+        self.assertEqual(config.formats, ("html", "pdf"))
+        self.assertTrue(config.pdf_split)
+        self.assertEqual(config.origin_of("pdf_split"), "env")
+        self.assertEqual((config.page_size, config.origin_of("page_size")),
+                         ("A4", "flag"))
+        config = load_config(config_file=None, env={"DEVDOCS_PDF_ENGINE": "weasyprint"})
+        self.assertEqual(config.pdf_engine, "weasyprint")
+
+    def test_page_sizes_are_named_in_any_case(self) -> None:
+        for given, size in (("letter", "Letter"), ("LETTER", "Letter"), ("a4", "A4")):
+            with self.subTest(given):
+                config = load_config({"page_size": given}, config_file=None, env={})
+                self.assertEqual(config.page_size, size)
+
+    def test_unknown_values_are_rejected_with_the_choices(self) -> None:
+        cases = (({"pdf_engine": "pandoc"}, "chrome"), ({"page_size": "A5"}, "Letter"),
+                 ({"formats": ("docx",)}, "pdf"))
+        for overrides, choice in cases:
+            with self.subTest(overrides), self.assertRaises(ConfigError) as caught:
+                load_config(overrides, config_file=None, env={})
+            self.assertIn(choice, caught.exception.hint or "")
+
+    def test_an_external_engine_cannot_split(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            load_config({"pdf_engine": "chrome", "pdf_split": True, "formats": ["pdf"]},
+                        config_file=None, env={})
+        self.assertIn("cannot split", caught.exception.message)
+        self.assertIn("--no-split", caught.exception.hint or "")
+        config = load_config({"pdf_split": True}, config_file=None, env={})
+        self.assertEqual((config.pdf_engine, config.pdf_split), ("builtin", True))
+
+    def test_split_and_engine_only_clash_when_pdf_is_written(self) -> None:
+        # Regression: a file's pdf_split broke every command once the
+        # environment named an external engine, even with no PDF to make.
+        path = write_config("[devdocs]\npdf_split = true\n")
+        config = load_config(config_file=path, env={"DEVDOCS_PDF_ENGINE": "chrome"})
+        self.assertEqual((config.formats, config.pdf_engine, config.pdf_split),
+                         (("markdown",), "chrome", True))
+        config = load_config({"pdf_engine": "chrome", "pdf_split": False,
+                              "formats": ("pdf",)}, config_file=path, env={})
+        self.assertEqual((config.pdf_split, config.origin_of("pdf_split")),
+                         (False, "flag"))
+
+    def test_split_must_be_a_boolean(self) -> None:
+        path = write_config('[devdocs]\npdf_split = "yes"\n')
+        with self.assertRaises(ConfigError):
+            load_config(config_file=path, env={})
+        with self.assertRaises(ConfigError) as caught:
+            load_config(config_file=None, env={"DEVDOCS_PDF_SPLIT": "sometimes"})
+        self.assertIn("DEVDOCS_PDF_SPLIT", str(caught.exception))
+
+
 class TestValidation(unittest.TestCase):
     def test_rejects_unknown_provider(self) -> None:
         with self.assertRaises(ConfigError):

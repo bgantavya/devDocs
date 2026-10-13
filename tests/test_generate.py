@@ -12,10 +12,13 @@ import json
 import re
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from devdocs.config import Config
+from devdocs.errors import ConfigError
 from devdocs.generate import Pipeline
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
@@ -24,6 +27,11 @@ from devdocs.llm import Completion, Finish, Request, Usage
 from devdocs.llm.budget import Budget, Router
 from devdocs.llm.client import LLMClient
 from devdocs.llm.http import RetryPolicy
+from devdocs.render import Renderer
+from devdocs.render.markdown import MarkdownRenderer
+from devdocs.render.model import DocSet
+from devdocs.render.pdf import PdfRenderer, external
+from devdocs.render.pdf.check import PdfFile, check
 
 PROJECT = {
     "pyproject.toml": '[project]\nname = "shop"\n',
@@ -100,7 +108,8 @@ class PipelineCase(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.model = TaggedModel()
 
-    def pipeline(self, *, log: Any = None, **overrides: object) -> Pipeline:
+    def pipeline(self, *, log: Any = None, renderers: Sequence[Renderer] | None = None,
+                 **overrides: object) -> Pipeline:
         config = Config(path=self.tmp, **overrides)  # type: ignore[arg-type]
         client = LLMClient(
             self.model,
@@ -111,7 +120,8 @@ class PipelineCase(unittest.TestCase):
             retry=RetryPolicy(base_delay=0),
             free_tier=False,
         )
-        return Pipeline(config, client=client, db=self.db, log=log)
+        return Pipeline(config, client=client, db=self.db, log=log,
+                        renderers=renderers)
 
     def docs(self) -> dict[str, str]:
         out = self.tmp / "docs"
@@ -179,6 +189,110 @@ class TestRun(PipelineCase):
         summary = again.run(again.prepare())
         self.assertTrue(summary.resumed)
         self.assertGreater(summary.cache_hits, 0)
+
+
+class Noisy:
+    """A renderer whose every render warns `count` times."""
+
+    format = "pdf"
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.warnings: list[str] = []
+
+    def render(self, docset: DocSet) -> dict[str, bytes]:
+        self.warnings = [f"U+{0x4E00 + n:04X} CJK in shop/cart.py"
+                         for n in range(self.count)]
+        return {"shop.pdf": b"%PDF-1.4\n"}
+
+
+class TestFormats(PipelineCase):
+    def test_every_configured_format_is_written(self) -> None:
+        pipeline = self.pipeline(formats=("markdown", "html", "pdf"))
+        summary = pipeline.run(pipeline.prepare())
+        docs = self.tmp / "docs"
+        for page in ("README.md", "shop/cart.py.md", "index.html", "shop/cart.py.html",
+                     "assets/style.css", "shop.pdf"):
+            self.assertTrue((docs / page).is_file(), page)
+        self.assertEqual(check((docs / "shop.pdf").read_bytes()), [])
+        listed = json.loads((docs / "index.json").read_text("utf-8"))["files"]
+        self.assertEqual(listed, sorted(
+            p.relative_to(docs).as_posix() for p in docs.rglob("*")
+            if p.is_file() and p.name != "index.json"
+        ))
+        self.assertEqual(summary.warnings, [])
+
+    def test_markdown_alone_by_default_and_each_format_once(self) -> None:
+        self.assertEqual([r.format for r in self.pipeline().renderers], ["markdown"])
+        pipeline = self.pipeline(formats=("pdf", "markdown", "pdf"))
+        self.assertEqual([r.format for r in pipeline.renderers], ["pdf", "markdown"])
+
+    def test_pdf_options_come_from_the_config(self) -> None:
+        pipeline = self.pipeline(formats=("pdf",), pdf_split=True, page_size="Letter")
+        pipeline.run(pipeline.prepare())
+        split = self.tmp / "docs" / "pdf"
+        cart = (split / "shop" / "cart.py.pdf").read_bytes()
+        self.assertEqual(check(cart), [])
+        self.assertEqual(PdfFile(cart).page(0)["MediaBox"], [0, 0, 612, 792])
+        self.assertTrue((split / "index.pdf").is_file())
+        self.assertFalse((self.tmp / "docs" / "README.md").exists())
+
+    def test_explicit_renderers_win_over_the_formats(self) -> None:
+        with mock.patch.object(external, "find", return_value=None):
+            pipeline = self.pipeline(formats=("pdf",), pdf_engine="chrome",
+                                     renderers=[MarkdownRenderer()])
+        self.assertEqual([r.format for r in pipeline.renderers], ["markdown"])
+
+    def test_a_missing_pdf_engine_fails_before_anything_is_bought(self) -> None:
+        with mock.patch.object(external, "find", return_value=None), \
+                self.assertRaises(ConfigError):
+            self.pipeline(formats=("markdown", "pdf"), pdf_engine="weasyprint")
+        self.assertEqual(self.model.calls, [])
+        self.assertFalse((self.tmp / "docs").exists())
+
+    def test_writing_needs_no_model(self) -> None:
+        pipeline = Pipeline(Config(path=self.tmp, formats=("markdown", "pdf")))
+        docset = pipeline._compose(pipeline.prepare(), {})
+        report = pipeline.write(docset)
+        self.assertIn("shop.pdf", report.written)
+        self.assertIn("shop/cart.py.md", report.written)
+
+    def test_render_warnings_are_logged_with_a_remedy_and_kept(self) -> None:
+        messages: list[str] = []
+        pipeline = self.pipeline(log=messages.append,
+                                 renderers=[MarkdownRenderer(), Noisy(12)])
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(len(summary.warnings), 12)
+        (message,) = [m for m in messages if m.startswith("pdf:")]
+        lines = message.splitlines()
+        self.assertEqual(lines[0], "pdf: characters outside the built-in fonts "
+                                   "were printed as '?' (12):")
+        self.assertEqual(lines[1:11], [f"  {w}" for w in summary.warnings[:10]])
+        self.assertEqual(lines[11:], [
+            "  and 2 more",
+            "  for all of Unicode, use --pdf-engine chrome or --pdf-engine weasyprint",
+        ])
+
+    def test_warnings_describe_the_last_write_only(self) -> None:
+        noisy = Noisy(1)
+        pipeline = Pipeline(Config(path=self.tmp), renderers=[noisy])
+        docset = pipeline._compose(pipeline.prepare(), {})
+        pipeline.write(docset)
+        noisy.count = 0
+        pipeline.write(docset)
+        self.assertEqual(pipeline.warnings, [])
+
+    def test_characters_the_pdf_fonts_lack_are_reported_by_document(self) -> None:
+        (self.tmp / "shop" / "greet.py").write_text(
+            '"""Greetings."""\n\n\ndef hello() -> str:\n'
+            '    """Say 你好."""\n    return "hi"\n',
+            encoding="utf-8",
+        )
+        pipeline = self.pipeline(formats=("pdf",))
+        summary = pipeline.run(pipeline.prepare())
+        self.assertIn("U+4F60 CJK UNIFIED IDEOGRAPH-4F60 in shop/greet.py",
+                      summary.warnings)
+        self.assertIsInstance(pipeline.renderers[0], PdfRenderer)
 
 
 class TestEstimate(PipelineCase):
