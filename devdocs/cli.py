@@ -198,7 +198,25 @@ def _config(args: argparse.Namespace) -> Config:
     }
     if getattr(args, "paid", False):
         overrides["free_tier"] = False
-    return load_config(overrides)
+    config = load_config(overrides)
+    flags = _pdf_flags(config)
+    if flags and "pdf" not in config.formats:
+        raise ConfigError(
+            f"{', '.join(flags)} {'applies' if len(flags) == 1 else 'apply'} only "
+            f"to PDF output, which is not among the formats: "
+            f"{', '.join(config.formats)}",
+            hint="add --format pdf",
+        )
+    return config
+
+
+def _pdf_flags(config: Config) -> list[str]:
+    """The PDF options given on the command line, as typed. The file and the
+    environment may set them for every PDF a project makes; a flag is meant
+    for this one."""
+    named = {"pdf_engine": "--pdf-engine", "page_size": "--page-size",
+             "pdf_split": "--split" if config.pdf_split else "--no-split"}
+    return [flag for name, flag in named.items() if config.origin_of(name) == "flag"]
 
 
 def _state(config: Config) -> Database:
