@@ -139,6 +139,20 @@ class TestOutputSettings(unittest.TestCase):
         self.assertEqual((config.pdf_split, config.origin_of("pdf_split")),
                          (False, "flag"))
 
+    def test_an_empty_format_list_is_refused(self) -> None:
+        # Regression: it wrote nothing but the manifest, pruned every page
+        # the last run wrote, and exited 0.
+        cases = {
+            "file": ({}, write_config("formats = []\n"), {}),
+            "environment": ({}, None, {"DEVDOCS_FORMATS": ","}),
+            "flag": ({"formats": ()}, None, {}),
+        }
+        for name, (overrides, path, env) in cases.items():
+            with self.subTest(name), self.assertRaises(ConfigError) as caught:
+                load_config(overrides, config_file=path, env=env)
+            self.assertEqual(caught.exception.message, "no output format configured")
+            self.assertIn("markdown, html, pdf", caught.exception.hint or "")
+
     def test_split_must_be_a_boolean(self) -> None:
         path = write_config('[devdocs]\npdf_split = "yes"\n')
         with self.assertRaises(ConfigError):

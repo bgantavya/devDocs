@@ -169,6 +169,19 @@ class TestGenerate(CliCase):
         self.assertIn("--page-size, --split apply only to PDF output", err)
         self.assertEqual(self.model.calls, [])
 
+    def test_an_empty_format_list_is_refused_before_anything_is_bought(self) -> None:
+        self.run_cli("generate", str(self.root), "--api-key", "k", "--quiet")
+        docs = sorted(p.name for p in (self.root / "docs").iterdir())
+        calls = len(self.model.calls)
+        for argv, env in ((["--format", ""], None), ([], {"DEVDOCS_FORMATS": ","})):
+            with self.subTest(argv=argv, env=env):
+                code, _, err = self.run_cli("generate", str(self.root), "--api-key",
+                                            "k", *argv, env=env)
+                self.assertEqual(code, 2)
+                self.assertIn("no output format configured", err)
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertEqual(sorted(p.name for p in (self.root / "docs").iterdir()), docs)
+
 
 class TestEstimate(CliCase):
     def test_estimate_needs_no_key_and_sends_nothing(self) -> None:
