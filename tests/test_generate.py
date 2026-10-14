@@ -266,6 +266,23 @@ class TestFormats(PipelineCase):
         self.assertEqual(len(self.model.calls), calls)
         self.assertFalse((self.tmp / "docs" / "docs").exists())
 
+    def test_a_site_another_run_wrote_elsewhere_is_not_taken_for_source(self) -> None:
+        # Regression: only the out dir's manifest was read, so the scripts of
+        # a site written with another --out were documented, and paid for.
+        first = self.pipeline(formats=("html",), out=Path("site"))
+        first.run(first.prepare())
+        calls = len(self.model.calls)
+        again = self.pipeline(formats=("html",))
+        prepared = again.prepare()
+        self.assertEqual(sorted(prepared.files), ["shop/__init__.py", "shop/cart.py",
+                                                  "shop/cli.py", "shop/money.py"])
+        made = ("site/assets/filter.js", "site/assets/pages.js", "site/index.json")
+        for path in made:
+            self.assertEqual(prepared.skipped[path], "written by devdocs")
+        again.run(prepared)
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertFalse((self.tmp / "docs" / "site").exists())
+
     def test_hand_written_code_beside_the_pages_is_still_documented(self) -> None:
         first = self.pipeline()
         first.run(first.prepare())
