@@ -59,7 +59,14 @@ from devdocs.llm.providers import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 from devdocs.parse import Confidence, FileFacts, get_parser
 from devdocs.plan import Plan, Planner, PlannerOptions, fit_to_budget
 from devdocs.prompting import Prompt, PromptBuilder
-from devdocs.render import OutputWriter, Renderer, WriteReport, renderer_for
+from devdocs.render import (
+    MANIFEST,
+    OutputWriter,
+    Renderer,
+    WriteReport,
+    generated_files,
+    renderer_for,
+)
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
 from devdocs.render.style import StyleGuard, acceptable, parse_reply
 from devdocs.retrieve import Retriever
@@ -249,6 +256,11 @@ class Pipeline:
         scan = Scanner(
             self.root, include=self.config.include, exclude=self.config.exclude
         ).scan()
+        made = self._made()
+        for item in scan.files:
+            if item.relpath in made:
+                scan.skipped[item.relpath] = "written by devdocs"
+        scan.files = [f for f in scan.files if f.relpath not in made]
         coded = [f for f in scan.files if f.language]
         documentable = {f.relpath: f for f in coded if f.is_documentable}
 
@@ -302,6 +314,21 @@ class Pipeline:
             f"{plan.calls()} model calls planned ({time.monotonic() - started:.1f}s)"
         )
         return prepared
+
+    def _made(self) -> set[str]:
+        """What devdocs wrote inside the project, by relpath: the out dir's
+        manifest and every file it lists, so no HTML site's scripts are taken
+        for source to document. Hand-written files beside them are scanned as
+        usual."""
+        made: set[str] = set()
+        out = self.out.resolve()
+        if out.is_relative_to(self.root):
+            base = out.relative_to(self.root).as_posix()
+            base = "" if base == "." else base
+            listed = generated_files(out)
+            if listed:
+                made.update(posixpath.join(base, path) for path in (MANIFEST, *listed))
+        return made
 
     @staticmethod
     def _read(item: SourceFile) -> str:
