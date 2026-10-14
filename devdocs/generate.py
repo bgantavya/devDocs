@@ -554,12 +554,16 @@ class Pipeline:
 
     # -- the run -----------------------------------------------------------
 
-    def run(self, prepared: Prepared, *, resume: bool = True) -> RunSummary:
+    def run(
+        self, prepared: Prepared, *, resume: bool = True, force: bool = False
+    ) -> RunSummary:
         """Send the priced plan, then compose and write every document.
 
         Documents are written even when the run stops early on budget, quota
         or Ctrl-C: whatever was paid for is kept, the rest is stubbed, and
-        the ledger leaves the run resumable.
+        the ledger leaves the run resumable. A write refused for a file
+        devdocs did not write, see `write`, raises ConfigError; the answers
+        are cached by then, so running again costs nothing.
         """
         client = self._client()
         self._embed(prepared)
@@ -611,7 +615,12 @@ class Pipeline:
             output_tokens=sum(p.output_tokens for p in prose.values()),
             cost_usd=round(budget.spent, 6),
         )
-        summary.written = self.write(docset)
+        try:
+            summary.written = self.write(docset, force=force)
+        except ConfigError as err:   # refused before anything was written
+            cached = "the answers are cached, so running again costs nothing"
+            hint = f"{err.hint}; {cached}" if err.hint else cached
+            raise ConfigError(err.message, hint=hint) from err
         summary.warnings = list(self.warnings)
         summary.documents = len(docset.documents)
         summary.prose = sum(1 for d in docset.documents if d.meta.mode is Mode.PROSE)
@@ -859,14 +868,18 @@ class Pipeline:
         """The output directory: `config.out`, under the root when relative."""
         return self.root / self.config.out
 
-    def write(self, docset: DocSet) -> WriteReport:
+    def write(self, docset: DocSet, *, force: bool = False) -> WriteReport:
         """Render `docset` in every format and write the files to `out`.
 
         Rendering never calls a model. What a renderer could not show is
         logged and kept in `warnings`.
+
+        Raises ConfigError, before anything is written, for an output a file
+        devdocs did not write is in the way of, unless `force` replaces it;
+        see `OutputWriter`.
         """
         files = self._render(docset)
-        return OutputWriter(self.out).write(files, docset)
+        return OutputWriter(self.out).write(files, docset, force=force)
 
     def _render(self, docset: DocSet) -> dict[str, bytes]:
         """Every format's files; refills `warnings`."""
