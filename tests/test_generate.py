@@ -250,6 +250,31 @@ class TestFormats(PipelineCase):
         self.assertEqual(self.model.calls, [])
         self.assertFalse((self.tmp / "docs").exists())
 
+    def test_a_site_inside_the_project_is_not_taken_for_source(self) -> None:
+        first = self.pipeline(formats=("markdown", "html"))
+        first.run(first.prepare())
+        self.assertTrue((self.tmp / "docs" / "assets" / "filter.js").is_file())
+        calls = len(self.model.calls)
+
+        again = self.pipeline(formats=("markdown", "html"))
+        prepared = again.prepare()
+        self.assertEqual(sorted(prepared.files), ["shop/__init__.py", "shop/cart.py",
+                                                  "shop/cli.py", "shop/money.py"])
+        self.assertEqual(prepared.skipped["docs/assets/filter.js"],
+                         "written by devdocs")
+        again.run(prepared)
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertFalse((self.tmp / "docs" / "docs").exists())
+
+    def test_hand_written_code_beside_the_pages_is_still_documented(self) -> None:
+        first = self.pipeline()
+        first.run(first.prepare())
+        example = self.tmp / "docs" / "examples" / "demo.py"
+        example.parent.mkdir()
+        example.write_text('"""A worked example."""\n\n\ndef demo() -> None:\n'
+                           "    pass\n", encoding="utf-8")
+        self.assertIn("docs/examples/demo.py", self.pipeline().prepare().files)
+
     def test_writing_needs_no_model(self) -> None:
         pipeline = Pipeline(Config(path=self.tmp, formats=("markdown", "pdf")))
         docset = pipeline._compose(pipeline.prepare(), {})

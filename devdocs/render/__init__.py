@@ -40,6 +40,7 @@ __all__ = [
     "OutputWriter",
     "Renderer",
     "WriteReport",
+    "generated_files",
     "renderer_for",
 ]
 
@@ -123,7 +124,7 @@ class OutputWriter:
         manifest = _manifest(docset, listed)
         out = Path(self.out)
         out.mkdir(parents=True, exist_ok=True)
-        previous = _previous(out / MANIFEST)
+        previous = generated_files(out)
 
         report = WriteReport()
         kept: set[tuple[int, int]] = set()   # (device, inode) of every output
@@ -183,11 +184,12 @@ def _manifest(docset: DocSet, files: list[str]) -> bytes:
         return (json.dumps(data, indent=2) + "\n").encode("ascii")
 
 
-def _previous(manifest: Path) -> set[str]:
-    """What the last run wrote, per its manifest. Empty when the manifest is
-    missing, corrupt or not devdocs's, so nothing is pruned on a guess."""
+def generated_files(out: Path) -> set[str]:
+    """What the last write generated in `out`, per its manifest. Empty when
+    the manifest is missing, corrupt or not devdocs's, so nothing is pruned
+    on a guess."""
     try:
-        data = json.loads(manifest.read_bytes())
+        data = json.loads((Path(out) / MANIFEST).read_bytes())
     except (OSError, ValueError, RecursionError):
         return set()
     if not isinstance(data, dict) or "schema_version" not in data:
