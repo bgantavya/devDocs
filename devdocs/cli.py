@@ -100,6 +100,12 @@ def _output_options(parser: argparse.ArgumentParser) -> None:
                         help="one PDF per document instead of one book")
 
 
+def _force_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--force", action="store_true",
+                        help="replace files in the output directory that "
+                             "devdocs has no record of writing")
+
+
 def _run_options(parser: argparse.ArgumentParser) -> None:
     _output_options(parser)
     parser.add_argument("--provider", choices=PROVIDERS)
@@ -136,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     generate = commands.add_parser("generate", help="write docs for a project")
     _run_options(generate)
+    _force_option(generate)
     generate.add_argument("--no-resume", action="store_true",
                           help="start a fresh run instead of resuming")
 
@@ -272,7 +279,7 @@ def _generate(args: argparse.Namespace, out: _Output) -> int:
         available = client.discover()
         out.info(f"{config.provider}: {len(available)} models available to this key")
         prepared = pipeline.prepare()
-        summary = pipeline.run(prepared, resume=not args.no_resume)
+        summary = pipeline.run(prepared, resume=not args.no_resume, force=args.force)
 
     lines = [
         f"{summary.documents} documents ({summary.prose} with prose, "

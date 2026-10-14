@@ -1,14 +1,19 @@
 """The output writer: atomic writes, quiet re-runs, and pruning that only ever
-touches files devdocs itself generated; and the registry of formats."""
+touches files devdocs itself generated; reading a run back from its
+manifest; and the registry of formats."""
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
 import shutil
 import stat
 import tempfile
 import unittest
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -22,6 +27,7 @@ from devdocs.render import (
     OutputWriter,
     Renderer,
     WriteReport,
+    read_manifest,
     renderer_for,
 )
 from devdocs.render.html import HtmlRenderer
@@ -29,6 +35,30 @@ from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet, RunInfo
 from devdocs.render.pdf import PdfRenderer, external, layout
 from tests.test_markdown import shop
+
+ODD = b"caf\xe9".decode("utf-8", "surrogateescape")   # a Linux name, as os.walk has it
+
+
+@contextlib.contextmanager
+def unnameable(word: str) -> Iterator[None]:
+    """A file system that cannot name a path holding `word`, as macOS cannot
+    name bytes that are not UTF-8: making a file or directory there, or
+    renaming one to it, fails with EILSEQ, while a lookup finds nothing."""
+
+    def refusing(real: Callable[..., Any]) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            for arg in args:
+                if isinstance(arg, (str, os.PathLike)) and word in os.fspath(arg):
+                    raise OSError(errno.EILSEQ, os.strerror(errno.EILSEQ),
+                                  os.fspath(arg))
+            return real(*args, **kwargs)
+        return call
+
+    with contextlib.ExitStack() as stack:
+        for name in ("open", "mkdir", "replace"):
+            stack.enter_context(mock.patch(f"devdocs.render.os.{name}",
+                                           side_effect=refusing(getattr(os, name))))
+        yield
 
 
 class WriterCase(unittest.TestCase):
@@ -123,8 +153,10 @@ class TestWriting(WriterCase):
     def test_a_failed_write_keeps_the_old_file_and_cleans_up(self) -> None:
         self.write({"a.md": b"old\n"})
         failing = mock.patch("devdocs.render.os.replace", side_effect=OSError("full"))
-        with failing, self.assertRaises(OSError):
+        with failing, self.assertRaises(ConfigError) as caught:
             self.write({"a.md": b"new\n"})
+        self.assertEqual(caught.exception.message,
+                         f"cannot write a.md in {self.out}: full")
         tree = self.tree()
         self.assertEqual(sorted(tree), ["a.md", "index.json"])
         self.assertEqual(tree["a.md"], b"old\n")
@@ -142,8 +174,26 @@ class TestWriting(WriterCase):
             report = self.write({name: b"E\n"})
         self.assertEqual(report.written, sorted([name, MANIFEST]))
         self.assertEqual((self.out / name).read_bytes(), b"E\n")
-        self.assertEqual(len(lengths), 2)
+        self.assertEqual(len(lengths), 4)   # each probed, then written
         self.assertLessEqual(max(lengths), 255)
+
+    def test_a_temp_name_too_long_where_the_name_fits_is_cut(self) -> None:
+        """eCryptfs caps names at 143 bytes and Windows whole paths, so the
+        target's name may fit where a temp name holding all of it does not.
+        This one fits the cap exactly, so no temp name holding it does,
+        whatever the process id."""
+        name = "p" * 140 + ".md"
+        real_open = os.open
+
+        def capped(path: Any, flags: int, mode: int = 0o777) -> int:
+            if len(os.fsencode(os.path.basename(path))) > 143:
+                raise OSError(errno.ENAMETOOLONG, os.strerror(errno.ENAMETOOLONG), path)
+            return real_open(path, flags, mode)
+
+        with mock.patch("devdocs.render.os.open", side_effect=capped):
+            report = self.write({name: b"P\n"})
+        self.assertEqual(report.written, sorted([name, MANIFEST]))
+        self.assertEqual(sorted(self.tree()), sorted([name, MANIFEST]))
 
     def test_temp_files_never_open_an_existing_name(self) -> None:
         opened: list[tuple[str, int]] = []
@@ -157,17 +207,24 @@ class TestWriting(WriterCase):
 
         with mock.patch("devdocs.render.os.open", side_effect=taken_once):
             self.write({"a.md": b"A\n"})
-        self.assertEqual(len(opened), 3)   # a.md taken, a.md retried, index.json
+        # probes: index.json taken, retried; a.md; then each written
+        self.assertEqual(len(opened), 5)
         self.assertNotEqual(opened[0][0], opened[1][0])
         exclusive = os.O_CREAT | os.O_EXCL
         self.assertTrue(all(flags & exclusive == exclusive for _, flags in opened))
         self.assertEqual(sorted(self.tree()), ["a.md", "index.json"])
 
-    def test_a_directory_in_the_way_raises_and_cleans_up(self) -> None:
+    def test_a_directory_in_the_way_is_refused_before_anything_is_written(
+        self,
+    ) -> None:
         (self.out / "a.md").mkdir(parents=True)
-        with self.assertRaises(OSError):
-            self.write({"a.md": b"A\n"})
-        self.assertEqual(self.tree(), {})
+        for force in (False, True):
+            with self.subTest(force=force), self.assertRaises(ConfigError) as caught:
+                OutputWriter(self.out).write({"a.md": b"A\n", "b.md": b"B\n"},
+                                             self.docset, force=force)
+            self.assertIn("a directory", caught.exception.message)
+            self.assertTrue(caught.exception.message.endswith(" a.md"))
+            self.assertEqual(self.tree(), {})
 
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_new_files_get_the_permissions_of_a_plain_write(self) -> None:
@@ -235,34 +292,45 @@ class TestPruning(WriterCase):
         self.assertEqual(sorted(self.tree()), ["index.json", "new.md", "old.md"])
 
     def test_a_corrupt_or_foreign_manifest_is_not_trusted(self) -> None:
-        listed = {"schema_version": "1.0.0", "files": ["old.md"]}
+        """Nothing it lists is pruned, and as a file devdocs cannot tell it
+        wrote, only `force` replaces it."""
+        listed = {"schema_version": "1.0.0", "documents": [], "files": ["old.md"]}
         cases = {
             "not json": b"{oops",
             "not utf-8": b"\x80{}",
             "not an object": json.dumps(["old.md"]).encode(),
             "foreign": json.dumps({"files": ["old.md"]}).encode(),
+            "no documents": json.dumps({**listed, "documents": None}).encode(),
             "files not a list": json.dumps({**listed, "files": "old.md"}).encode(),
             "too deep": b"[" * 100_000 + b"]" * 100_000,
-            "a directory": None,
         }
         for name, manifest in cases.items():
             with self.subTest(name):
                 shutil.rmtree(self.out, ignore_errors=True)
                 self.plant("old.md")
-                if manifest is None:
-                    (self.out / MANIFEST).mkdir()
-                    with self.assertRaises(OSError):
-                        self.write({"new.md": b"N\n"})
-                else:
-                    self.plant(MANIFEST, manifest)
-                    self.assertEqual(self.write({"new.md": b"N\n"}).removed, [])
+                self.plant(MANIFEST, manifest)
+                with self.assertRaises(ConfigError) as caught:
+                    self.write({"new.md": b"N\n"})
+                self.assertTrue(caught.exception.message.endswith(": index.json"))
+                self.assertEqual(self.tree(), {"index.json": manifest,
+                                               "old.md": b"hand-written\n"})
+                report = OutputWriter(self.out).write({"new.md": b"N\n"},
+                                                      self.docset, force=True)
+                self.assertEqual(report.removed, [])
                 self.assertTrue((self.out / "old.md").is_file())
+                self.assertEqual(self.manifest()["files"], ["new.md"])
+        with self.subTest("a directory"):
+            shutil.rmtree(self.out, ignore_errors=True)
+            (self.out / MANIFEST).mkdir(parents=True)
+            with self.assertRaises(ConfigError):
+                OutputWriter(self.out).write({"new.md": b"N\n"}, self.docset,
+                                             force=True)
+            self.assertEqual(self.tree(), {})
 
     def test_a_manifest_entry_naming_no_possible_file_is_skipped(self) -> None:
         self.plant("old.md")
-        self.plant(MANIFEST, json.dumps({"schema_version": "1.0.0", "files": [
-            "\ud800.md", "old.md",
-        ]}).encode())
+        self.plant(MANIFEST, json.dumps({"schema_version": "1.0.0", "documents": [],
+                                         "files": ["\ud800.md", "old.md"]}).encode())
         report = self.write({"new.md": b"N\n"})
         self.assertEqual(report.removed, ["old.md"])
         self.assertEqual(self.manifest()["files"], ["new.md"])
@@ -278,9 +346,10 @@ class TestPruning(WriterCase):
         (self.out / "dir.md").mkdir()
         (self.out / "link.md").symlink_to(outside)
         (self.out / "jump").symlink_to(elsewhere, target_is_directory=True)
-        self.plant(MANIFEST, json.dumps({"schema_version": "1.0.0", "files": [
+        self.plant(MANIFEST, json.dumps({"schema_version": "1.0.0", "documents": [],
+                                         "files": [
             "../outside.md", str(outside), "dir.md", "link.md", "jump/x.md",
-            "missing.md", "a\\b.md", 42, None, "listed.md",
+            "missing.md", "a\\b.md", 42, None, "listed.md", "index.json",
         ]}).encode())
         report = self.write({})
         self.assertEqual(report.removed, ["listed.md"])
@@ -299,6 +368,7 @@ class TestPruning(WriterCase):
         self.assertEqual(report, WriteReport(written=["index.json"],
                                              unchanged=["page.md"]))
         self.assertTrue((self.out / "alias.md").is_file())
+        self.assertEqual(self.manifest()["files"], ["page.md"])
 
     def test_a_file_that_cannot_be_removed_is_skipped(self) -> None:
         self.write({"a.md": b"A\n", "b.md": b"B\n"})
@@ -306,6 +376,432 @@ class TestPruning(WriterCase):
             report = self.write({"b.md": b"B\n"})
         self.assertEqual(report.removed, [])
         self.assertTrue((self.out / "a.md").is_file())
+
+
+class TestConflicts(WriterCase):
+    """A file devdocs did not write, where an output goes, is never replaced
+    or later pruned without `force`."""
+
+    def force(self, files: dict[str, bytes]) -> WriteReport:
+        return OutputWriter(self.out).write(files, self.docset, force=True)
+
+    def assert_refused(self, files: dict[str, bytes], *paths: str) -> None:
+        before = self.tree()
+        with self.assertRaises(ConfigError) as caught:
+            self.write(files)
+        self.assertIn("devdocs has no record of writing", caught.exception.message)
+        self.assertTrue(caught.exception.message.endswith(": " + ", ".join(paths)))
+        self.assertIn("--force", caught.exception.hint or "")
+        self.assertEqual(self.tree(), before)
+
+    def test_a_first_write_refuses_hand_written_files_before_writing(self) -> None:
+        self.plant("index.html", b"<h1>Our landing page</h1>\n")
+        self.plant("assets/style.css", b"/* our theme */\n")
+        site = {"index.html": b"<p>site</p>\n", "assets/style.css": b"p {}\n",
+                "page.html": b"<p>page</p>\n"}
+        self.assert_refused(site, "assets/style.css", "index.html")
+
+    def test_a_file_the_manifest_does_not_list_is_refused(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.plant("README.md", b"# Our docs\n")
+        self.assert_refused({"a.md": b"A\n", "README.md": b"# Home\n"}, "README.md")
+
+    def test_force_replaces_them_and_lists_them_as_generated(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.plant("README.md", b"# Our docs\n")
+        report = self.force({"a.md": b"A\n", "README.md": b"# Home\n"})
+        self.assertEqual(report.written, ["README.md", "index.json"])
+        self.assertEqual(self.manifest()["files"], ["README.md", "a.md"])
+        self.assertEqual(self.write({"a.md": b"A\n"}).removed, ["README.md"])
+
+    def test_a_file_already_right_is_left_alone_and_never_pruned(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.plant(".nojekyll", b"")
+        report = self.write({"a.md": b"A\n", ".nojekyll": b""})
+        self.assertEqual(report, WriteReport(unchanged=[".nojekyll", "a.md",
+                                                        "index.json"]))
+        self.assertEqual(self.manifest()["files"], ["a.md"])
+        self.assertEqual(self.force({"a.md": b"A\n", ".nojekyll": b""}).written, [])
+        self.assertEqual(self.write({"a.md": b"A\n"}).removed, [])
+        self.assertTrue((self.out / ".nojekyll").is_file())
+
+    def test_without_a_manifest_identical_files_are_taken_as_generated(self) -> None:
+        """What a lost manifest leaves: the pages, exactly as they would be
+        written again, so nothing to refuse and nothing to lose."""
+        self.plant("a.md", b"A\n")
+        report = self.write({"a.md": b"A\n", "b.md": b"B\n"})
+        self.assertEqual(report, WriteReport(written=["b.md", "index.json"],
+                                             unchanged=["a.md"]))
+        self.assertEqual(self.manifest()["files"], ["a.md", "b.md"])
+        self.assertEqual(self.write({"b.md": b"B\n"}).removed, ["a.md"])
+
+    def test_a_write_that_dies_midway_leaves_a_record_of_its_files(self) -> None:
+        """A rename failing, as over a file Windows holds open: the files
+        renamed by then stay, the rest are as they were, and the manifest,
+        renamed first, lists them all. Regression: the hint asked for write
+        access to a directory devdocs could write."""
+        self.write({"a.md": b"A\n"})
+        real_replace = os.replace
+
+        def locked_at_c(source: Any, target: Any) -> None:
+            if os.fspath(target).endswith("c.md"):
+                raise PermissionError(errno.EACCES, "locked", os.fspath(source),
+                                      None, os.fspath(target))
+            real_replace(source, target)
+
+        with mock.patch("devdocs.render.os.replace", side_effect=locked_at_c), \
+                self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n", "b.md": b"B\n", "c.md": b"C\n", "d.md": b"D\n"})
+        self.assertEqual(caught.exception.message,
+                         f"cannot write c.md in {self.out}: locked")
+        self.assertEqual(caught.exception.hint, (
+            f"{self.out / 'c.md'} is locked or read-only: close any program that "
+            "has it open, or clear its read-only or immutable flag, then run again"))
+        self.assertEqual(sorted(self.tree()), ["a.md", "b.md", "index.json"])
+        self.assertEqual(self.manifest()["files"], ["a.md", "b.md", "c.md", "d.md"])
+        report = self.write({"a.md": b"A\n", "b.md": b"B2\n"})
+        self.assertEqual(report.written, ["b.md", "index.json"])
+        self.assertEqual(self.manifest()["files"], ["a.md", "b.md"])
+
+    @unittest.skipUnless(hasattr(os, "link"), "needs hard links")
+    def test_another_name_for_a_listed_file_is_not_a_conflict(self) -> None:
+        """A source renamed only in case: a case-insensitive disk finds the
+        old page under the new name; a hard link stands in for that here."""
+        self.write({"Page.md": b"old\n"})
+        os.link(self.out / "Page.md", self.out / "page-alias.md")
+        report = self.write({"page-alias.md": b"new\n"})
+        self.assertEqual(report.written, ["index.json", "page-alias.md"])
+        self.assertEqual(self.manifest()["files"], ["page-alias.md"])
+
+    def test_the_error_names_the_first_few_files_and_counts_the_rest(self) -> None:
+        names = [f"p{n}.md" for n in range(8)]
+        for name in names:
+            self.plant(name)
+        with self.assertRaises(ConfigError) as caught:
+            self.write(dict.fromkeys(names, b"page\n"))
+        self.assertTrue(caught.exception.message.startswith(
+            "refusing to replace 8 files in "))
+        self.assertTrue(caught.exception.message.endswith(
+            ": p0.md, p1.md, p2.md, p3.md, p4.md and 3 more"))
+
+
+class TestFailures(WriterCase):
+    """A write the file system fails is a ConfigError that names the file
+    and says what to do, never a bare OSError; most fail before anything
+    has changed."""
+
+    def test_a_name_the_file_system_cannot_hold_changes_nothing(self) -> None:
+        """Regression: on macOS a page named for a Linux file holding a byte
+        that is not UTF-8 ended the run as an internal error, after earlier
+        pages and the manifest had been replaced. The byte sits past the
+        first 40 characters, where an older temp name did not reach."""
+        self.write({"a.md": b"A\n", "sub/b.md": b"B\n"})
+        before, dirs = self.tree(), self.dirs()
+        for name in (f"{'x' * 50}{ODD}.py.md", f"new/{ODD}/x.py.md"):
+            with self.subTest(name=name):
+                with unnameable(ODD), self.assertRaises(ConfigError) as caught:
+                    self.write({"a.md": b"A2\n", name: b"X\n", "z.md": b"Z\n"})
+                error = caught.exception
+                self.assertEqual(error.message, (
+                    f"cannot write {name} in {self.out}: the file system cannot "
+                    f"name it ({os.strerror(errno.EILSEQ)})"))
+                self.assertEqual(error.hint, (
+                    "rename the source file it documents so its name is UTF-8, "
+                    "then run `devdocs generate` again; or choose an --out on a "
+                    "file system that can name it"))
+                self.assertEqual(error.exit_code, 2)
+                self.assertEqual((self.tree(), self.dirs()), (before, dirs))
+
+    def test_a_name_this_file_system_refuses_writes_nothing(self) -> None:
+        probe = self.base / f"{ODD}.probe"
+        try:
+            os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        except OSError:
+            pass
+        else:
+            self.skipTest("this file system names any bytes, as Linux does")
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"README.md": b"R\n", f"{ODD}.py.md": b"C\n"})
+        self.assertIn(f"cannot write {ODD}.py.md in ", caught.exception.message)
+        self.assertFalse(self.out.exists())
+        self.out = self.base / f"docs-{ODD}"
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"README.md": b"R\n"})
+        self.assertEqual(caught.exception.hint, "choose an --out whose path is UTF-8")
+
+    def test_an_out_the_file_system_cannot_name_is_named(self) -> None:
+        """Regression: where the out dir's path, not a page's, holds bytes
+        that are not UTF-8, the hint said to rename a source file."""
+        for out in (self.base / f"docs-{ODD}", self.base / ODD / "docs"):
+            with self.subTest(out=out):
+                self.out = out
+                with unnameable(ODD), self.assertRaises(ConfigError) as caught:
+                    self.write({"a.md": b"A\n"})
+                self.assertEqual(caught.exception.message, (
+                    f"cannot write to {out}: the file system cannot name it "
+                    f"({os.strerror(errno.EILSEQ)})"))
+                self.assertEqual(caught.exception.hint,
+                                 "choose an --out whose path is UTF-8")
+                self.assertEqual(os.listdir(self.base), [])
+
+    @unittest.skipIf(os.name == "nt", "Windows has its own limits and errors")
+    def test_an_out_whose_path_is_too_long_is_named(self) -> None:
+        """Regression: the hint said to shorten a source file's name."""
+        self.out = self.base / ("d" * 300) / "docs"
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n"})
+        self.assertEqual(caught.exception.message, (
+            f"cannot write to {self.out}: {os.strerror(errno.ENAMETOOLONG)}"))
+        self.assertEqual(caught.exception.hint, "choose an --out with a shorter path")
+
+    @unittest.skipIf(os.name == "nt", "Windows has its own limits and errors")
+    def test_a_name_too_long_is_found_before_anything_is_written(self) -> None:
+        """Looked up where the out dir exists, else once the write has made
+        its directory; either way before any rename. Directories made for it
+        go again, innermost first."""
+        name = "x" * 300 + ".md"
+        for where, first in ((name, True), (name, False), (f"new/{name}", False),
+                             (f"new/sub/{name}", False)):
+            with self.subTest(where=where, first=first):
+                shutil.rmtree(self.out, ignore_errors=True)
+                if not first:
+                    self.write({"a.md": b"A\n"})
+                before, dirs = self.tree(), self.dirs()
+                with self.assertRaises(ConfigError) as caught:
+                    self.write({"a.md": b"A2\n", where: b"X\n"})
+                self.assertEqual(caught.exception.message, (
+                    f"cannot write {where} in {self.out}: "
+                    f"{os.strerror(errno.ENAMETOOLONG)}"))
+                self.assertIn("shorten the source file's name",
+                              caught.exception.hint or "")
+                if first:
+                    self.assertFalse(self.out.exists())
+                else:
+                    self.assertEqual((self.tree(), self.dirs()), (before, dirs))
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_devdocs_may_not_write_is_named(self) -> None:
+        self.write({"a.md": b"A\n"})
+        before = self.tree()
+        os.chmod(self.out, 0o555)
+        self.addCleanup(os.chmod, self.out, 0o755)
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A2\n", "b.md": b"B\n"})
+        self.assertTrue(caught.exception.message.startswith(
+            f"cannot write index.json in {self.out}: "))
+        self.assertEqual(caught.exception.hint,
+                         f"devdocs needs write access to {self.out}")
+        self.assertEqual(self.tree(), before)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_the_directory_out_cannot_be_made_in_is_named(self) -> None:
+        site = self.base / "site"
+        site.mkdir()
+        os.chmod(site, 0o555)
+        self.addCleanup(os.chmod, site, 0o755)
+        self.out = site / "docs"
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n"})
+        self.assertEqual(caught.exception.message,
+                         f"cannot write to {self.out}: {os.strerror(errno.EACCES)}")
+        self.assertEqual(caught.exception.hint, f"devdocs needs write access to {site}")
+
+    @unittest.skipUnless(hasattr(os, "chflags"), "BSD file flags")
+    def test_a_file_flagged_immutable_is_named_with_what_to_do(self) -> None:
+        """Its rename fails midway. Regression: the hint asked for write
+        access to the out dir, which devdocs had."""
+        self.write({"a.md": b"A\n", "b.md": b"B\n"})
+        target = self.out / "b.md"
+        try:
+            os.chflags(target, stat.UF_IMMUTABLE)
+        except OSError:
+            self.skipTest("this file system keeps no file flags")
+        self.addCleanup(os.chflags, target, 0)
+        pages = {"a.md": b"A2\n", "b.md": b"B2\n"}
+        with self.assertRaises(ConfigError) as caught:
+            self.write(pages)
+        self.assertEqual(caught.exception.message,
+                         f"cannot write b.md in {self.out}: {os.strerror(errno.EPERM)}")
+        self.assertEqual(caught.exception.hint, (
+            f"{target} is locked or read-only: close any program that has it "
+            "open, or clear its read-only or immutable flag, then run again"))
+        os.chflags(target, 0)
+        self.assertEqual(self.write(pages).written, ["b.md"])
+
+    def test_only_one_temp_file_is_there_at_a_time(self) -> None:
+        """Regression: every temp file was written before any was renamed,
+        so a rewrite needed room on the disk for all its files at once, and
+        a process killed midway left them all behind."""
+        self.write({f"p{n}.md": b"old\n" for n in range(5)})
+        counts: list[int] = []
+        real_fsync = os.fsync
+
+        def counting(handle: int) -> None:
+            counts.append(sum(path.suffix == ".tmp" for path in self.out.iterdir()))
+            real_fsync(handle)
+
+        self.docset = DocSet(project="two")
+        with mock.patch("devdocs.render.os.fsync", side_effect=counting):
+            report = self.write({f"p{n}.md": b"new\n" for n in range(5)})
+        self.assertEqual(len(report.written), 6)
+        self.assertEqual(counts, [1] * 6)
+
+    def test_a_disk_that_fills_midway_leaves_a_record_of_its_files(self) -> None:
+        """The files renamed by then are new and the rest as they were, no
+        temp file stays, and the manifest, renamed first, holds the new
+        record and lists them all; the next write finishes the job."""
+        self.write({"a.md": b"A\n", "b.md": b"B\n", "c.md": b"C\n"})
+        real_fsync = os.fsync
+
+        def full_at_c(handle: int) -> None:
+            if any(path.name.startswith(".c.md.") for path in self.out.iterdir()):
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            real_fsync(handle)
+
+        self.docset = DocSet(project="two")
+        pages = {"a.md": b"A2\n", "b.md": b"B2\n", "c.md": b"C2\n"}
+        with mock.patch("devdocs.render.os.fsync", side_effect=full_at_c), \
+                self.assertRaises(ConfigError) as caught:
+            self.write(pages)
+        self.assertEqual(caught.exception.message, (
+            f"cannot write c.md in {self.out}: {os.strerror(errno.ENOSPC)}"))
+        self.assertEqual(caught.exception.hint,
+                         "free some space on the disk, then run again")
+        tree = self.tree()
+        self.assertEqual(sorted(tree), ["a.md", "b.md", "c.md", MANIFEST])
+        self.assertEqual((tree["a.md"], tree["b.md"], tree["c.md"]),
+                         (b"A2\n", b"B2\n", b"C\n"))
+        self.assertEqual(read_manifest(self.out).project, "two")
+        self.assertEqual(self.manifest()["files"], ["a.md", "b.md", "c.md"])
+        self.assertEqual(self.write(pages), WriteReport(
+            written=["c.md"], unchanged=["a.md", "b.md", MANIFEST]))
+
+    def test_each_failure_names_the_file_and_what_to_do(self) -> None:
+        """Making the temp file fails for most causes; a directory that
+        appears where a page goes fails its rename."""
+        self.write({"a.md": b"A\n"})
+        before = self.tree()
+        cases = [
+            ("open", errno.EACCES, f"devdocs needs write access to {self.out}"),
+            ("open", errno.EPERM, f"devdocs needs write access to {self.out}"),
+            ("open", errno.EROFS,
+             "choose an --out on a file system devdocs can write to"),
+            ("open", errno.ENOSPC, "free some space on the disk, then run again"),
+            ("open", errno.EIO,
+             f"check that devdocs can write to {self.out}, or choose another --out"),
+            ("replace", errno.EISDIR,
+             "a file or directory is in the way: move it away or choose another --out"),
+        ]
+        for call, code, hint in cases:
+            with self.subTest(call=call, errno=errno.errorcode[code]):
+                failing = mock.patch(f"devdocs.render.os.{call}",
+                                     side_effect=OSError(code, os.strerror(code)))
+                with failing, self.assertRaises(ConfigError) as caught:
+                    self.write({"a.md": b"A2\n"})
+                reason = os.strerror(code)
+                self.assertEqual(caught.exception.message,
+                                 f"cannot write a.md in {self.out}: {reason}")
+                self.assertEqual(caught.exception.hint, hint)
+                self.assertEqual(caught.exception.exit_code, 2)
+                self.assertEqual(self.tree(), before)
+
+    def test_a_manifest_that_fails_after_pruning_leaves_one_still_read(self) -> None:
+        """The manifest written ahead still lists the pruned file; the next
+        write finds it gone and lists only what is there."""
+        self.write({"a.md": b"A\n", "old.md": b"O\n"})
+        real_open = os.open
+
+        def no_manifest(path: Any, flags: int, mode: int = 0o777) -> int:
+            if os.path.basename(path).startswith(f".{MANIFEST}."):
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), path)
+            return real_open(path, flags, mode)
+
+        with mock.patch("devdocs.render.os.open", side_effect=no_manifest), \
+                self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n"})
+        self.assertTrue(caught.exception.message.startswith(
+            f"cannot write {MANIFEST} in {self.out}: "))
+        self.assertEqual(sorted(self.tree()), ["a.md", "index.json"])
+        self.assertEqual(self.manifest()["files"], ["a.md", "old.md"])
+        self.assertEqual(self.write({"a.md": b"A\n"}),
+                         WriteReport(written=["index.json"], unchanged=["a.md"]))
+        self.assertEqual(self.manifest()["files"], ["a.md"])
+
+
+class TestReadingTheManifest(WriterCase):
+    def test_the_docset_comes_back_as_written(self) -> None:
+        docset = shop()
+        docset.run = RunInfo(generator="devdocs 4.0.0",
+                             generated_at="2026-11-02T10:00:00+00:00", requests=3)
+        OutputWriter(self.out).write({"a.md": b"A\n"}, docset)
+        again = read_manifest(self.out)
+        self.assertEqual(again.to_dict(), docset.to_dict())
+        self.assertEqual(again.run, docset.run)
+
+    def assert_refused(self, manifest: bytes | None, *words: str) -> ConfigError:
+        shutil.rmtree(self.out, ignore_errors=True)
+        if manifest is not None:
+            self.plant(MANIFEST, manifest)
+        with self.assertRaises(ConfigError) as caught:
+            read_manifest(self.out)
+        for word in words:
+            self.assertIn(word, str(caught.exception))
+        self.assertEqual(caught.exception.exit_code, 2)
+        return caught.exception
+
+    def test_a_missing_manifest_says_to_generate_first(self) -> None:
+        refused = self.assert_refused(None, "index.json is missing")
+        self.assertIn("devdocs generate", refused.hint or "")
+
+    def test_an_unreadable_or_foreign_manifest_is_refused(self) -> None:
+        documents = [{"id": "x", "kind": "file", "title": "x"}]   # no path
+        cases: dict[str, tuple[bytes, tuple[str, ...]]] = {
+            "not json": (b"{oops", ("cannot read",)),
+            "too deep": (b"[" * 100_000 + b"]" * 100_000, ()),   # 3.15 parses it
+            "not an object": (b"[]", ("not a devdocs manifest",)),
+            "foreign": (b'{"files": []}', ("not a devdocs manifest",)),
+            "older": (b'{"schema_version": "0.9.0"}', ("not readable",)),
+            "malformed": (json.dumps({"schema_version": "1.0.0",
+                                      "documents": documents}).encode(), ("path",)),
+            "not a list": (b'{"schema_version": "1.0.0", "documents": 7}',
+                           ("cannot read",)),
+        }
+        for name, (manifest, words) in cases.items():
+            with self.subTest(name):
+                refused = self.assert_refused(manifest, *words)
+                self.assertIn("devdocs generate", refused.hint or "")
+        with self.subTest("a directory"):
+            shutil.rmtree(self.out, ignore_errors=True)
+            (self.out / MANIFEST).mkdir(parents=True)
+            with self.assertRaises(ConfigError):
+                read_manifest(self.out)
+
+    def test_a_newer_schema_is_refused_by_name(self) -> None:
+        data = shop().to_dict()
+        data["schema_version"] = "2.0.0"
+        refused = self.assert_refused(json.dumps(data).encode(), "newer devdocs",
+                                      "2.0.0")
+        self.assertIn("upgrade devdocs", refused.hint or "")
+
+    def test_a_newer_minor_version_is_read(self) -> None:
+        data = shop().to_dict()
+        data["schema_version"] = "1.9.0"
+        self.plant(MANIFEST, json.dumps(data).encode())
+        self.assertEqual(len(read_manifest(self.out).documents), len(data["documents"]))
+
+    def test_documents_that_would_write_outside_out_or_twice_are_refused(self) -> None:
+        good = shop()
+        first = good.documents[0]
+        for name, documents in (
+            ("unsafe", [replace(first, path="../../escape")]),
+            ("empty", [replace(first, path="")]),
+            ("twice", [first, replace(first, path="elsewhere")]),
+        ):
+            with self.subTest(name):
+                data = DocSet(project="demo", documents=documents).to_dict()
+                self.assert_refused(json.dumps(data).encode(), repr(first.id))
 
 
 class TestRegistry(unittest.TestCase):
