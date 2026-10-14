@@ -1,9 +1,10 @@
-/* devdocs copies this page filter into every HTML site it writes. Every
-   site page loads it, deferred, after pages.js, which lists each page as
-   [title, path from the site root, summary]. It adds a search box to the
-   masthead that lists the pages whose title and summary hold every word
-   typed. Without JavaScript, or without pages.js, nothing is added and the
-   site works as it is. Text goes in as text only. */
+/* @generated: devdocs copies this page filter into every HTML site it
+   writes, and the marker keeps a scan of that site from taking it for
+   source. Every site page loads it, deferred, after pages.js, which lists
+   each page as [title, path from the site root, summary]. It adds a search
+   box to the masthead that lists the pages whose title and summary hold
+   every word typed. Without JavaScript, or without pages.js, nothing is
+   added and the site works as it is. Text goes in as text only. */
 (function () {
   "use strict";
 
