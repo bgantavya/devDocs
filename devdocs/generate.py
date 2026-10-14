@@ -70,7 +70,7 @@ from devdocs.render import (
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
 from devdocs.render.style import StyleGuard, acceptable, parse_reply
 from devdocs.retrieve import Retriever
-from devdocs.scan import Scanner, SourceFile
+from devdocs.scan import Scanner, ScanResult, SourceFile
 
 __all__ = [
     "Estimate",
@@ -256,7 +256,7 @@ class Pipeline:
         scan = Scanner(
             self.root, include=self.config.include, exclude=self.config.exclude
         ).scan()
-        made = self._made()
+        made = self._made(scan)
         for item in scan.files:
             if item.relpath in made:
                 scan.skipped[item.relpath] = "written by devdocs"
@@ -315,17 +315,20 @@ class Pipeline:
         )
         return prepared
 
-    def _made(self) -> set[str]:
-        """What devdocs wrote inside the project, by relpath: the out dir's
-        manifest and every file it lists, so no HTML site's scripts are taken
-        for source to document. Hand-written files beside them are scanned as
-        usual."""
-        made: set[str] = set()
+    def _made(self, scan: ScanResult) -> set[str]:
+        """What devdocs wrote inside the project, by relpath: each manifest
+        the scan met and every file it lists, and the out dir's, so no HTML
+        site's scripts are taken for source to document, wherever an earlier
+        run wrote them. Hand-written files beside them are scanned as usual."""
+        found = {posixpath.dirname(item.relpath) for item in scan.files
+                 if posixpath.basename(item.relpath) == MANIFEST}
         out = self.out.resolve()
         if out.is_relative_to(self.root):
             base = out.relative_to(self.root).as_posix()
-            base = "" if base == "." else base
-            listed = generated_files(out)
+            found.add("" if base == "." else base)
+        made: set[str] = set()
+        for base in found:
+            listed = generated_files(self.root / base)
             if listed:
                 made.update(posixpath.join(base, path) for path in (MANIFEST, *listed))
         return made
