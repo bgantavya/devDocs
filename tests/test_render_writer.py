@@ -380,6 +380,35 @@ class TestPruning(WriterCase):
         self.assertTrue((self.out / "a.md").is_file())
 
 
+class TestKeeping(WriterCase):
+    def keep(self, files: dict[str, bytes]) -> WriteReport:
+        return OutputWriter(self.out).write(files, self.docset, prune=False)
+
+    def test_earlier_files_stay_and_stay_listed(self) -> None:
+        self.write({"a.md": b"A\n", "sub/b.md": b"B\n"})
+        report = self.keep({"book.pdf": b"%PDF\n", "a.md": b"A\n"})
+        self.assertEqual(report, WriteReport(written=["book.pdf", "index.json"],
+                                             unchanged=["a.md"]))
+        self.assertEqual(sorted(self.tree()),
+                         ["a.md", "book.pdf", "index.json", "sub/b.md"])
+        self.assertEqual(self.manifest()["files"], ["a.md", "book.pdf", "sub/b.md"])
+
+    def test_only_files_still_there_stay_listed(self) -> None:
+        self.write({"a.md": b"A\n", "gone.md": b"G\n", "moved.md": b"M\n"})
+        (self.out / "gone.md").unlink()
+        (self.out / "moved.md").unlink()
+        (self.out / "moved.md").mkdir()
+        self.keep({"book.pdf": b"%PDF\n"})
+        self.assertEqual(self.manifest()["files"], ["a.md", "book.pdf"])
+
+    def test_a_later_pruning_write_still_removes_what_was_kept(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.keep({"book.pdf": b"%PDF\n"})
+        report = self.write({"a.md": b"A\n"})
+        self.assertEqual(report.removed, ["book.pdf"])
+        self.assertEqual(sorted(self.tree()), ["a.md", "index.json"])
+
+
 class TestConflicts(WriterCase):
     """A file devdocs did not write, where an output goes, is never replaced
     or later pruned without `force`."""

@@ -18,7 +18,7 @@ from typing import Any
 from unittest import mock
 
 from devdocs.config import Config
-from devdocs.errors import ConfigError
+from devdocs.errors import ConfigError, DevDocsError
 from devdocs.generate import Pipeline
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
@@ -206,6 +206,16 @@ class Noisy:
         return {"shop.pdf": b"%PDF-1.4\n"}
 
 
+class Failing:
+    """A PDF renderer whose external engine always fails."""
+
+    format = "pdf"
+
+    def render(self, docset: DocSet) -> dict[str, bytes]:
+        raise DevDocsError("chrome could not print the book",
+                           hint="use the builtin PDF engine")
+
+
 class TestFormats(PipelineCase):
     def test_every_configured_format_is_written(self) -> None:
         pipeline = self.pipeline(formats=("markdown", "html", "pdf"))
@@ -282,6 +292,32 @@ class TestFormats(PipelineCase):
         again.run(prepared)
         self.assertEqual(len(self.model.calls), calls)
         self.assertFalse((self.tmp / "docs" / "site").exists())
+
+    def test_a_format_that_fails_costs_only_itself(self) -> None:
+        first = self.pipeline(formats=("markdown", "pdf"))
+        first.run(first.prepare())
+        docs = self.tmp / "docs"
+        book = (docs / "shop.pdf").read_bytes()
+        (self.tmp / "shop" / "cli.py").unlink()
+
+        failing = self.pipeline(renderers=[MarkdownRenderer(), Failing()])
+        summary = failing.run(failing.prepare())
+        ((kind, key, error),) = summary.failed
+        self.assertEqual((kind, key), ("format", "pdf"))
+        self.assertEqual(error, "chrome could not print the book\n  hint: use the "
+                                "builtin PDF engine; `devdocs export --format pdf` "
+                                "makes it from the manifest, with no key")
+        self.assertEqual([fmt for fmt, _ in failing.failures], ["pdf"])
+        self.assertNotIn("cli.py", (docs / "README.md").read_text("utf-8"))
+        # Nothing is pruned meanwhile: the old book stays, and stays listed.
+        self.assertEqual((docs / "shop.pdf").read_bytes(), book)
+        listed = json.loads((docs / "index.json").read_bytes())["files"]
+        self.assertIn("shop.pdf", listed)
+        self.assertIn("shop/cli.py.md", listed)
+
+        again = self.pipeline(formats=("markdown", "pdf"))
+        self.assertEqual(again.run(again.prepare()).failed, [])
+        self.assertFalse((docs / "shop" / "cli.py.md").exists())
 
     def test_hand_written_code_beside_the_pages_is_still_documented(self) -> None:
         first = self.pipeline()

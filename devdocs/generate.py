@@ -16,8 +16,10 @@ is recorded in the run ledger, so an interrupted run writes what it has,
 stubs the rest, and resumes next time without paying twice.
 
 Rendering comes last and costs nothing: one renderer per configured format
-turns the composed documents into files. `export` renders the documents of
-the last run again, read back from its manifest, so another format needs
+turns the composed documents into files. A format whose renderer fails, such
+as an external PDF engine, costs only itself: the others and the manifest
+are still written. `export` renders the documents of the last run again,
+read back from its manifest, so another format, or one that failed, needs
 neither a key nor a model.
 """
 
@@ -229,6 +231,14 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def _retry(fmt: str, err: DevDocsError) -> str:
+    """A failed format's error, as a run reports it: with how to make that
+    format later without a key, from the manifest the run still wrote."""
+    retry = f"`devdocs export --format {fmt}` makes it from the manifest, with no key"
+    hint = f"{err.hint}; {retry}" if err.hint else retry
+    return f"{err.message}\n  hint: {hint}"
+
+
 class Pipeline:
     """One configured run over one project.
 
@@ -236,7 +246,7 @@ class Pipeline:
     `write` and `export` need none. `log` receives one-line progress
     messages for the CLI. Without `renderers`, there is one per configured
     format, built now so that a missing PDF engine fails before any call.
-    `warnings` describe the last write.
+    `warnings` and `failures` describe the last write.
     """
 
     def __init__(
@@ -260,6 +270,7 @@ class Pipeline:
             for fmt in dict.fromkeys(config.formats)
         ]
         self.warnings: list[str] = []
+        self.failures: list[tuple[str, DevDocsError]] = []   # (format, error)
         self.log = log or (lambda message: None)
         self.project = project or project_name(self.root)
         self.description = description
@@ -577,9 +588,10 @@ class Pipeline:
 
         Documents are written even when the run stops early on budget, quota
         or Ctrl-C: whatever was paid for is kept, the rest is stubbed, and
-        the ledger leaves the run resumable. A write refused for a file
-        devdocs did not write, see `write`, raises ConfigError; the answers
-        are cached by then, so running again costs nothing.
+        the ledger leaves the run resumable. A format that fails to render
+        is reported in `failed`, the others written. A write refused for a
+        file devdocs did not write, see `write`, raises ConfigError; the
+        answers are cached by then, so running again costs nothing.
         """
         client = self._client()
         self._embed(prepared)
@@ -637,6 +649,8 @@ class Pipeline:
             cached = "the answers are cached, so running again costs nothing"
             hint = f"{err.hint}; {cached}" if err.hint else cached
             raise ConfigError(err.message, hint=hint) from err
+        summary.failed += [("format", fmt, _retry(fmt, err))
+                           for fmt, err in self.failures]
         summary.warnings = list(self.warnings)
         summary.documents = len(docset.documents)
         summary.prose = sum(1 for d in docset.documents if d.meta.mode is Mode.PROSE)
@@ -884,18 +898,26 @@ class Pipeline:
         """The output directory: `config.out`, under the root when relative."""
         return self.root / self.config.out
 
-    def write(self, docset: DocSet, *, force: bool = False) -> WriteReport:
+    def write(
+        self, docset: DocSet, *, prune: bool = True, force: bool = False
+    ) -> WriteReport:
         """Render `docset` in every format and write the files to `out`.
 
         Rendering never calls a model. What a renderer could not show is
-        logged and kept in `warnings`.
+        logged and kept in `warnings`. A renderer that fails is skipped and
+        its error kept in `failures`; the other formats are still written,
+        pruning nothing, so the failed format's earlier files stay and stay
+        listed. With `prune` False, the files the last write made and this
+        one does not stay, and stay in the manifest.
 
         Raises ConfigError, before anything is written, for an output a file
         devdocs did not write is in the way of, unless `force` replaces it;
         see `OutputWriter`.
         """
         files = self._render(docset)
-        return OutputWriter(self.out).write(files, docset, force=force)
+        return OutputWriter(self.out).write(
+            files, docset, prune=prune and not self.failures, force=force
+        )
 
     def export(self, *, force: bool = False) -> ExportSummary:
         """Render the last run's documents again, in the configured formats.
@@ -912,12 +934,15 @@ class Pipeline:
         describe an older run.
 
         Raises ConfigError when `out` holds no manifest that can be read, and
-        as `write` does.
+        as `write` does; and a failed format's own error once the other
+        formats are written.
         """
         docset = read_manifest(self.out)
         run = docset.run
         self.log(f"read {len(docset.documents)} documents from {self.out / MANIFEST}")
         written = OutputWriter(self.out).add(self._render(docset), force=force)
+        if self.failures:
+            raise self.failures[0][1]
         return ExportSummary(
             documents=len(docset.documents),
             formats=[renderer.format for renderer in self.renderers],
@@ -928,11 +953,15 @@ class Pipeline:
         )
 
     def _render(self, docset: DocSet) -> dict[str, bytes]:
-        """Every format's files; refills `warnings`."""
+        """Every format's files; refills `warnings` and `failures`."""
         files: dict[str, bytes] = {}
-        self.warnings = []
+        self.warnings, self.failures = [], []
         for renderer in self.renderers:
-            files.update(renderer.render(docset))
+            try:
+                files.update(renderer.render(docset))
+            except DevDocsError as err:
+                self.failures.append((renderer.format, err))
+                continue
             self.warnings += self._logged_warnings(renderer)
         return files
 
