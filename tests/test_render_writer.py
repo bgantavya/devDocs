@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import io
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from devdocs import cli
 from devdocs.errors import ConfigError
 from devdocs.render import (
     FORMATS,
@@ -32,7 +34,7 @@ from devdocs.render import (
 )
 from devdocs.render.html import HtmlRenderer
 from devdocs.render.markdown import MarkdownRenderer
-from devdocs.render.model import DocSet, RunInfo
+from devdocs.render.model import DocKind, DocSet, Document, RunInfo, Section
 from devdocs.render.pdf import PdfRenderer, external, layout
 from tests.test_markdown import shop
 
@@ -728,6 +730,66 @@ class TestFailures(WriterCase):
         self.assertEqual(self.write({"a.md": b"A\n"}),
                          WriteReport(written=["index.json"], unchanged=["a.md"]))
         self.assertEqual(self.manifest()["files"], ["a.md"])
+
+    def test_export_reports_it_instead_of_an_internal_error(self) -> None:
+        """Regression: `devdocs export` ended with "internal error: OSError:
+        [Errno 92] Illegal byte sequence" and exit 1."""
+        root = self.base / "proj"
+        docs = root / "docs"
+        docset = DocSet(project="proj")
+        docset.add(Document(f"file:{ODD}.py", DocKind.FILE, f"{ODD}.py", f"{ODD}.py",
+                            sections=(Section("purpose", "Purpose", text=("Hi.",)),)))
+        OutputWriter(docs).write({}, docset)
+        before = (docs / MANIFEST).read_bytes()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("DEVDOCS_")}
+        with mock.patch.dict(os.environ, environ, clear=True), unnameable(ODD), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["export", str(root), "--format", "markdown"])
+        self.assertEqual(code, 2)
+        self.assertNotIn("internal error", stderr.getvalue())
+        self.assertIn(f"devdocs: cannot write {ODD}.py.md in ", stderr.getvalue())
+        self.assertIn(": the file system cannot name it (", stderr.getvalue())
+        self.assertEqual(sorted(path.name for path in docs.iterdir()), [MANIFEST])
+        self.assertEqual((docs / MANIFEST).read_bytes(), before)
+
+
+class TestAdding(WriterCase):
+    """`add`, as export uses it: new files join the last write's, whose
+    record is kept exactly as it was."""
+
+    def test_files_join_the_record_which_is_kept(self) -> None:
+        self.docset = shop()
+        self.write({"a.md": b"A\n"})
+        before = self.manifest()
+        report = OutputWriter(self.out).add({"shop.pdf": b"%PDF\n"})
+        self.assertEqual(report, WriteReport(written=["index.json", "shop.pdf"]))
+        self.assertEqual(self.manifest(), {**before, "files": ["a.md", "shop.pdf"]})
+
+    def test_a_newer_schemas_fields_and_label_survive(self) -> None:
+        self.write({"a.md": b"A\n"})
+        newer = self.manifest()
+        newer["schema_version"] = "1.9.0"
+        newer["sources_root"] = "src"
+        newer["run"] = {"embedding_model": "e"}
+        self.plant(MANIFEST, json.dumps(newer).encode())
+        OutputWriter(self.out).add({"b.md": b"B\n"})
+        self.assertEqual(self.manifest(), {**newer, "files": ["a.md", "b.md"]})
+
+    def test_adding_refuses_what_writing_refuses(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.plant("index.html", b"<h1>Ours</h1>\n")
+        with self.assertRaises(ConfigError):
+            OutputWriter(self.out).add({"index.html": b"<p>site</p>\n"})
+        self.assertEqual(self.manifest()["files"], ["a.md"])
+        OutputWriter(self.out).add({"index.html": b"<p>site</p>\n"}, force=True)
+        self.assertEqual(self.manifest()["files"], ["a.md", "index.html"])
+
+    def test_there_must_be_a_manifest_to_add_to(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            OutputWriter(self.out).add({"b.md": b"B\n"})
+        self.assertIn("devdocs generate", caught.exception.hint or "")
+        self.assertFalse(self.out.exists())
 
 
 class TestReadingTheManifest(WriterCase):

@@ -16,7 +16,9 @@ is recorded in the run ledger, so an interrupted run writes what it has,
 stubs the rest, and resumes next time without paying twice.
 
 Rendering comes last and costs nothing: one renderer per configured format
-turns the composed documents into files.
+turns the composed documents into files. `export` renders the documents of
+the last run again, read back from its manifest, so another format needs
+neither a key nor a model.
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ from devdocs.render import (
     Renderer,
     WriteReport,
     generated_files,
+    read_manifest,
     renderer_for,
 )
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
@@ -74,6 +77,7 @@ from devdocs.scan import Scanner, ScanResult, SourceFile
 
 __all__ = [
     "Estimate",
+    "ExportSummary",
     "Pipeline",
     "Prepared",
     "PricedItem",
@@ -182,6 +186,18 @@ class RunSummary:
     written: WriteReport = field(default_factory=WriteReport)
 
 
+@dataclass
+class ExportSummary:
+    """What `Pipeline.export` rendered, from which run, and where."""
+
+    documents: int = 0
+    formats: list[str] = field(default_factory=list)
+    out: str = ""
+    generated_at: str = ""   # when the exported run wrote its documents
+    warnings: list[str] = field(default_factory=list)
+    written: WriteReport = field(default_factory=WriteReport)
+
+
 def project_name(root: Path) -> str:
     """The project's own name for itself, from its manifest, else the folder."""
     try:
@@ -216,11 +232,11 @@ def _sha(text: str) -> str:
 class Pipeline:
     """One configured run over one project.
 
-    `client` is required for `price`, `estimate` and `run`; `prepare` and
-    `write` need none. `log` receives one-line progress messages for the
-    CLI. Without `renderers`, there is one per configured format, built now
-    so that a missing PDF engine fails before any call. `warnings` describe
-    the last write.
+    `client` is required for `price`, `estimate` and `run`; `prepare`,
+    `write` and `export` need none. `log` receives one-line progress
+    messages for the CLI. Without `renderers`, there is one per configured
+    format, built now so that a missing PDF engine fails before any call.
+    `warnings` describe the last write.
     """
 
     def __init__(
@@ -880,6 +896,36 @@ class Pipeline:
         """
         files = self._render(docset)
         return OutputWriter(self.out).write(files, docset, force=force)
+
+    def export(self, *, force: bool = False) -> ExportSummary:
+        """Render the last run's documents again, in the configured formats.
+
+        The DocSet comes back from the manifest in `out`, so nothing is
+        scanned, priced or sent. Export adds files and never prunes: what
+        the last write listed stays, and stays listed beside the new files,
+        and the manifest keeps the run's record exactly as it was.
+        Exporting PDF so keeps every Markdown page, and an HTML site that
+        `generate --format html` wrote; rendering the configured formats
+        beside the requested ones would not, as a format passed by flag is
+        not configured. The complete list lets the next `generate` prune
+        exports with whatever else it does not write again, since they then
+        describe an older run.
+
+        Raises ConfigError when `out` holds no manifest that can be read, and
+        as `write` does.
+        """
+        docset = read_manifest(self.out)
+        run = docset.run
+        self.log(f"read {len(docset.documents)} documents from {self.out / MANIFEST}")
+        written = OutputWriter(self.out).add(self._render(docset), force=force)
+        return ExportSummary(
+            documents=len(docset.documents),
+            formats=[renderer.format for renderer in self.renderers],
+            out=str(self.out),
+            generated_at=run.generated_at if run is not None else "",
+            warnings=list(self.warnings),
+            written=written,
+        )
 
     def _render(self, docset: DocSet) -> dict[str, bytes]:
         """Every format's files; refills `warnings`."""
