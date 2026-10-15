@@ -2,6 +2,7 @@
 
     devdocs generate [PATH]   write docs for a project
     devdocs estimate [PATH]   price a run without sending anything
+    devdocs export [PATH]     render the last run again, in other formats, free
     devdocs doctor            check interpreter, configuration, key, provider
     devdocs init [PATH]       write a starter devdocs.toml
     devdocs models            models your key can use, with tier and price
@@ -39,8 +40,9 @@ from devdocs.render import PDF_ENGINES
 
 __all__ = ["build_parser", "main"]
 
-COMMANDS = ("generate", "estimate", "doctor", "init", "models", "cache")
+COMMANDS = ("generate", "estimate", "export", "doctor", "init", "models", "cache")
 STATE_DIR = ".devdocs"
+_LISTED = 10             # written files an export names; --json lists them all
 
 
 class _Output:
@@ -150,6 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
     _run_options(estimate)
     estimate.add_argument("--explain", action="store_true",
                           help="list every file with its plan and reason")
+
+    export = commands.add_parser(
+        "export", help="render the last run again, in other formats; no key, no cost"
+    )
+    _output_options(export)
+    _force_option(export)
+    export.add_argument("--json", action="store_true", help="JSON on stdout")
+    export.add_argument("-q", "--quiet", action="store_true")
 
     doctor = commands.add_parser("doctor", help="check that a run can work")
     doctor.add_argument("path", nargs="?", default=None)
@@ -316,6 +326,26 @@ def _warnings(warnings: Sequence[str]) -> list[str]:
     if not warnings:
         return []
     return [f"{_count(len(warnings), 'rendering warning')}; --json lists them all"]
+
+
+def _export(args: argparse.Namespace, out: _Output) -> int:
+    from devdocs.generate import Pipeline
+
+    config = _config(args)
+    summary = Pipeline(config, log=out.info).export(force=args.force)
+    report = summary.written
+    run = f" (run of {summary.generated_at})" if summary.generated_at else ""
+    lines = [
+        f"{_count(summary.documents, 'document')}{run} as "
+        f"{', '.join(summary.formats)} in {config.out}: "
+        f"{_count(len(report.written), 'file')} written, "
+        f"{len(report.unchanged)} unchanged",
+    ]
+    if len(report.written) <= _LISTED:
+        lines += [f"  {Path(config.out, path).as_posix()}" for path in report.written]
+    lines.extend(_warnings(summary.warnings))
+    out.result("\n".join(lines), asdict(summary))
+    return 0
 
 
 def _estimate(args: argparse.Namespace, out: _Output) -> int:
@@ -516,6 +546,7 @@ def _cache(args: argparse.Namespace, out: _Output) -> int:
 _HANDLERS = {
     "generate": _generate,
     "estimate": _estimate,
+    "export": _export,
     "doctor": _doctor,
     "init": _init,
     "models": _models,

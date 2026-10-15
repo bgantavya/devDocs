@@ -43,11 +43,14 @@ killed outright leaves at most one temp file behind. What fails only
 then, as a full disk, or a file another program holds open or one flagged
 immutable, fails midway. The files renamed by then are new and the rest as
 they were, and the manifest, renamed first, holds the new record and lists
-every file the write may make, so the next write replaces or prunes them all.
+every file the write may make, so the next write replaces or prunes them
+all and `export` renders that record.
 
 The manifest is also the run's record: it holds the whole DocSet, so
 `read_manifest` gives it back and another format can be rendered later
-without scanning the project or asking a model anything.
+without scanning the project or asking a model anything. `OutputWriter.add`
+then lists the new files and keeps that record exactly as it was, so fields
+a newer devdocs added to the schema survive.
 """
 
 from __future__ import annotations
@@ -231,7 +234,21 @@ class OutputWriter:
         see the module docstring.
         """
         return self._commit(files, docset.to_dict(include_run=True),
-                            _load(Path(self.out)), force=force)
+                            _load(Path(self.out)), prune=True, force=force)
+
+    def add(self, files: dict[str, bytes], *, force: bool = False) -> WriteReport:
+        """Write `files` beside the last write's, which all stay listed. The
+        manifest keeps its record exactly as it was; only its list of files
+        grows.
+
+        Raises ConfigError when `out` holds no devdocs manifest, and as
+        `write` does.
+        """
+        last = _load(Path(self.out))
+        if last is None:
+            raise ConfigError(f"no devdocs manifest in {self.out} to add files to",
+                              hint="run `devdocs generate` first")
+        return self._commit(files, last, last, prune=False, force=force)
 
     def _commit(
         self,
@@ -239,6 +256,7 @@ class OutputWriter:
         record: Mapping[str, Any],
         last: Mapping[str, Any] | None,
         *,
+        prune: bool,
         force: bool,
     ) -> WriteReport:
         """Write `files`, and `record` as the manifest, over what `last`, the
@@ -268,7 +286,10 @@ class OutputWriter:
             pages = [(path, outputs[path]) for path in report.written]
             kept.update(batch.write([(MANIFEST, ahead), *pages] if wrote else pages))
             stale = _leftovers(out, previous.difference(outputs), kept)
-            report.removed = _prune(out, stale)
+            if prune:
+                report.removed = _prune(out, stale)
+            else:
+                owned = sorted([*owned, *stale])
             final = _encode(record, owned)
             if not _holds(manifest, final):
                 batch.write([(MANIFEST, final)])
