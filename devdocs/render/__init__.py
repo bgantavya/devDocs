@@ -220,11 +220,16 @@ class OutputWriter:
         self.out = out
 
     def write(
-        self, files: dict[str, bytes], docset: DocSet, *, force: bool = False
+        self,
+        files: dict[str, bytes],
+        docset: DocSet,
+        *,
+        prune: bool = True,
+        force: bool = False,
     ) -> WriteReport:
         """Write `files` plus a manifest holding `docset`; remove what the last
-        write made and this one did not. `force` replaces files devdocs did
-        not write.
+        write made and this one did not, or with `prune` False keep it, still
+        listed. `force` replaces files devdocs did not write.
 
         Raises ValueError for a path that is not plain relative POSIX, and
         ConfigError for an output another file is in the way of; either
@@ -234,7 +239,7 @@ class OutputWriter:
         see the module docstring.
         """
         return self._commit(files, docset.to_dict(include_run=True),
-                            _load(Path(self.out)), prune=True, force=force)
+                            _load(Path(self.out)), prune=prune, force=force)
 
     def add(self, files: dict[str, bytes], *, force: bool = False) -> WriteReport:
         """Write `files` beside the last write's, which all stay listed. The

@@ -14,7 +14,7 @@ from unittest import mock
 
 from devdocs import cli
 from devdocs.config import Config
-from devdocs.errors import ConfigError
+from devdocs.errors import ConfigError, DevDocsError
 from devdocs.generate import Pipeline
 from devdocs.render import MANIFEST
 from devdocs.render.pdf import external
@@ -216,6 +216,17 @@ class TestExport(ExportCase):
                 self.assertIn("only to PDF output, which is not among the formats: "
                               "markdown", err)
         self.assertEqual(tree(self.docs), self.generated)
+
+    def test_a_failing_engine_still_writes_the_other_formats(self) -> None:
+        broken = DevDocsError("chrome could not print the book (exit status 1)")
+        with mock.patch.object(external, "find", return_value="/bin/chrome"), \
+                mock.patch.object(external, "render", side_effect=broken):
+            code, _, err = self.export("--format", "html,pdf", "--pdf-engine", "chrome")
+        self.assertEqual(code, 1)
+        self.assertIn("chrome could not print the book", err)
+        self.assertTrue((self.docs / "index.html").is_file())
+        self.assertFalse((self.docs / "shop.pdf").exists())
+        self.assertIn("index.html", self.manifest()["files"])
 
     def test_characters_the_pdf_fonts_lack_are_reported(self) -> None:
         self.generate("--description", "Sells books in 中文.")
