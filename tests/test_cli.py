@@ -93,8 +93,10 @@ class TestGenerate(CliCase):
         self.assertIn("rejected", err)
 
     def test_v3_flags_are_translated(self) -> None:
-        code, _, err = self.run_cli("-p", str(self.root), "--output", "manual",
-                                    "--api-key", "k")
+        # v3 wrote under --output in the current directory
+        with contextlib.chdir(self.root):
+            code, _, err = self.run_cli("-p", str(self.root), "--output", "manual",
+                                        "--include", "tests", "--api-key", "k")
         self.assertEqual(code, 0)
         self.assertIn("deprecated", err)
         self.assertTrue((self.root / "manual" / "shop" / "cart.md").is_file())

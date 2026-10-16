@@ -5,8 +5,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
+import os
+import shlex
+import shutil
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from devdocs import cli, legacy
@@ -14,6 +20,20 @@ from devdocs.errors import ConfigError
 from devdocs.legacy import is_v3_invocation, translate
 from devdocs.llm import Request
 from devdocs.llm.factory import OfflineModel, make_provider
+from tests.test_cli import CliCase
+from tests.test_generate import PROJECT
+
+_V3_PAGE = "written by devDocs 3\n"
+_HAND = "written by hand\n"
+
+
+class InTempDir(unittest.TestCase):
+    """Each test runs from a fresh temporary directory, `self.here`."""
+
+    def setUp(self) -> None:
+        self.enterContext(contextlib.chdir(
+            self.enterContext(tempfile.TemporaryDirectory())))
+        self.here = Path.cwd()
 
 
 class TestDetection(unittest.TestCase):
@@ -41,13 +61,13 @@ class TestDetection(unittest.TestCase):
         self.assertEqual(sorted(cli.COMMANDS), sorted(commands))
 
 
-class TestTranslation(unittest.TestCase):
+class TestTranslation(InTempDir):
     def test_full_v3_command_line(self) -> None:
         argv = ["-p", "app", "--output", "manual", "--include", "tests,build",
                 "--exclude", "docs", "--api-key", "k", "--name", "Shop",
                 "--description", "A shop.", "--authors", "me", "--overwrite"]
         self.assertEqual(translate(argv), [
-            "generate", "app", "--per-file", "--out", "manual",
+            "generate", "app", "--per-file", "--out", str(self.here / "manual" / "app"),
             "--include", "tests,build", "--exclude", "docs", "--api-key", "k",
             "--name", "Shop", "--description", "A shop.",
         ])
@@ -56,6 +76,29 @@ class TestTranslation(unittest.TestCase):
         argv = ["--name", "My Project", "--description", "No description provided."]
         self.assertEqual(translate(argv),
                          ["generate", ".", "--per-file", "--out", "docs"])
+
+    def test_nothing_is_forced(self) -> None:
+        # v4 writes paths v3 never did; forced, it replaced hand-written files there
+        self.assertNotIn("--force", translate([]))
+        self.assertEqual(translate(["--overwrite"]), translate([]))
+
+    def test_pages_go_where_v3_put_them(self) -> None:
+        # v3: <cwd>/<output>/<project path from the cwd>; v4 reads --out from
+        # the project, so only a project at `.` keeps it relative
+        here = self.here
+        for argv, out in (
+            ([], "docs"),
+            (["-p", "."], "docs"),
+            (["-p", "app"], here / "docs" / "app"),
+            (["-p", "app/shop", "--output", "manual"],
+             here / "manual" / "app" / "shop"),
+            (["-p", "app", "--output", str(here / "site")], here / "site" / "app"),
+            (["-p", str(here)], here / "docs"),
+            (["-p", ".."], here / "docs" / str(here.parent).lstrip("\\/")),
+        ):
+            with self.subTest(argv=argv):
+                translated = translate(argv)
+                self.assertEqual(translated[translated.index("--out") + 1], str(out))
 
     def test_a_v4_command_line_comes_back_as_it_is(self) -> None:
         for command in cli.COMMANDS:
@@ -72,7 +115,28 @@ class TestTranslation(unittest.TestCase):
         )
 
 
-class TestMain(unittest.TestCase):
+class TestNotice(InTempDir):
+    def test_it_names_the_v4_command(self) -> None:
+        argv = ["-p", "my app", "--name", "Shop"]
+        self.assertIn(f"deprecated; running `devdocs {shlex.join(translate(argv))}`",
+                      legacy.notice(argv))
+
+    def test_it_says_how_to_take_over_v3_pages(self) -> None:
+        for argv, docs in (([], "docs"),
+                           (["-p", "app", "--output", "manual"], "manual/app")):
+            with self.subTest(argv=argv):
+                self.assertIn(
+                    "v4 never replaces a page it has no record of writing: if "
+                    f"{os.path.join(*docs.split('/'), '')} still holds v3 pages, "
+                    "add --force once to take them over", legacy.notice(argv))
+
+    def test_overwrite_no_longer_applies(self) -> None:
+        self.assertIn("devdocs: --overwrite no longer applies; v4 never replaces",
+                      legacy.notice(["--overwrite"]))
+        self.assertNotIn("--overwrite", legacy.notice([]))
+
+
+class TestMain(InTempDir):
     """`legacy.main`, the v3 entry point, hands `cli.main` a command line.
     `cli.main` is a stand-in here, so nothing runs."""
 
@@ -110,10 +174,121 @@ class TestMain(unittest.TestCase):
                 self.assertEqual(passed, argv)
                 self.assertEqual(err, "")
 
+    def test_an_empty_path_or_output_exits_2(self) -> None:
+        for argv in (["--output="], ["--output", ""], ["-p", ""], ["--path="]):
+            with self.subTest(argv=argv), mock.patch.object(cli, "main") as run, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as caught:
+                    legacy.main(argv)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("expected a directory, got an empty string",
+                              err.getvalue())
+                run.assert_not_called()
+
     def test_argv_may_be_given(self) -> None:
         with mock.patch.object(cli, "main", return_value=0) as run:
             legacy.main(["export", "app"])
         run.assert_called_once_with(["export", "app"])
+
+
+class TestOverV3Docs(CliCase):
+    """A v3 command line run in the project, where v3 already wrote docs and
+    no manifest."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.enterContext(contextlib.chdir(self.root))
+        self.docs = self.root / "docs"
+
+    def plant(self, pages: dict[str, str]) -> None:
+        """Leave `pages` in docs/, as v3 or a person did."""
+        for name, text in pages.items():
+            page = self.docs / name
+            page.parent.mkdir(parents=True, exist_ok=True)
+            page.write_text(text, encoding="utf-8")
+
+    def found(self, pages: dict[str, str]) -> dict[str, str]:
+        """What docs/ holds now where `pages` were left."""
+        return {name: (self.docs / name).read_text(encoding="utf-8") for name in pages}
+
+    def test_its_pages_are_kept_until_forced(self) -> None:
+        pages = {"README.md": _V3_PAGE, "shop/cart.md": _V3_PAGE}
+        self.plant(pages)
+        code, _, err = self.run_cli("-p", ".", "--api-key", "k")
+        self.assertEqual(code, 2)
+        self.assertIn("has no record of writing: README.md, shop/cart.md", err)
+        self.assertEqual(self.found(pages), pages)
+        calls = len(self.model.calls)
+        code, _, err = self.run_cli("-p", ".", "--api-key", "k", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.model.calls), calls)
+        listed = json.loads((self.docs / "index.json").read_bytes())["files"]
+        for name, text in self.found(pages).items():
+            self.assertNotEqual(text, _V3_PAGE, name)
+            self.assertIn(name, listed)
+
+    def test_pages_only_v4_writes_are_left_alone(self) -> None:
+        # v3 wrote README.md, <stem>.md and <dir>/<dir>.md, never these
+        pages = {"shop/cart.md": _V3_PAGE, "architecture.md": _HAND,
+                 "index.md": _HAND, "shop/index.md": _HAND}
+        self.plant(pages)
+        code, _, err = self.run_cli("-p", ".", "--api-key", "k")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.found(pages), pages)
+
+    def test_overwrite_forces_nothing_and_reaches_no_further(self) -> None:
+        # v3 put the summary over this README; v4 writes only in docs/
+        pages = {"README.md": _V3_PAGE}
+        self.plant(pages)
+        readme = self.root / "README.md"
+        readme.write_text("# Shop\n", encoding="utf-8")
+        code, _, err = self.run_cli("-p", ".", "--api-key", "k", "--overwrite")
+        self.assertEqual(code, 2)
+        self.assertIn("--overwrite no longer applies", err)
+        self.assertEqual(self.found(pages), pages)
+        code, _, err = self.run_cli("-p", ".", "--api-key", "k", "--overwrite",
+                                    "--force")
+        self.assertEqual(code, 0, err)
+        self.assertNotEqual(self.found(pages), pages)
+        self.assertEqual(readme.read_text(encoding="utf-8"), "# Shop\n")
+
+
+class TestWhereV3Wrote(CliCase):
+    """A v3 command line run above the project, at `self.root`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.enterContext(contextlib.chdir(self.root))
+        self.app = self.root / "app"
+        for relpath, text in PROJECT.items():
+            path = self.app / relpath
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+
+    def test_the_pages_go_under_the_current_directory(self) -> None:
+        # v3 `-p app` wrote docs/app/ here and never looked in app/docs/
+        hand = self.app / "docs" / "README.md"
+        hand.parent.mkdir()
+        hand.write_text(_HAND, encoding="utf-8")
+        code, _, err = self.run_cli("-p", "app", "--api-key", "k")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(p.name for p in hand.parent.iterdir()), ["README.md"])
+        self.assertEqual(hand.read_text(encoding="utf-8"), _HAND)
+        for page in ("README.md", "shop/cart.md"):
+            self.assertTrue((self.root / "docs" / "app" / page).is_file(), page)
+
+    def test_an_empty_path_or_output_runs_nothing(self) -> None:
+        # v3 crashed on these before writing; v4 read them as the current directory
+        for flags in (["--output="], ["-p", ""]):
+            with self.subTest(flags=flags):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_cli(*flags, "--api-key", "k")
+                self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
+                         sorted({"app", *(rel.split("/")[0] for rel in PROJECT)}))
 
 
 class TestFactory(unittest.TestCase):
