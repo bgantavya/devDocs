@@ -35,7 +35,9 @@ import os
 import shlex
 import sys
 from collections.abc import Sequence
+from itertools import pairwise
 from pathlib import Path
+from typing import NoReturn
 
 __all__ = ["V3_ONLY_FLAGS", "is_v3_invocation", "main", "notice", "translate"]
 
@@ -53,8 +55,15 @@ def _directory(value: str) -> str:
     return value
 
 
+class _V3Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        """Exit 2 as argparse does, any key in `message` masked: an ambiguous
+        `--a=KEY` (--authors or --api-key) comes back whole."""
+        super().error(" ".join(map(_hidden, message.split(" "))))
+
+
 def _v3_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="devdocs", add_help=False)  # -h is v4's
+    parser = _V3Parser(prog="devdocs", add_help=False)  # -h is v4's
     parser.add_argument("-p", "--path", default=".", type=_directory)
     parser.add_argument("--name")
     parser.add_argument("--description")
@@ -131,11 +140,28 @@ def translate(argv: Sequence[str]) -> list[str]:
     return [*translated, *rest]
 
 
+def _names_key(arg: str) -> bool:
+    """True for `--api-key`, in full or abbreviated as argparse accepts it."""
+    return len(arg) > 2 and "--api-key".startswith(arg)
+
+
+def _hidden(arg: str) -> str:
+    """`arg`, its key masked if it is `--api-key=KEY` in any spelling."""
+    flag, equals, _ = arg.partition("=")
+    return f"{flag}=***" if equals and _names_key(flag) else arg
+
+
+def _masked(arguments: Sequence[str]) -> list[str]:
+    """`arguments` with every API key as ***, given apart or after '='."""
+    return ["***" if _names_key(before) else _hidden(arg)
+            for before, arg in pairwise(["", *arguments])]
+
+
 def notice(argv: Sequence[str]) -> str:
     """The deprecation notice for the v3 command line `argv`: the v4 command
-    it runs, and what becomes of pages already there."""
+    it runs, API key masked, and what becomes of pages already there."""
     args, _ = _read(argv)
-    command = shlex.join(translate(argv))
+    command = shlex.join(_masked(translate(argv)))
     docs = os.path.join(args.output, _place(args.path), "")
     dropped = "--overwrite no longer applies; " if args.overwrite else ""
     return (

@@ -135,6 +135,15 @@ class TestNotice(InTempDir):
                       legacy.notice(["--overwrite"]))
         self.assertNotIn("--overwrite", legacy.notice([]))
 
+    def test_it_hides_the_api_key_however_spelled(self) -> None:
+        for argv in (["--api-key", "SECRET"], ["--api-key=SECRET"], ["--api", "SECRET"],
+                     ["--api-k=SECRET"], ["-p", ".", "--", "--api-key", "SECRET"],
+                     ["-p", ".", "--", "--a=SECRET"]):
+            with self.subTest(argv=argv):
+                text = legacy.notice(argv)
+                self.assertNotIn("SECRET", text)
+                self.assertIn("***", text)
+
 
 class TestMain(InTempDir):
     """`legacy.main`, the v3 entry point, hands `cli.main` a command line.

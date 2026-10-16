@@ -101,6 +101,26 @@ class TestGenerate(CliCase):
         self.assertIn("deprecated", err)
         self.assertTrue((self.root / "manual" / "shop" / "cart.md").is_file())
 
+    def test_the_v3_notice_masks_the_key(self) -> None:
+        for spelling in (["--api-key", "AIza-SECRET"], ["--api-key=AIza-SECRET"],
+                         ["--api", "AIza-SECRET"]):
+            with self.subTest(spelling=spelling), contextlib.chdir(self.root):
+                code, _, err = self.run_cli("-p", ".", *spelling)
+                self.assertEqual(code, 0)
+                self.assertIn("deprecated; running `devdocs generate . ", err)
+                self.assertNotIn("AIza-SECRET", err)
+
+    def test_a_v3_line_v3_rejects_masks_the_key_too(self) -> None:
+        # --a abbreviates v3's --authors and --api-key alike
+        err = io.StringIO()
+        with contextlib.chdir(self.root), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as caught:
+            cli.main(["-p", ".", "--a=AIza-SECRET"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("ambiguous option: --a=*** could match", err.getvalue())
+        self.assertNotIn("AIza-SECRET", err.getvalue())
+        self.assertEqual(self.model.calls, [])
+
     def test_a_v4_command_line_is_never_translated(self) -> None:
         # `--output` is a v3 flag; read as v3, this would run a paid generate.
         with self.assertRaises(SystemExit) as caught, \
