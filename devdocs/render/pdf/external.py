@@ -5,7 +5,8 @@ roughly Latin-1. For full Unicode or CSS typography, two external engines
 print `HtmlRenderer(book=True)` output instead: "chrome" runs Chrome,
 Chromium or Edge headless with --print-to-pdf, and "weasyprint" runs
 WeasyPrint's command line. Neither is a dependency; each is found on PATH or,
-for browsers, in the usual macOS, Linux and Windows install locations.
+for browsers, in the usual macOS, Linux and Windows install locations, and
+`available_engines` reports what this machine has.
 
 The book is written to a temporary directory together with a one-line
 @page rule for the chosen paper size, printed by the tool with a timeout and
@@ -29,7 +30,7 @@ from pathlib import Path
 from devdocs.errors import ConfigError, DevDocsError
 from devdocs.render.model import DocSet
 
-__all__ = ["ENGINES", "find", "print_html", "render"]
+__all__ = ["ENGINES", "available_engines", "find", "print_html", "render"]
 
 ENGINES = ("builtin", "chrome", "weasyprint")
 _TIMEOUT = 120.0        # seconds a tool may take to print the book
@@ -92,6 +93,18 @@ def _browser_locations() -> list[Path]:
             if os.environ.get(variable)
         ]
     return [Path(path) for path in _LINUX_PATHS]
+
+
+def available_engines() -> dict[str, str]:
+    """Each usable engine and the executable that runs it, in `ENGINES`
+    order. "builtin" is always present and runs in this interpreter, so it
+    maps to `sys.executable`."""
+    engines = {"builtin": sys.executable}
+    for engine in ENGINES[1:]:
+        path = find(engine)
+        if path:
+            engines[engine] = path
+    return engines
 
 
 def render(

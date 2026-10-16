@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from devdocs import __version__, cli
+from devdocs import __version__, capabilities, cli
+from devdocs.capabilities import Capability, Report
 from devdocs.config import load_config
 from devdocs.errors import AuthError, DevDocsError
 from devdocs.render.pdf import external
@@ -341,6 +342,54 @@ class TestDoctorAndModels(CliCase):
         code, out, _ = self.run_cli("doctor", str(self.root), "--offline")
         self.assertEqual(code, 1)
         self.assertIn("!! api key", out)
+
+    def test_doctor_lists_the_pdf_engines_it_finds(self) -> None:
+        found = {"builtin": "/usr/bin/python3", "weasyprint": "/opt/bin/weasyprint"}
+        with mock.patch.object(external, "available_engines", return_value=found):
+            _, out, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                     "--api-key", "k")
+            _, data, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                      "--api-key", "k", "--json")
+        self.assertIn("ok pdf-engines", out)
+        self.assertIn("builtin, weasyprint (/opt/bin/weasyprint)", out)
+        self.assertNotIn("!! pdf engine", out)
+        self.assertEqual(json.loads(data)["pdf_engines"], found)
+
+    def doctor(self, *argv: str, env: dict[str, str] | None = None) -> tuple[int, str]:
+        """`doctor` on a healthy machine that has only the builtin engine."""
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.object(external, "available_engines",
+                               return_value={"builtin": "/usr/bin/python3"}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                        "--api-key", "k", *argv, env=env)
+        return code, out
+
+    def test_a_missing_engine_blocks_when_pdf_is_configured(self) -> None:
+        # Regression: doctor exited 0 where generate exits 2, and --json
+        # carried neither the setting nor the problem.
+        (self.root / "devdocs.toml").write_text(
+            'formats = ["markdown", "pdf"]\npdf_engine = "chrome"\n', "utf-8")
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn("!! pdf engine           chrome is configured but not "
+                      "installed", out)
+        code, out = self.doctor("--json")
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertEqual(data["formats"], ["markdown", "pdf"])
+        self.assertEqual(data["pdf_engine"], {"configured": "chrome", "path": None})
+
+    def test_a_missing_engine_is_no_problem_without_pdf(self) -> None:
+        code, out = self.doctor(env={"DEVDOCS_PDF_ENGINE": "weasyprint"})
+        self.assertEqual(code, 0)
+        self.assertNotIn("pdf engine", out)
+
+    def test_an_empty_format_list_is_a_config_error(self) -> None:
+        (self.root / "devdocs.toml").write_text("formats = []\n", "utf-8")
+        code, out = self.doctor()
+        self.assertEqual(code, 2)
+        self.assertIn("!! config               no output format configured", out)
 
     def test_models_marks_what_the_key_can_reach(self) -> None:
         code, out, _ = self.run_cli("models", "--api-key", "k", "--json")
