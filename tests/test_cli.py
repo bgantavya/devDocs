@@ -99,6 +99,15 @@ class TestGenerate(CliCase):
         self.assertIn("deprecated", err)
         self.assertTrue((self.root / "manual" / "shop" / "cart.md").is_file())
 
+    def test_a_v4_command_line_is_never_translated(self) -> None:
+        # `--output` is a v3 flag; read as v3, this would run a paid generate.
+        with self.assertRaises(SystemExit) as caught, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli("export", str(self.root), "--output", "manual")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.model.calls, [])
+        self.assertFalse((self.root / "manual").exists())
+
     def test_formats_reach_the_pipeline(self) -> None:
         code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
                                     "--format", "html", "--format", "markdown,pdf",
