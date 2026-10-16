@@ -6,20 +6,36 @@ rewritten into its v4 equivalent and runs through the same pipeline, after
 one deprecation notice. A command line led by a v4 command is never
 rewritten, and arguments v3 lacked are passed on rather than dropped, so a
 line meant for v4 cannot turn into a paid run over the current directory.
-`--per-file` keeps the v3 output layout.
+
+The pages go where v3 put them, in its per-file layout: under `--output` in
+the current directory, at the project's path from there, so `-p app` writes
+docs/app/ and leaves app/docs/ alone. Nothing is forced, by `--overwrite` or
+otherwise. v4 never replaces a file it has no record of writing, and v3 kept
+no record, so over a v3 tree the run stops before writing and names the
+pages; `--force` then takes them over at no cost, the model's answers being
+cached. Forcing every run would also replace hand-written files at paths
+only v4 writes (architecture.md, index.md, index.json), which v3 never
+touched.
 
 Three flags change meaning, deliberately. `--include` and `--exclude` were
 inverted in v3 (an include landed on the skip list); they now do what their
-names say. `--overwrite` wrote a README.md into every directory; v4 never
-touches files it did not generate, so the flag is accepted and ignored, as
-are `--authors` and `--keywords`, which have no v4 use.
+names say. `--overwrite` wrote each README page (the project summary, and
+that of any file or folder with README in its name) over the README.md of
+the source directory being read, instead of into the output directory; v4
+writes only inside its output directory, so the flag is accepted and no
+longer applies. `--authors` and `--keywords` are accepted and ignored, having
+no v4 use. An empty `-p` or `--output`, on which v3 crashed before writing a
+page, exits 2.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shlex
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 __all__ = ["V3_ONLY_FLAGS", "is_v3_invocation", "main", "notice", "translate"]
 
@@ -29,15 +45,23 @@ V3_ONLY_FLAGS = frozenset({
 })
 
 
+def _directory(value: str) -> str:
+    """A `-p` or `--output` value. v3 crashed on an empty one; v4 would read
+    it as the current directory, and document it or write over it."""
+    if not value:
+        raise argparse.ArgumentTypeError("expected a directory, got an empty string")
+    return value
+
+
 def _v3_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(add_help=False)  # -h is v4's
-    parser.add_argument("-p", "--path", default=".")
+    parser = argparse.ArgumentParser(prog="devdocs", add_help=False)  # -h is v4's
+    parser.add_argument("-p", "--path", default=".", type=_directory)
     parser.add_argument("--name")
     parser.add_argument("--description")
     parser.add_argument("--authors")
     parser.add_argument("--keywords")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--output", default="docs")
+    parser.add_argument("--output", default="docs", type=_directory)
     parser.add_argument("--exclude", default="")
     parser.add_argument("--include", default="")
     parser.add_argument("--api-key", default="")
@@ -72,14 +96,28 @@ def is_v3_invocation(argv: Sequence[str]) -> bool:
     )
 
 
+def _place(path: str) -> str:
+    """Where v3 put project `path`'s pages in its output directory: '' for
+    the current directory, else the path from there. v3 cut the current
+    directory's text out of the project's own, so a path outside it keeps
+    its full name: `-p /srv/app` wrote docs/srv/app."""
+    # v3's getcwd() inside the project: the real path, but as typed on Windows
+    inside = os.path.abspath(path) if os.name == "nt" else os.path.realpath(path)
+    return inside.replace(os.getcwd(), "").lstrip("\\/").replace("\\", "/")
+
+
 def translate(argv: Sequence[str]) -> list[str]:
     """The v4 arguments equivalent to a v3 command line. A v4 command line
     comes back as it is; arguments v3 lacked follow the translation, for v4
-    to apply or reject."""
+    to apply or reject. `--out` is v3's output directory, absolute unless the
+    project is `.`, since v4 reads it from the project and v3 from here."""
     if _is_v4(argv):
         return list(argv)
     args, rest = _read(argv)
-    translated = ["generate", args.path, "--per-file", "--out", args.output]
+    out = args.output
+    if args.path != ".":
+        out = str(Path.cwd() / args.output / _place(args.path))
+    translated = ["generate", args.path, "--per-file", "--out", out]
     if args.include:
         translated += ["--include", args.include]
     if args.exclude:
@@ -95,9 +133,17 @@ def translate(argv: Sequence[str]) -> list[str]:
 
 def notice(argv: Sequence[str]) -> str:
     """The deprecation notice for the v3 command line `argv`: the v4 command
-    it runs."""
-    return ("devdocs: v3-style flags are deprecated; running "
-            f"`devdocs {' '.join(translate(argv))}`")
+    it runs, and what becomes of pages already there."""
+    args, _ = _read(argv)
+    command = shlex.join(translate(argv))
+    docs = os.path.join(args.output, _place(args.path), "")
+    dropped = "--overwrite no longer applies; " if args.overwrite else ""
+    return (
+        f"devdocs: v3-style flags are deprecated; running `devdocs {command}`\n"
+        f"devdocs: {dropped}v4 never replaces a page it has no record of "
+        f"writing: if {docs} still holds v3 pages, add --force once to take "
+        "them over"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
