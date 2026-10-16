@@ -11,7 +11,8 @@
 Every failure maps to a stable exit code from `devdocs.errors`, so CI can tell
 a bad key (3) from a budget stop (7) from a spent daily quota (10). Progress
 goes to stderr and results to stdout; `--json` makes stdout machine-readable.
-A v3-style invocation is translated by `devdocs.legacy`, with one notice.
+A v3-style invocation is translated by `devdocs.legacy`, with one notice; a
+command line that starts with a v4 command never is.
 """
 
 from __future__ import annotations
@@ -557,15 +558,11 @@ _HANDLERS = {
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the `devdocs` script. Returns the process exit code."""
     arguments = list(sys.argv[1:] if argv is None else argv)
-    from devdocs.legacy import is_v3_invocation, translate
+    from devdocs.legacy import is_v3_invocation, notice, translate
 
     if is_v3_invocation(arguments):
+        print(notice(arguments), file=sys.stderr)
         arguments = translate(arguments)
-        print(
-            "devdocs: v3-style flags are deprecated; running "
-            f"`devdocs {' '.join(arguments)}`",
-            file=sys.stderr,
-        )
 
     parser = build_parser()
     args = parser.parse_args(arguments)
