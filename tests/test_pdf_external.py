@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import sys
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -72,6 +73,18 @@ class TestExternal(unittest.TestCase):
             mock.patch(f"{EXTERNAL}.os.access", return_value=True),
         ):
             self.assertEqual(Path(external.find("chrome") or ""), exe)
+
+    def test_available_engines(self) -> None:
+        with (
+            self.which({"weasyprint": "/usr/local/bin/weasyprint"}),
+            mock.patch.object(external, "_browser_locations", return_value=[]),
+        ):
+            self.assertEqual(external.available_engines(), {
+                "builtin": sys.executable, "weasyprint": "/usr/local/bin/weasyprint",
+            })
+        with self.which({}), mock.patch.object(external, "_browser_locations",
+                                                return_value=[]):
+            self.assertEqual(external.available_engines(), {"builtin": sys.executable})
 
     def test_chrome_prints_headless_without_a_shell(self) -> None:
         with printing(self, "chrome") as commands:

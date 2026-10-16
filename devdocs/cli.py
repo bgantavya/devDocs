@@ -411,11 +411,16 @@ def _free_days(config: Config, requests: int) -> int:
 
 
 def _doctor(args: argparse.Namespace, out: _Output) -> int:
-    from devdocs.capabilities import probe_all
+    from devdocs.capabilities import Capability, probe_all
+    from devdocs.render.pdf.external import available_engines
 
     report = probe_all()
-    lines = [str(report), ""]
-    data: dict[str, Any] = {"capabilities": [asdict(c) for c in report.capabilities]}
+    engines = available_engines()   # builtin always among them
+    found = ", ".join(name if name == "builtin" else f"{name} ({path})"
+                      for name, path in engines.items())
+    lines = [str(report), str(Capability("pdf-engines", True, found)), ""]
+    data: dict[str, Any] = {"capabilities": [asdict(c) for c in report.capabilities],
+                            "pdf_engines": engines}
     blocking = not report.ok
 
     try:
@@ -426,7 +431,14 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
         return 2
     lines.append(f"ok config               provider={config.provider} "
                  f"quality={config.quality} context={config.context} "
-                 f"max_cost=${config.max_cost:g}")
+                 f"max_cost=${config.max_cost:g} formats={','.join(config.formats)}")
+    data["formats"] = list(config.formats)
+    data["pdf_engine"] = {"configured": config.pdf_engine,
+                          "path": engines.get(config.pdf_engine)}
+    if "pdf" in config.formats and config.pdf_engine not in engines:
+        lines.append(f"!! pdf engine           {config.pdf_engine} is configured "
+                     "but not installed; PDF output will fail")
+        blocking = True
     age = (date.today() - date.fromisoformat(PRICES_CHECKED)).days
     if age > 180:
         lines.append(f"!! prices               checked {PRICES_CHECKED}, {age} days "

@@ -136,7 +136,8 @@ def renderer_for(
         if pdf_engine != "builtin" and external.find(pdf_engine) is None:
             raise ConfigError(
                 f"the {pdf_engine} PDF engine is not installed",
-                hint="install it or use --pdf-engine builtin",
+                hint="install it or use --pdf-engine builtin; "
+                     "`devdocs doctor` lists the engines it finds",
             )
         return renderer
     raise ConfigError(f"unknown format {fmt!r}",
