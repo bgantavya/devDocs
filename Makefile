@@ -30,9 +30,9 @@ coverage: ## Run the tests under coverage; fails below the configured floor
 	$(RUN) coverage run -m unittest discover -s tests
 	$(RUN) coverage report
 
-security: ## Run bandit on the package and pip-audit on the locked dev tools
+security: ## Run bandit on the package and pip-audit on all locked extras
 	$(RUN) bandit -r devdocs -ll
-	$(UV) export --locked --extra dev --no-hashes --no-emit-project --quiet --output-file $(AUDIT_REQUIREMENTS)
+	$(UV) export --locked --all-extras --no-hashes --no-emit-project --quiet --output-file $(AUDIT_REQUIREMENTS)
 	$(RUN) pip-audit --requirement $(AUDIT_REQUIREMENTS) --no-deps --disable-pip --progress-spinner off
 
 check: lint typecheck test ## Lint, type-check and test

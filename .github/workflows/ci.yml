@@ -130,9 +130,9 @@ jobs:
       - run: uv sync --locked --extra dev
       - name: Bandit
         run: uv run bandit -r devdocs -ll
-      - name: pip-audit (locked dev dependencies)
+      - name: pip-audit (locked dependencies, all extras)
         run: |
-          uv export --locked --extra dev --no-hashes --no-emit-project \
+          uv export --locked --all-extras --no-hashes --no-emit-project \
             > "$RUNNER_TEMP/requirements.txt"
           uv run pip-audit --progress-spinner off --no-deps --disable-pip \
             -r "$RUNNER_TEMP/requirements.txt"
