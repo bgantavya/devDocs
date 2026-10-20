@@ -63,6 +63,10 @@ class ProviderError(DevDocsError):
     follows the status: none (a network failure), 429 and 5xx are worth
     retrying; other 4xx are not. Pass it explicitly when the status alone
     misleads, e.g. a TLS certificate failure has no status but never heals.
+
+    `retry_after` is seconds when the provider said how long to wait, as a
+    429 or a 503 may. `RetryPolicy` then waits that long instead of backing
+    off, or gives up at once when it is too long to wait inside one request.
     """
 
     exit_code = 4
@@ -75,10 +79,12 @@ class ProviderError(DevDocsError):
         provider: str | None = None,
         hint: str | None = None,
         retryable: bool | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message, hint=hint)
         self.status = status
         self.provider = provider
+        self.retry_after = retry_after
         self._retryable = retryable
 
     @property
@@ -89,7 +95,8 @@ class ProviderError(DevDocsError):
 
 
 class RateLimited(ProviderError):
-    """429 or 503. `retry_after` is seconds when the provider supplied it."""
+    """A 429: too many requests for now. A 503 is a plain ProviderError, the
+    provider being down, and its `retry_after` is honoured all the same."""
 
     exit_code = 5
 
@@ -101,8 +108,8 @@ class RateLimited(ProviderError):
         status: int | None = None,
         provider: str | None = None,
     ) -> None:
-        super().__init__(message, status=status, provider=provider)
-        self.retry_after = retry_after
+        super().__init__(message, status=status, provider=provider,
+                         retry_after=retry_after)
 
 
 class ModelNotFound(ProviderError):

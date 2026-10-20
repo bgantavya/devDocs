@@ -7,6 +7,7 @@ response bodies follow the vendors' documented examples.
 
 from __future__ import annotations
 
+import functools
 import json
 import unittest
 from collections.abc import Mapping
@@ -224,6 +225,78 @@ class TestGeminiDecoding(unittest.TestCase):
         err = raised(lambda: provider.generate(GEMINI))
         assert isinstance(err, ProviderError)
         self.assertTrue(err.retryable)
+
+
+VENDORS: tuple[tuple[Any, Request, Any], ...] = (
+    (GeminiProvider, GEMINI, {"candidates": []}),
+    (AnthropicProvider, CLAUDE, {"content": [], "stop_reason": "end_turn"}),
+)
+
+
+class TestServerDelay(unittest.TestCase):
+    """A server error that says how long to wait is waited for, by either vendor."""
+
+    def slept(self, vendor: tuple[Any, Request, Any], status: int,
+              headers: dict[str, str]) -> list[float]:
+        """What `RetryPolicy` sleeps through a failure, then an answer."""
+        make, request, answer = vendor
+        transport = Recorded((status, {}, headers), (200, answer, {}))
+        provider = make("k", transport)
+        slept: list[float] = []
+        RetryPolicy().run(lambda: provider.generate(request), sleep=slept.append)
+        self.assertEqual(len(transport.sent), 2)
+        return slept
+
+    def test_a_503_with_retry_after_is_waited_for(self) -> None:
+        for vendor in VENDORS:
+            with self.subTest(vendor[0].__name__):
+                self.assertEqual(self.slept(vendor, 503, {"retry-after": "7"}), [7.0])
+
+    def test_a_503_with_a_date_is_waited_for(self) -> None:
+        date = "Wed, 21 Oct 2015 07:28:00 GMT"   # past: at once
+        for vendor in VENDORS:
+            with self.subTest(vendor[0].__name__):
+                self.assertEqual(self.slept(vendor, 503, {"retry-after": date}), [0.0])
+
+    def test_a_503_without_one_backs_off(self) -> None:
+        for vendor in VENDORS:
+            for headers in ({}, {"retry-after": "soon"}):
+                with self.subTest(vendor[0].__name__, headers=headers):
+                    (pause,) = self.slept(vendor, 503, headers)
+                    self.assertLessEqual(pause, RetryPolicy().base_delay)
+
+    def test_a_503_asking_too_long_a_wait_is_not_sat_out(self) -> None:
+        for make, request, _ in VENDORS:
+            with self.subTest(make.__name__):
+                transport = Recorded((503, {}, {"retry-after": "3600"}))
+                send = functools.partial(make("k", transport).generate, request)
+                slept: list[float] = []
+                with self.assertRaises(ProviderError) as caught:
+                    RetryPolicy().run(send, sleep=slept.append)
+                error = caught.exception
+                self.assertEqual((error.status, error.retry_after), (503, 3600.0))
+                self.assertEqual((len(transport.sent), slept), (1, []))
+
+    def test_a_503_stays_a_provider_failure_with_its_exit_code(self) -> None:
+        for make, request, _ in VENDORS:
+            with self.subTest(make.__name__):
+                provider = make("k", replay(503, {}, {"retry-after": "7"}))
+                err = raised(functools.partial(provider.generate, request))
+                self.assertIs(type(err), ProviderError)
+                self.assertEqual(err.exit_code, 4)
+
+    def test_gemini_retry_info_comes_first_as_for_a_429(self) -> None:
+        details = [{"@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "3s"}]
+        provider = GeminiProvider("k", replay(
+            503, {"error": {"status": "UNAVAILABLE", "details": details}},
+            {"retry-after": "7"}))
+        err = raised(lambda: provider.generate(GEMINI))
+        assert isinstance(err, ProviderError)
+        self.assertEqual(err.retry_after, 3.0)
+
+    def test_an_anthropic_overload_with_retry_after_is_waited_for(self) -> None:
+        self.assertEqual(self.slept(VENDORS[1], 529, {"retry-after": "4"}), [4.0])
 
 
 class TestGeminiErrors(unittest.TestCase):

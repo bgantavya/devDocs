@@ -139,6 +139,13 @@ class TestPayload(unittest.TestCase):
         self.assertEqual(error.retry_after, 2.5)
         self.assertEqual(error.status, 429)
 
+    def test_any_provider_failure_can_carry_retry_after(self) -> None:
+        down = ProviderError("down", status=503, retry_after=7)
+        self.assertEqual(down.retry_after, 7)
+        self.assertIsNone(ProviderError("down", status=503).retry_after)
+        self.assertIsNone(QuotaExhausted("daily limit").retry_after)
+        self.assertIsNone(ModelNotFound("no such model").retry_after)
+
     def test_budget_records_spend_and_limit(self) -> None:
         error = BudgetExceeded("over", spent=0.61, limit=0.5)
         self.assertEqual((error.spent, error.limit), (0.61, 0.5))
