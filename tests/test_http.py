@@ -27,6 +27,7 @@ from unittest import mock
 from devdocs.errors import AuthError, ProviderError, RateLimited
 from devdocs.llm import http as http_module
 from devdocs.llm.http import HttpResponse, HttpTransport, RetryPolicy, parse_retry_after
+from devdocs.llm.stop import Interrupted
 
 # A self-signed certificate for 127.0.0.1, trusted by nothing (test data only).
 _KEY = """-----BEGIN EC PRIVATE KEY-----
@@ -45,6 +46,44 @@ KoZIzj0EAwIDRwAwRAIgV0jEGgu1fDcKrWyAZUOM0BVra8GGu5v/vrpgEibUgn4C
 IHAX5W+6qaTcy0Cb9m4xcXe0aD64OkwDlSyMNn8znDSu
 -----END CERTIFICATE-----
 """
+
+
+class Watched(threading.Event):
+    """A stop signal that reports each wait on it, so that a test can set it
+    while a wait is in progress."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waiting.set()
+        return super().wait(timeout)
+
+
+def stopped_while_waiting(
+    work: Callable[[], object], stop: Watched
+) -> tuple[BaseException | None, float]:
+    """Run `work` in a thread, set `stop` once it waits on it, and return
+    what it raised and how long it took in all."""
+    raised: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            work()
+        except BaseException as err:
+            raised.append(err)
+
+    started = time.monotonic()
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    if not stop.waiting.wait(5):
+        raise AssertionError("never waited on the stop")
+    stop.set()
+    thread.join(5)
+    if thread.is_alive():
+        raise AssertionError("still waiting after the stop")
+    return (raised[0] if raised else None), time.monotonic() - started
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -774,6 +813,73 @@ class TestRetryPolicy(unittest.TestCase):
         policy = RetryPolicy(base_delay=1, max_delay=4)
         for attempt in (*range(1, 10), 5000):
             self.assertLessEqual(policy.delay(attempt), 4)
+
+
+class TestRetryStop(unittest.TestCase):
+    """A stop request: no retry, and a wait to retry ends at once."""
+
+    def failing_once(self, failure: Exception) -> tuple[Callable[[], str], list[int]]:
+        calls: list[int] = []
+
+        def operation() -> str:
+            calls.append(1)
+            if len(calls) == 1:
+                raise failure
+            return "done"
+
+        return operation, calls
+
+    def test_a_stop_ends_the_backoff_at_once(self) -> None:
+        self.enterContext(mock.patch.object(http_module.random, "uniform",
+                                            lambda low, high: high))
+        operation, calls = self.failing_once(ProviderError("down", status=503))
+        stop = Watched()
+        policy = RetryPolicy(base_delay=60, max_delay=60)
+        raised, elapsed = stopped_while_waiting(
+            lambda: policy.run(operation, stop=stop), stop)
+        self.assertIsInstance(raised, Interrupted)
+        self.assertIsInstance(raised.__cause__, ProviderError)
+        self.assertLess(elapsed, 5)   # not the 60 s backoff
+        self.assertEqual(calls, [1])
+
+    def test_a_stop_ends_a_retry_after_wait_at_once(self) -> None:
+        operation, calls = self.failing_once(RateLimited("slow", retry_after=100))
+        stop = Watched()
+        raised, elapsed = stopped_while_waiting(
+            lambda: RetryPolicy().run(operation, stop=stop), stop)
+        self.assertIsInstance(raised, Interrupted)
+        self.assertLess(elapsed, 5)   # not the 100 s the server asked for
+        self.assertEqual(calls, [1])
+
+    def test_nothing_is_retried_once_stopped(self) -> None:
+        stop = threading.Event()
+        calls: list[int] = []
+        retries: list[int] = []
+        slept: list[float] = []
+
+        def operation() -> str:
+            calls.append(1)
+            stop.set()   # the stop comes while the request is out
+            raise ProviderError("down", status=503)
+
+        with self.assertRaises(Interrupted) as caught:
+            RetryPolicy().run(operation, sleep=slept.append, stop=stop,
+                              on_retry=lambda n, err, wait: retries.append(n))
+        self.assertIsInstance(caught.exception.__cause__, ProviderError)
+        self.assertEqual((calls, retries, slept), ([1], [], []))
+
+    def test_a_final_failure_is_raised_as_itself(self) -> None:
+        # Never retried anyway, so the stop changes nothing about it.
+        stop = threading.Event()
+        stop.set()
+        for policy, error in ((RetryPolicy(), ProviderError("bad", status=400)),
+                              (RetryPolicy(attempts=1), ProviderError("down"))):
+            def operation(error: ProviderError = error) -> str:
+                raise error
+
+            with self.subTest(error=error), self.assertRaises(ProviderError) as caught:
+                policy.run(operation, stop=stop)
+            self.assertIs(caught.exception, error)
 
 
 if __name__ == "__main__":

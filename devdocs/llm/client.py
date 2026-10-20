@@ -14,6 +14,10 @@
    one that actually served, record it against today's quota, and cache a
    usable answer.
 
+A stop request (`stop`, set) ends everything but the cache: no call is
+sent, retried or escalated after it, and a wait for a slot or a backoff
+ends at once. A call already sent finishes, and its answer is kept.
+
 Escalation to a stronger model happens only when a cheaper one returns
 nothing usable, or has been retired (404, or its daily quota is spent). A
 quota retirement lasts until the provider's quota day turns, and once quota
@@ -29,7 +33,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from devdocs.errors import ConfigError, ModelNotFound, QuotaExhausted
+from devdocs.errors import ConfigError, Interrupted, ModelNotFound, QuotaExhausted
 from devdocs.index import ledger
 from devdocs.index.cache import ResponseCache
 from devdocs.index.ledger import DailyUsage
@@ -76,7 +80,12 @@ class Quote:
 
 
 class LLMClient:
-    """Composes router, budget, limiters, cache and retries around a ChatModel."""
+    """Composes router, budget, limiters, cache and retries around a ChatModel.
+
+    `stop` is the run's stop signal (a new one unless given), shared with
+    whatever else the run starts; see `devdocs.llm.stop`. Once set it stays
+    set, so a client stopped once sends nothing until it is cleared.
+    """
 
     def __init__(
         self,
@@ -91,6 +100,7 @@ class LLMClient:
         effort: str | None = "low",
         temperature: float | None = 0.2,
         on_event: Callable[[CallEvent], None] | None = None,
+        stop: threading.Event | None = None,
     ) -> None:
         self.model = model
         self.router = router
@@ -102,6 +112,7 @@ class LLMClient:
         self.effort = effort
         self.temperature = temperature
         self.on_event = on_event
+        self.stop = stop if stop is not None else threading.Event()
         self._limiters: dict[str, RateLimiter] = {}
         self._quota: dict[str, tuple[str, QuotaExhausted]] = {}  # id -> (day, why)
         self._lock = threading.Lock()
@@ -140,7 +151,8 @@ class LLMClient:
             if existing is None:
                 used = self.usage.requests(info.id) if self.usage else 0
                 existing = RateLimiter.for_model(
-                    info, free_tier=self.free_tier, used_today=used, day=_quota_day
+                    info, free_tier=self.free_tier, used_today=used, day=_quota_day,
+                    stop=self.stop,
                 )
                 self._limiters[info.id] = existing
             return existing
@@ -279,7 +291,8 @@ class LLMClient:
         `text` may be None (blocked, refused, or no rung produced anything).
         Raises AuthError, BudgetExceeded, QuotaExhausted (also once quota has
         retired every model the request could use) and non-retryable
-        ProviderError to the caller.
+        ProviderError to the caller; and Interrupted once `stop` is set, for
+        a request the cache cannot answer.
         """
         self._thaw()
         candidates = self.router.candidates(tier)
@@ -307,6 +320,8 @@ class LLMClient:
             )
             if rung is None:
                 break
+            if self.stop.is_set():
+                raise Interrupted(f"stopped before calling {rung.id}")
             if tried:
                 self._emit("escalate", rung.id, tag, detail=f"after {tried[-1]}")
             tried.append(rung.id)
@@ -371,7 +386,9 @@ class LLMClient:
                 self.budget.fail(estimate)
                 raise
 
-        completion = self.retry.run(attempt, on_retry=retried)
+        completion = self.retry.run(
+            attempt, on_retry=retried, stop=self.stop
+        )
 
         # A server-side fallback answers under another model's id; never
         # book it below the price of the model that was asked.

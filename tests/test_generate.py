@@ -7,21 +7,32 @@ client, composition, rendering and writing end to end.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
+import signal
+import sys
 import tempfile
+import threading
+import time
 import unittest
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from devdocs.config import Config
-from devdocs.errors import ConfigError, DevDocsError
+from devdocs.errors import (
+    ConfigError,
+    DevDocsError,
+    ProviderError,
+    RateLimited,
+)
 from devdocs.generate import Pipeline
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
+from devdocs.index.embed import Embeddings
 from devdocs.index.ledger import DailyUsage
 from devdocs.llm import Completion, Finish, Request, Usage
 from devdocs.llm.budget import Budget, Router
@@ -97,6 +108,9 @@ class TaggedModel:
                           Usage(input_tokens=500, output_tokens=60))
 
 
+PROSE = "Implements part of the shop."      # TaggedModel's answer for a file
+
+
 class PipelineCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -106,7 +120,7 @@ class PipelineCase(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
         self.db = Database(self.tmp / ".devdocs" / "devdocs.db")
         self.addCleanup(self.db.close)
-        self.model = TaggedModel()
+        self.model: TaggedModel = TaggedModel()
 
     def pipeline(self, *, log: Any = None, renderers: Sequence[Renderer] | None = None,
                  **overrides: object) -> Pipeline:
@@ -120,6 +134,7 @@ class PipelineCase(unittest.TestCase):
             retry=RetryPolicy(base_delay=0),
             free_tier=False,
         )
+        self.client = client
         return Pipeline(config, client=client, db=self.db, log=log,
                         renderers=renderers)
 
@@ -129,6 +144,13 @@ class PipelineCase(unittest.TestCase):
             p.relative_to(out).as_posix(): p.read_text("utf-8")
             for p in sorted(out.rglob("*")) if p.is_file()
         }
+
+    def last_run(self) -> str:
+        """How the last run ended, as the ledger has it."""
+        run = self.db.query_one(
+            "SELECT status FROM run ORDER BY started_at DESC LIMIT 1")
+        assert run is not None
+        return str(run["status"])
 
 
 class TestRun(PipelineCase):
@@ -189,6 +211,154 @@ class TestRun(PipelineCase):
         summary = again.run(again.prepare())
         self.assertTrue(summary.resumed)
         self.assertGreater(summary.cache_hits, 0)
+
+
+class OnTheWire(TaggedModel):
+    """Answers `tags` only once all are out at once; the first sets `stop`,
+    and the others answer after it."""
+
+    def __init__(self, *tags: str) -> None:
+        super().__init__()
+        self.tags = tags
+        self.out = threading.Barrier(len(tags), timeout=5)
+        self.stop = threading.Event()   # the run's, once its client exists
+
+    def generate(self, request: Request) -> Completion:
+        if request.tag in self.tags:
+            self.out.wait()
+            if request.tag == self.tags[0]:
+                self.stop.set()
+            else:
+                self.stop.wait(5)
+        return super().generate(request)
+
+
+class DownAtTheStop(TaggedModel):
+    """The stop comes while the module prompt's call, this project's last,
+    is out, and that call fails with a 503 a retry might cure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop = threading.Event()   # the run's, once its client exists
+
+    def generate(self, request: Request) -> Completion:
+        if "RELATION" in request.system:
+            self.stop.set()
+            raise ProviderError("down", status=503)
+        return super().generate(request)
+
+
+class Limited(TaggedModel):
+    """shop/cart.py's first call is told to come back in 30 s; shop/cli.py's
+    raises KeyboardInterrupt once it is, as Python's own Ctrl-C would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.limited = threading.Event()
+
+    def generate(self, request: Request) -> Completion:
+        if request.tag == "shop/cart.py" and not self.limited.is_set():
+            self.limited.set()
+            raise RateLimited("slow down", retry_after=30, status=429)
+        if request.tag == "shop/cli.py":
+            self.limited.wait(5)
+            raise KeyboardInterrupt
+        return super().generate(request)
+
+
+class TestStop(PipelineCase):
+    """A stop request, set here while a call is out."""
+
+    def test_calls_on_the_wire_finish_and_are_kept(self) -> None:
+        model = OnTheWire("shop/cart.py", "shop/cli.py")
+        self.model = model
+        pipeline = self.pipeline(concurrency=2)
+        model.stop = self.client.stop
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(summary.stopped, "interrupted")
+        self.assertEqual(sorted(r.tag for r in model.calls),
+                         ["shop/cart.py", "shop/cli.py"])
+        docs = self.docs()
+        for page in ("shop/cart.py.md", "shop/cli.py.md"):
+            self.assertIn(PROSE, docs[page])
+        for page in ("shop/money.py.md", "shop/__init__.py.md"):
+            self.assertNotIn(PROSE, docs[page])
+        self.assertEqual(self.last_run(), "interrupted")
+
+        again = self.pipeline(concurrency=2)
+        summary = again.run(again.prepare())
+        self.assertTrue(summary.resumed)
+        self.assertEqual(summary.cache_hits, 2)
+
+    def test_a_stop_still_takes_what_the_cache_holds(self) -> None:
+        first = self.pipeline()
+        first.run(first.prepare())
+        cli = self.tmp / "shop" / "cli.py"
+        cli.write_text(cli.read_text("utf-8").replace(
+            "    Cart()\n", "    # build the basket\n    Cart().total()\n"
+        ), encoding="utf-8")
+        model = OnTheWire("shop/cli.py")
+        self.model = model
+        second = self.pipeline()
+        model.stop = self.client.stop
+        summary = second.run(second.prepare())
+        self.assertEqual(summary.stopped, "interrupted")
+        self.assertEqual([r.tag for r in model.calls], ["shop/cli.py"])
+        docs = self.docs()
+        for page in ("shop/cart.py.md", "shop/cli.py.md", "shop/money.py.md",
+                     "shop/__init__.py.md"):
+            self.assertIn(PROSE, docs[page])
+        self.assertIn("Holds the cart, money and the command line.",
+                      docs["shop/index.md"])
+        self.assertEqual(self.last_run(), "interrupted")
+
+    def test_a_stop_that_fails_the_last_call_leaves_the_run_to_resume(self) -> None:
+        # The failed call is not retried once stopped, so its answer is still
+        # to buy: the run must not be recorded as finished.
+        model = DownAtTheStop()
+        self.model = model
+        pipeline = self.pipeline()
+        model.stop = self.client.stop
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(summary.stopped, "interrupted")
+        self.assertEqual(self.last_run(), "interrupted")
+        docs = self.docs()
+        for page in ("shop/cart.py.md", "shop/cli.py.md", "shop/money.py.md",
+                     "shop/__init__.py.md"):
+            self.assertIn(PROSE, docs[page])
+        self.assertNotIn("Holds the cart", docs["shop/index.md"])
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX signal masks")
+    def test_workers_leave_stop_signals_to_the_main_thread(self) -> None:
+        # Python runs a handler only on the main thread, and a signal the
+        # kernel gave a worker instead would leave that thread's wait asleep.
+        masks: list[set[signal.Signals]] = []
+
+        class Masked(TaggedModel):
+            def generate(self, request: Request) -> Completion:
+                masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+                return super().generate(request)
+
+        self.model = Masked()
+        pipeline = self.pipeline(concurrency=2)
+        pipeline.run(pipeline.prepare())
+        self.assertTrue(masks)
+        for mask in masks:
+            self.assertLessEqual({signal.SIGINT, signal.SIGTERM}, mask)
+
+    def test_pythons_own_ctrl_c_stops_the_workers_too(self) -> None:
+        # Regression: with no handler to set the stop, a Ctrl-C waited out
+        # every retry the workers had begun, here a 30 s Retry-After.
+        self.model = Limited()
+        pipeline = self.pipeline(concurrency=2)
+        prepared = pipeline.prepare()
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline.run(prepared)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertTrue(self.client.stop.is_set())
+        self.assertIn("README.md", self.docs())
+        self.assertEqual(self.last_run(), "interrupted")
 
 
 class Noisy:
@@ -398,8 +568,11 @@ class EmbeddingModel(TaggedModel):
     def __init__(self) -> None:
         super().__init__()
         self.batches: list[list[str]] = []
+        self.during_embed: Callable[[], None] | None = None
 
     def embed(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
+        if self.during_embed is not None:
+            self.during_embed()
         self.batches.append(list(texts))
         vectors = []
         for text in texts:
@@ -467,6 +640,33 @@ class TestSemanticContext(PipelineCase):
                          ("embed", "gemini-embedding-001", 1))
         self.assertGreater(embed.cost, 0.0)
         self.assertEqual(self.embedder.batches, [])
+
+    def test_a_stop_while_embedding_asks_for_nothing_more(self) -> None:
+        # A chunk a batch, so that the stop has batches left to refuse.
+        self.enterContext(mock.patch("devdocs.generate.Embeddings",
+                                     functools.partial(Embeddings, batch=1)))
+        pipeline = self.pipeline(context="semantic")
+        prepared = pipeline.prepare()
+
+        def unembedded() -> int:
+            embeddings = pipeline._embeddings()
+            assert embeddings is not None
+            return embeddings.quote().chunks
+
+        chunks = unembedded()
+        self.assertGreater(chunks, 1)
+        self.embedder.during_embed = self.client.stop.set
+        summary = pipeline.run(prepared)
+        self.assertEqual(summary.stopped, "interrupted")
+        self.assertEqual((len(self.embedder.batches), self.model.calls), (1, []))
+        self.assertEqual(unembedded(), chunks - 1)
+        self.assertEqual(self.last_run(), "interrupted")
+
+        self.embedder.during_embed = None
+        again = self.pipeline(context="semantic")
+        again.run(again.prepare())
+        # The batch embedded before the stop was kept: each chunk is sent once.
+        self.assertEqual([len(b) for b in self.embedder.batches], [1] * chunks)
 
     def test_embedding_never_takes_most_of_the_budget(self) -> None:
         messages: list[str] = []

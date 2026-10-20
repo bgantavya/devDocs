@@ -15,6 +15,12 @@ useful work. Every paid answer is cached the moment it lands and every item
 is recorded in the run ledger, so an interrupted run writes what it has,
 stubs the rest, and resumes next time without paying twice.
 
+A stop request (the client's `stop` set, from any thread) sends nothing more,
+but the waves still run through: calls already sent finish and are kept, and
+every other prompt gets the answer an earlier run paid for, from the cache, or
+a stub. So a stop never costs a page that was already bought, and the run is
+recorded as interrupted, to resume.
+
 Rendering comes last and costs nothing: one renderer per configured format
 turns the composed documents into files. A format whose renderer fails, such
 as an external PDF engine, costs only itself: the others and the manifest
@@ -29,6 +35,7 @@ import builtins
 import hashlib
 import json
 import posixpath
+import sys
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -46,6 +53,7 @@ from devdocs.errors import (
     BudgetExceeded,
     ConfigError,
     DevDocsError,
+    Interrupted,
     QuotaExhausted,
 )
 from devdocs.graph import GraphBuilder, ProjectGraph
@@ -60,6 +68,7 @@ from devdocs.llm import Completion, Embedder
 from devdocs.llm.catalog import assume, find
 from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.providers import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
+from devdocs.llm.stop import leave_signals
 from devdocs.parse import Confidence, FileFacts, get_parser
 from devdocs.plan import Plan, Planner, PlannerOptions, fit_to_budget
 from devdocs.prompting import Prompt, PromptBuilder
@@ -95,6 +104,13 @@ _QUALITY = {
 
 # Semantic context may claim at most this share of either limit.
 _EMBED_SHARE = 0.5
+
+# Stops after which nothing can be asked; after "interrupted" the cache can.
+_EXHAUSTED = frozenset({"budget", "quota"})
+
+# On Windows a Ctrl-C may not wake a lock wait; waking this often lets its
+# handler run.
+_TICK: float | None = 0.5 if sys.platform == "win32" else None
 
 _SHOWN_WARNINGS = 10     # per renderer in the log; summaries keep them all
 # What a format's warnings mean, and how to avoid them.
@@ -403,6 +419,7 @@ class Pipeline:
         client = self.client
         if client is not None:
             embeddings.budget = client.budget
+            embeddings.stop = client.stop
             if isinstance(client.model, Embedder):
                 embeddings.embedder = client.model
                 embeddings.dims = client.model.dimensions
@@ -444,7 +461,7 @@ class Pipeline:
             return
         try:
             done, spent = embeddings.update()
-        except (BudgetExceeded, QuotaExhausted) as err:
+        except (BudgetExceeded, QuotaExhausted, Interrupted) as err:
             self.log(f"semantic context: {err.message}; using the vectors stored")
         else:
             self.log(f"embedded {done} chunks (${spent:.4f})")
@@ -587,11 +604,15 @@ class Pipeline:
         """Send the priced plan, then compose and write every document.
 
         Documents are written even when the run stops early on budget, quota
-        or Ctrl-C: whatever was paid for is kept, the rest is stubbed, and
-        the ledger leaves the run resumable. A format that fails to render
-        is reported in `failed`, the others written. A write refused for a
-        file devdocs did not write, see `write`, raises ConfigError; the
-        answers are cached by then, so running again costs nothing.
+        or a stop request: whatever was paid for is kept, the rest is
+        stubbed, and the ledger leaves the run resumable. A stop request,
+        `client.stop` set before the waves end, makes `stopped`
+        "interrupted". A KeyboardInterrupt in a wave, as Python raises on Ctrl-C
+        when no handler sets the stop instead, is raised again once the documents
+        are written. A format that fails to render is reported in `failed`,
+        the others written. A write refused for a file devdocs did not
+        write, see `write`, raises ConfigError; the answers are cached by
+        then, so running again costs nothing.
         """
         client = self._client()
         self._embed(prepared)
@@ -629,6 +650,8 @@ class Pipeline:
             interrupted = err
         finally:
             client.on_event = previous
+        if client.stop.is_set():
+            summary.stopped = summary.stopped or "interrupted"
 
         docset = self._compose(prepared, prose)
         budget = client.budget
@@ -710,18 +733,30 @@ class Pipeline:
         summary: RunSummary,
         ledger: RunLedger | None,
     ) -> None:
-        """Send one wave of calls, most valuable first, stopping cleanly on a
-        budget or quota stop and recording each outcome as it lands."""
-        if not prompts or summary.stopped:
+        """Send one wave of calls, most valuable first, recording each outcome
+        as it lands.
+
+        A budget or quota stop ends the asking. A stop request does not: the
+        client then sends nothing, so the wave runs on through the cache
+        while the calls on the wire finish. A KeyboardInterrupt, which no
+        handler turned into a stop request, sets the stop for the workers'
+        sake on its way up.
+        """
+        if not prompts or summary.stopped in _EXHAUSTED:
             return
+        stop = self._client().stop
         describe = {p.relpath: p.describe for p in prepared.plan.files}
         workers = max(1, min(self.config.concurrency, len(prompts)))
-        pool = ThreadPoolExecutor(max_workers=workers)
+        pool = ThreadPoolExecutor(max_workers=workers, initializer=leave_signals)
         futures: dict[Future[Prose | None], Prompt] = {}
         pending = list(prompts)
         try:
             while pending or futures:
-                while pending and len(futures) < workers and not summary.stopped:
+                if stop.is_set() and not summary.stopped:
+                    summary.stopped = "interrupted"
+                if summary.stopped in _EXHAUSTED:
+                    pending.clear()
+                while pending and len(futures) < workers:
                     prompt = pending.pop(0)
                     allowed = describe.get(prompt.key, ())
                     if prompt.kind != "file":
@@ -729,11 +764,13 @@ class Pipeline:
                     futures[pool.submit(self._ask, prompt, guard, allowed)] = prompt
                 if not futures:
                     break
-                done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+                done, _ = wait(list(futures), timeout=_TICK,
+                               return_when=FIRST_COMPLETED)
                 for future in sorted(done, key=lambda f: futures[f].key):
                     self._settle(future, futures.pop(future), prose, summary, ledger)
-                if summary.stopped:
-                    pending.clear()
+        except KeyboardInterrupt:
+            stop.set()
+            raise
         finally:
             # In-flight calls finish and are cached; queued ones never start.
             pool.shutdown(wait=True, cancel_futures=True)
@@ -749,6 +786,8 @@ class Pipeline:
         source = prompt.key or prompt.kind
         try:
             result = future.result()
+        except Interrupted:
+            return   # refused for a stop request: for the next run to buy
         except BudgetExceeded as err:
             summary.stopped = summary.stopped or "budget"
             self.log(f"stopped: {err.message}")
