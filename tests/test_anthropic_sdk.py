@@ -377,7 +377,9 @@ class TestErrors(SDKCase):
             (500, self.body("api_error"), {}),
             (504, self.body("timeout_error"), {}),
             (529, self.body("overloaded_error"), {}),
+            (529, self.body("overloaded_error"), {"retry-after": "4"}),
             (503, "upstream connect error", {}),
+            (503, "upstream connect error", {"retry-after": "7"}),
         ]
         for status, body, headers in cases:
             via_sdk = self.mapped(status_error(status, body, headers))
@@ -408,6 +410,11 @@ class TestErrors(SDKCase):
                                        {"retry-after": "4"}))
         assert isinstance(err, RateLimited)
         self.assertEqual(err.retry_after, 4.0)
+
+    def test_a_503_keeps_its_retry_after(self) -> None:
+        err = self.mapped(status_error(503, "busy", {"retry-after": "7"}))
+        assert isinstance(err, ProviderError)
+        self.assertEqual((err.retry_after, err.exit_code), (7.0, 4))
 
     def test_overload_and_timeouts_are_retryable(self) -> None:
         for raised in (status_error(529, self.body("overloaded_error")),

@@ -720,6 +720,22 @@ class TestRetryPolicy(unittest.TestCase):
         _, slept = self.run_with([RateLimited("slow", retry_after=7)], RetryPolicy())
         self.assertEqual(slept, [7])
 
+    def test_a_server_errors_retry_after_is_used(self) -> None:
+        # Regression: only RateLimited's was read, so a 503's asked in vain.
+        _, slept = self.run_with([ProviderError("down", status=503, retry_after=7)],
+                                 RetryPolicy())
+        self.assertEqual(slept, [7])
+
+    def test_a_server_error_asking_too_long_is_not_sat_out(self) -> None:
+        with self.assertRaises(ProviderError):
+            self.run_with([ProviderError("down", status=503, retry_after=3600)],
+                          RetryPolicy())
+
+    def test_a_retry_after_on_a_failure_not_worth_retrying_is_ignored(self) -> None:
+        with self.assertRaises(ProviderError):
+            self.run_with([ProviderError("bad", status=400, retry_after=1)],
+                          RetryPolicy())
+
     def test_client_errors_are_not_retried(self) -> None:
         for error in (ProviderError("bad", status=400), AuthError("key")):
             with self.assertRaises(type(error)):

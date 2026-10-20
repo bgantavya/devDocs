@@ -47,7 +47,7 @@ from typing import Any, Protocol, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from devdocs import __version__
-from devdocs.errors import ProviderError, RateLimited
+from devdocs.errors import ProviderError
 
 __all__ = [
     "HttpResponse",
@@ -616,7 +616,8 @@ class RetryPolicy:
     Only failures that can succeed on a second try are retried: rate limits,
     5xx, and network errors. Bad keys, unknown models and bad requests fail
     fast, because retrying them only spends quota to learn the same thing.
-    KeyboardInterrupt and other non-Exception signals are never retried.
+    KeyboardInterrupt and other non-Exception signals are never retried. A
+    delay the server gave, on a 429 or a 503 alike, replaces the backoff.
     """
 
     attempts: int = 4
@@ -658,7 +659,7 @@ class RetryPolicy:
                 if attempt >= self.attempts or not self.should_retry(err):
                     raise
                 retry_after = (
-                    _server_delay(err.retry_after) if isinstance(err, RateLimited)
+                    _server_delay(err.retry_after) if isinstance(err, ProviderError)
                     else None
                 )
                 if retry_after is not None and retry_after > self.max_retry_after:
