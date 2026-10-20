@@ -13,6 +13,7 @@ from devdocs.errors import (
     BudgetExceeded,
     ConfigError,
     DevDocsError,
+    Interrupted,
     ModelNotFound,
     ParseError,
     ProviderError,
@@ -21,10 +22,12 @@ from devdocs.errors import (
     StorageError,
     exit_code_for,
 )
+from devdocs.llm import stop
 
 ALL: tuple[type[DevDocsError], ...] = (
     DevDocsError, ConfigError, AuthError, ProviderError, RateLimited,
     ModelNotFound, BudgetExceeded, ParseError, StorageError, QuotaExhausted,
+    Interrupted,
 )
 
 
@@ -38,10 +41,13 @@ class TestExitCodes(unittest.TestCase):
         expected: dict[type[DevDocsError], int] = {
             DevDocsError: 1, ConfigError: 2, AuthError: 3, ProviderError: 4,
             RateLimited: 5, ModelNotFound: 6, BudgetExceeded: 7, ParseError: 8,
-            StorageError: 9, QuotaExhausted: 10,
+            StorageError: 9, QuotaExhausted: 10, Interrupted: 130,
         }
         for cls, code in expected.items():
             self.assertEqual(cls.exit_code, code, cls.__name__)
+
+    def test_a_stop_refusal_is_also_named_in_stop(self) -> None:
+        self.assertIs(stop.Interrupted, Interrupted)
 
     def test_unknown_exception_is_one(self) -> None:
         self.assertEqual(exit_code_for(ValueError("x")), 1)

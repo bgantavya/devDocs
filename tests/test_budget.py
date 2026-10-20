@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 import unittest
 
 import devdocs.llm.catalog as catalog_module
-from devdocs.errors import BudgetExceeded, ConfigError, QuotaExhausted
+from devdocs.errors import BudgetExceeded, ConfigError, Interrupted, QuotaExhausted
 from devdocs.llm import Usage
 from devdocs.llm.budget import (
     Budget,
@@ -25,6 +26,7 @@ from devdocs.llm.catalog import (
     find,
     ladder,
 )
+from tests.test_http import Watched, stopped_while_waiting
 
 GEMINI = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]
 
@@ -338,6 +340,76 @@ class TestRateLimiter(unittest.TestCase):
         paid = RateLimiter.for_model(lite, free_tier=False)
         self.assertEqual(paid.rpm, lite.paid_rpm)
         self.assertIsNone(paid.rpd)
+
+
+class TestRateLimiterStop(unittest.TestCase):
+    """`stop=`: the wait for a slot ends with the run, and takes no slot."""
+
+    def test_a_stop_ends_the_wait_at_once(self) -> None:
+        stop = Watched()
+        limiter = RateLimiter(1, stop=stop)
+        limiter.acquire()   # this minute's one slot is used
+        raised, elapsed = stopped_while_waiting(limiter.acquire, stop)
+        self.assertIsInstance(raised, Interrupted)
+        self.assertLess(elapsed, 5)   # not the minute to the next slot
+        self.assertEqual(limiter.used_today, 1)   # refused: not a request
+
+    def test_a_stop_already_set_never_waits(self) -> None:
+        stop = threading.Event()
+        limiter = RateLimiter(1, stop=stop)
+        limiter.acquire()
+        stop.set()
+        started = time.monotonic()
+        with self.assertRaises(Interrupted):
+            limiter.acquire()
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_free_slot_needs_no_wait_to_end(self) -> None:
+        # The client refuses to call once stopped; a slot itself is not a call.
+        stop = threading.Event()
+        stop.set()
+        self.assertEqual(RateLimiter(1, stop=stop).acquire(), 0.0)
+
+    def test_unset_it_paces_as_ever(self) -> None:
+        clock = FakeClock()
+        limiter = RateLimiter(1, clock=clock, sleep=clock.sleep,
+                              stop=threading.Event())
+        limiter.acquire()
+        self.assertAlmostEqual(limiter.acquire(), 60.01)
+        self.assertEqual(limiter.used_today, 2)
+
+    def test_a_given_sleep_is_used_and_the_stop_still_read_after_it(self) -> None:
+        clock = FakeClock()
+        stop = threading.Event()
+
+        def sleep(seconds: float) -> None:
+            clock.sleep(seconds)
+            stop.set()   # the stop comes during the sleep
+
+        limiter = RateLimiter(1, clock=clock, sleep=sleep, stop=stop)
+        limiter.acquire()
+        with self.assertRaises(Interrupted):
+            limiter.acquire()
+        self.assertEqual(len(clock.slept), 1)
+        self.assertEqual(limiter.used_today, 1)
+
+    def test_the_daily_cap_comes_before_any_wait(self) -> None:
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(QuotaExhausted):
+            RateLimiter(1, 1, used_today=1, stop=stop).acquire()
+
+    def test_for_model_hands_it_on_at_either_tier(self) -> None:
+        lite = known("gemini-2.5-flash-lite")
+        for free_tier in (True, False):
+            with self.subTest(free_tier=free_tier):
+                stop = Watched()
+                limiter = RateLimiter.for_model(lite, free_tier=free_tier, stop=stop)
+                for _ in range(limiter.rpm or 0):
+                    limiter.acquire()
+                raised, elapsed = stopped_while_waiting(limiter.acquire, stop)
+                self.assertIsInstance(raised, Interrupted)
+                self.assertLess(elapsed, 5)
 
 
 class TestBudget(unittest.TestCase):

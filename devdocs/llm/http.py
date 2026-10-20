@@ -47,7 +47,7 @@ from typing import Any, Protocol, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from devdocs import __version__
-from devdocs.errors import ProviderError
+from devdocs.errors import Interrupted, ProviderError
 
 __all__ = [
     "HttpResponse",
@@ -616,8 +616,9 @@ class RetryPolicy:
     Only failures that can succeed on a second try are retried: rate limits,
     5xx, and network errors. Bad keys, unknown models and bad requests fail
     fast, because retrying them only spends quota to learn the same thing.
-    KeyboardInterrupt and other non-Exception signals are never retried. A
-    delay the server gave, on a 429 or a 503 alike, replaces the backoff.
+    KeyboardInterrupt and other non-Exception signals are never retried, and
+    nothing is once a stop is requested. A delay the server gave, on a 429 or
+    a 503 alike, replaces the backoff.
     """
 
     attempts: int = 4
@@ -647,10 +648,18 @@ class RetryPolicy:
         self,
         operation: Callable[[], T],
         *,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], object] | None = None,
         on_retry: Callable[[int, BaseException, float], None] | None = None,
+        stop: threading.Event | None = None,
     ) -> T:
-        """Call `operation` up to `attempts` times, retrying only retryable failures."""
+        """Call `operation` up to `attempts` times, retrying only retryable failures.
+
+        Once `stop` is set nothing is retried, and the wait before a retry,
+        a wait on `stop` unless `sleep` is given, ends at once. Either way
+        Interrupted is raised, from the failure that went unretried.
+        """
+        if sleep is None:
+            sleep = time.sleep if stop is None else stop.wait
         attempt = 1
         while True:
             try:
@@ -665,7 +674,15 @@ class RetryPolicy:
                 if retry_after is not None and retry_after > self.max_retry_after:
                     raise
                 wait = self.delay(attempt, retry_after)
+                _refuse_retry(stop, err)
                 if on_retry is not None:
                     on_retry(attempt, err, wait)
                 sleep(wait)
+                _refuse_retry(stop, err)
                 attempt += 1
+
+
+def _refuse_retry(stop: threading.Event | None, failure: Exception) -> None:
+    """Raise Interrupted, from `failure`, once `stop` is set."""
+    if stop is not None and stop.is_set():
+        raise Interrupted("stopped instead of retrying") from failure

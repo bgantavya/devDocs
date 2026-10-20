@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 from typing import Any
 
@@ -9,8 +10,10 @@ from devdocs.errors import BudgetExceeded, ConfigError, ProviderError, QuotaExha
 from devdocs.index.chunk import ChunkStore, chunk_file
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
-from devdocs.llm.budget import Budget, token_ceiling
+from devdocs.llm.budget import Budget, RateLimiter, token_ceiling
 from devdocs.llm.catalog import ModelInfo, find
+from devdocs.llm.stop import Interrupted
+from tests.test_http import Watched, stopped_while_waiting
 from tests.test_retrieval import CART, MONEY, facts
 
 _FOUND = find("gemini-embedding-001")
@@ -35,6 +38,18 @@ class Counting:
         return [[1.0] + [0.0] * (self.dimensions - 1) for _ in texts]
 
 
+class StopsMidBatch(Counting):
+    """Sets `stop` while its first batch is out."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        super().__init__()
+        self.stop = stop
+
+    def embed(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
+        self.stop.set()
+        return super().embed(texts, query=query)
+
+
 class Refusing:
     def acquire(self) -> None:
         raise QuotaExhausted("daily quota spent", status=429, provider="gemini")
@@ -56,11 +71,12 @@ class EmbedCase(unittest.TestCase):
         budget: Budget | None = None,
         limiter: Any = None,
         batch: int = 100,
+        stop: threading.Event | None = None,
     ) -> Embeddings:
         embedder = embedder or Counting()
         return Embeddings(self.store, model=MODEL, dims=embedder.dimensions,
                           embedder=embedder, budget=budget, limiter=limiter,
-                          batch=batch)
+                          batch=batch, stop=stop)
 
 
 class TestQuote(EmbedCase):
@@ -130,6 +146,32 @@ class TestUpdate(EmbedCase):
             self.embeddings(failing, budget=budget).update()
         self.assertEqual((budget.requests, budget.spent), (1, 0.0))
         self.assertEqual(self.embeddings().quote().chunks, len(self.texts))
+
+
+class TestStop(EmbedCase):
+    def test_the_batch_on_the_wire_is_kept_and_no_other_is_sent(self) -> None:
+        stop = threading.Event()
+        embedder = StopsMidBatch(stop)
+        budget = Budget()
+        embeddings = self.embeddings(embedder, budget=budget, batch=1, stop=stop)
+        with self.assertRaises(Interrupted):
+            embeddings.update()
+        self.assertEqual(len(embedder.batches), 1)
+        self.assertEqual(budget.requests, 1)
+        self.assertEqual(embeddings.quote().chunks, len(self.texts) - 1)
+
+    def test_a_stop_ends_a_wait_for_a_request_slot(self) -> None:
+        stop = Watched()
+        limiter = RateLimiter(1, stop=stop)
+        limiter.acquire()   # this minute's one slot is used
+        embedder = Counting()
+        budget = Budget()
+        embeddings = self.embeddings(embedder, budget=budget, limiter=limiter,
+                                     stop=stop)
+        raised, elapsed = stopped_while_waiting(embeddings.update, stop)
+        self.assertIsInstance(raised, Interrupted)
+        self.assertLess(elapsed, 5)   # not the minute to the next slot
+        self.assertEqual((embedder.batches, budget.requests), ([], 0))
 
 
 if __name__ == "__main__":
