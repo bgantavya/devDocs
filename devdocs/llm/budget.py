@@ -24,7 +24,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 
-from devdocs.errors import BudgetExceeded, ConfigError, QuotaExhausted
+from devdocs.errors import BudgetExceeded, ConfigError, Interrupted, QuotaExhausted
 from devdocs.llm.catalog import ModelInfo, Tier, assume, find, ladder, tier_models
 
 __all__ = ["Budget", "RateLimiter", "Router", "estimate_tokens", "token_ceiling"]
@@ -161,13 +161,17 @@ class RateLimiter:
         *,
         used_today: int = 0,
         clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], object] | None = None,
         day: Callable[[], str] | None = None,
+        stop: threading.Event | None = None,
     ) -> None:
         self.rpm = rpm
         self.rpd = rpd
         self._clock = clock
+        if sleep is None:
+            sleep = time.sleep if stop is None else stop.wait
         self._sleep = sleep
+        self._stop = stop
         self._window: deque[float] = deque()
         self._today = used_today
         self._day = day
@@ -182,11 +186,13 @@ class RateLimiter:
         free_tier: bool = True,
         used_today: int = 0,
         day: Callable[[], str] | None = None,
+        stop: threading.Event | None = None,
     ) -> RateLimiter:
         """Free-tier limits by default; `used_today` carries earlier runs' count."""
         if free_tier and info.free_rpm:
-            return cls(info.free_rpm, info.free_rpd, used_today=used_today, day=day)
-        return cls(info.paid_rpm, None)
+            return cls(info.free_rpm, info.free_rpd, used_today=used_today, day=day,
+                       stop=stop)
+        return cls(info.paid_rpm, None, stop=stop)
 
     def _roll(self) -> None:
         """Start the daily count again once the quota day has turned. Locked."""
@@ -201,7 +207,8 @@ class RateLimiter:
         Raises QuotaExhausted without waiting once the daily cap is reached:
         sleeping to the next quota day would hold a worker for hours, so the
         caller moves on and the next call after the day turns is counted
-        afresh.
+        afresh. The wait for a slot is a wait on `stop` unless `sleep` is
+        given; a stop request ends it at once with Interrupted.
         """
         waited = 0.0
         while True:
@@ -221,6 +228,8 @@ class RateLimiter:
                     return waited
                 pause = 60.0 - (now - self._window[0]) + 0.01
             self._sleep(pause)
+            if self._stop is not None and self._stop.is_set():
+                raise Interrupted("stopped while waiting for a request slot")
             waited += pause
 
     @property

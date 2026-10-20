@@ -8,15 +8,20 @@ semantic retrieval on can never push a run past its ceiling.
 
 The embeddings endpoint reports no token usage, so a batch is reserved and
 booked at a ceiling (one token per UTF-8 byte), which can only overstate it.
+
+A stop request (`stop`, the run's signal, which the limiter shares) sends no
+further batch, and a wait for a request slot ends at once. The batch already
+sent is stored.
 """
 
 from __future__ import annotations
 
+import threading
 from array import array
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from devdocs.errors import ConfigError
+from devdocs.errors import ConfigError, Interrupted
 from devdocs.index.chunk import Chunk, ChunkStore
 from devdocs.llm import Embedder
 from devdocs.llm.budget import Budget, RateLimiter, token_ceiling
@@ -52,6 +57,7 @@ class Embeddings:
         budget: Budget | None = None,
         limiter: RateLimiter | None = None,
         batch: int = 100,
+        stop: threading.Event | None = None,
     ) -> None:
         self.store = store
         self.model = model
@@ -60,6 +66,7 @@ class Embeddings:
         self.budget = budget or Budget()
         self.limiter = limiter
         self.batch = batch
+        self.stop = stop
 
     def quote(self) -> EmbeddingQuote:
         """Priced batch by batch, as `update` books them."""
@@ -77,7 +84,8 @@ class Embeddings:
         """Embed every chunk that lacks a current vector.
 
         Returns (chunks embedded, dollars booked). Batches already stored are
-        kept when a later one stops on the budget or the daily quota.
+        kept when a later one stops on the budget, the daily quota or a stop
+        request, which raises Interrupted.
         """
         if self.embedder is None:
             raise ConfigError("no embedding model configured")
@@ -86,6 +94,8 @@ class Embeddings:
         done = 0
         spent = 0.0
         for group in batches:
+            if self.stop is not None and self.stop.is_set():
+                raise Interrupted("stopped before every chunk was embedded")
             cost = self._price(group)
             self.budget.reserve(cost)
             if self.limiter is not None:

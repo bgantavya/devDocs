@@ -31,6 +31,8 @@ from devdocs.llm.budget import Budget, Router, token_ceiling
 from devdocs.llm.catalog import Tier, find
 from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.http import RetryPolicy
+from devdocs.llm.stop import Interrupted
+from tests.test_http import Watched, stopped_while_waiting
 
 LITE = "gemini-2.5-flash-lite"
 ALL_GEMINI = [LITE, "gemini-2.5-flash", "gemini-2.5-pro"]
@@ -282,6 +284,69 @@ class TestFailures(ClientCase):
         client, _ = self.make({})
         self.assertEqual(client.discover(), set(ALL_GEMINI))
         self.assertEqual(client.router.available, set(ALL_GEMINI))
+
+
+class TestStop(ClientCase):
+    """A stop request: nothing more is sent, retried or escalated, and the
+    cache still answers."""
+
+    def test_the_cache_answers_and_nothing_is_sent(self) -> None:
+        client, model = self.make({LITE: ok(LITE)})
+        client.complete(Tier.FILE, "SYS", "a")
+        client.stop.set()
+        self.assertTrue(client.complete(Tier.FILE, "SYS", "a").cached)
+        with self.assertRaises(Interrupted):
+            client.complete(Tier.FILE, "SYS", "b")
+        self.assertEqual(model.calls, [LITE])
+        self.assertEqual(client.budget.requests, 1)
+
+    def test_an_answer_on_the_wire_is_kept(self) -> None:
+        def answer() -> Completion:
+            client.stop.set()   # the stop comes while the request is out
+            return ok(LITE)
+
+        client, model = self.make({LITE: answer})
+        self.assertEqual(client.complete(Tier.FILE, "SYS", "a").text, "doc")
+        self.assertAlmostEqual(client.spent, 0.00018)
+        self.assertTrue(client.complete(Tier.FILE, "SYS", "a").cached)
+        self.assertEqual(model.calls, [LITE])
+
+    def test_no_escalation_after_a_stop(self) -> None:
+        def empty() -> Completion:
+            client.stop.set()
+            return nothing(LITE)
+
+        client, model = self.make({LITE: empty, "gemini-2.5-flash": ok("x")})
+        with self.assertRaises(Interrupted):
+            client.complete(Tier.FILE, "SYS", "a")
+        self.assertEqual(model.calls, [LITE])
+        self.assertEqual(self.kinds(), ["call"])
+
+    def test_no_retry_after_a_stop(self) -> None:
+        def down() -> BaseException:
+            client.stop.set()
+            return ProviderError("down", status=503)
+
+        client, model = self.make({LITE: down})
+        with self.assertRaises(Interrupted):
+            client.complete(Tier.FILE, "SYS", "a")
+        self.assertEqual((model.calls, self.kinds()), ([LITE], []))
+        self.assertEqual((client.budget.requests, client.spent), (1, 0.0))
+
+    def test_a_stop_ends_a_wait_for_a_request_slot(self) -> None:
+        stop = Watched()
+        client, model = self.make({LITE: ok(LITE)}, stop=stop)
+        info = find(LITE)
+        assert info is not None
+        limiter = client.limiter(info)
+        for _ in range(limiter.rpm or 0):   # this minute's free slots are used
+            limiter.acquire()
+        raised, elapsed = stopped_while_waiting(
+            lambda: client.complete(Tier.FILE, "SYS", "a"), stop)
+        self.assertIsInstance(raised, Interrupted)
+        self.assertLess(elapsed, 5)   # not the minute to the next slot
+        self.assertEqual(model.calls, [])
+        self.assertEqual(client.budget.requests, 0)   # never sent: not a request
 
 
 class TestQuote(ClientCase):

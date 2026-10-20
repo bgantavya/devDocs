@@ -7,6 +7,7 @@ default" is enforced rather than hoped for:
 - `catalog` — models as data: tier, price, limits, supported parameters.
 - `providers` — Gemini and Anthropic behind one `ChatModel` protocol.
 - `budget` — which model to use, how fast to call it, and when to stop.
+- `stop` — a run's stop signal, and the error for the work it refuses.
 - `client` — the facade the pipeline calls; composes all of the above.
 
 The provider-neutral request and response types live here so that callers

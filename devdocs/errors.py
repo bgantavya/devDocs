@@ -16,6 +16,7 @@ __all__ = [
     "BudgetExceeded",
     "ConfigError",
     "DevDocsError",
+    "Interrupted",
     "ModelNotFound",
     "ParseError",
     "ProviderError",
@@ -180,6 +181,15 @@ class StorageError(DevDocsError):
     """The SQLite index is unreadable, locked, or from a newer schema."""
 
     exit_code = 9
+
+
+class Interrupted(DevDocsError):
+    """Work a stop request refused to start; see `devdocs.llm.stop`.
+
+    Exits 130, as Ctrl-C does.
+    """
+
+    exit_code = 130
 
 
 def exit_code_for(error: BaseException) -> int:
