@@ -359,6 +359,8 @@ class GeminiProvider:
         402 (Prepay balance at $0) and a spend cap stop every key on the
         billing account until it is topped up or the month turns, so both are
         account-wide QuotaExhausted. A per-day quota retires one model only.
+        How long to wait, in a RetryInfo detail or a Retry-After header, is
+        kept for a 429 and for a server error such as a 503.
         """
         error = _json_body(response).get("error")
         if isinstance(error, str) and error.strip():
@@ -384,6 +386,9 @@ class GeminiProvider:
             )
         if code == 404:
             return ModelNotFound(message, provider=self.provider)
+        delay = _gemini_retry_delay(error)
+        if delay is None:
+            delay = parse_retry_after(response.header("retry-after"))
         if code == 429:
             capped = "spending cap" in lowered or "spend cap" in lowered
             if capped and "monthly" in lowered:
@@ -395,16 +400,12 @@ class GeminiProvider:
                 return QuotaExhausted(
                     f"Gemini daily quota exhausted: {message}", provider=self.provider
                 )
-            delay = _gemini_retry_delay(error)
             return RateLimited(
-                message,
-                retry_after=delay if delay is not None else parse_retry_after(
-                    response.header("retry-after")
-                ),
-                status=code,
-                provider=self.provider,
+                message, retry_after=delay, status=code, provider=self.provider
             )
-        return ProviderError(message, status=code, provider=self.provider)
+        return ProviderError(
+            message, status=code, provider=self.provider, retry_after=delay
+        )
 
 
 def _gemini_retry_delay(error: Mapping[str, Any]) -> float | None:
@@ -629,7 +630,8 @@ def _anthropic_error(
     `rate_limit_error` with `details.error_code` set and no retry-after, and a
     limit the user set is a 400 named only by its message. Both, like a 402
     billing error, stop every model on the account until someone acts, so they
-    are account-wide QuotaExhausted and never retried.
+    are account-wide QuotaExhausted and never retried. A `retry-after` is kept
+    for a 429 and for a server error such as a 503 or a 529.
     """
     error = body.get("error") if isinstance(body, Mapping) else None
     if isinstance(error, str) and error.strip():
@@ -656,14 +658,10 @@ def _anthropic_error(
         )
     if kind == "not_found_error" or status == 404:
         return ModelNotFound(message, provider=provider)
+    delay = parse_retry_after(retry_after)
     if kind == "rate_limit_error" or status == 429:
-        return RateLimited(
-            message,
-            retry_after=parse_retry_after(retry_after),
-            status=status,
-            provider=provider,
-        )
-    return ProviderError(message, status=status, provider=provider)
+        return RateLimited(message, retry_after=delay, status=status, provider=provider)
+    return ProviderError(message, status=status, provider=provider, retry_after=delay)
 
 
 class AnthropicProvider:
