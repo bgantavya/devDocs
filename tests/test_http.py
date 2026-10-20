@@ -516,6 +516,33 @@ class TestUnsendable(LocalCase):
             self.assertIn("x-api-key", str(caught.exception))
         self.assertEqual(server.requests, 0)
 
+    def test_a_control_character_is_refused_before_any_connection(self) -> None:
+        # Regression: http.client refuses only CR and LF, so a key holding NUL
+        # or another control went to the connection.
+        attempts: list[object] = []
+
+        def connect(*args: object, **kwargs: object) -> None:
+            attempts.append(args)
+            raise AssertionError("a connection was attempted")
+
+        for name in ("socket.create_connection", "socket.getaddrinfo"):
+            self.enterContext(mock.patch(name, side_effect=connect))
+        self.enterContext(mock.patch.object(socket.socket, "connect", connect))
+        for char in sorted({*map(chr, range(0x20)), "\x7f"} - {"\t"}):
+            with self.subTest(char):
+                with self.assertRaises(ProviderError) as caught:
+                    self.transport.request("POST", "https://api.example/v1",
+                                           headers={"x-api-key": f"SECRET{char}KEY"})
+                self.assertFalse(caught.exception.retryable)
+                self.assertNotIn("SECRET", str(caught.exception))
+                self.assertIn("x-api-key", str(caught.exception))
+        self.assertEqual(attempts, [])
+
+    def test_a_tab_and_latin_1_in_a_header_are_still_sent(self) -> None:
+        server = self.scripted(lambda n: _reply("200 OK"))
+        self.transport.request("POST", server.url, headers={"x-note": "a\tb \xe9"})
+        self.assertEqual(server.requests, 1)
+
     def test_malformed_urls_are_provider_errors(self) -> None:
         resolver = self.enterContext(mock.patch("socket.getaddrinfo"))
         for url in ("https://api.example:99999/", "https://[::1/", "api.example/v1",
