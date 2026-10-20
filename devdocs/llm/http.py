@@ -77,6 +77,9 @@ _EXCHANGE_ERRORS = (OSError, ValueError, http.client.HTTPException)
 _GZIP = 16 + zlib.MAX_WBITS
 _MAX_INTERIM = 16
 _HEADER_NAME = re.compile(rb"[^:\s][^:\r\n]*")   # http.client's own rule
+# Controls a field value may not hold (RFC 9110): all but tab. http.client
+# refuses only CR and LF.
+_HEADER_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 _DELAY_SECONDS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _TUNNEL_FAILED = re.compile(r"Tunnel connection failed: (\d{3})")
 
@@ -389,7 +392,9 @@ def _split(url: str) -> tuple[str, str, int, str]:
 
 
 def _check_headers(headers: Mapping[str, str]) -> None:
-    """Refuse a header http.client would refuse, without quoting its value.
+    """Refuse a header HTTP cannot carry, before any connection and without
+    quoting its value: a name http.client refuses, or a value outside Latin-1
+    or with a control character other than tab (RFC 9110).
 
     http.client's own error repeats the value, and the value may be an API
     key with a stray newline: printing that error would print the key.
@@ -400,7 +405,7 @@ def _check_headers(headers: Mapping[str, str]) -> None:
             value.encode("latin-1")
         except UnicodeEncodeError:
             legal = False
-        if not legal or "\r" in value or "\n" in value:
+        if not legal or _HEADER_CONTROL.search(value):
             raise ProviderError(
                 f"request header {name!r} has a line break or a character HTTP "
                 "headers cannot carry",
