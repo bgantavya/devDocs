@@ -342,11 +342,15 @@ class LLMClient:
                 quota_error = err
                 continue
 
-            if usable(completion):
-                if self.cache is not None:
-                    self.cache.put(
-                        self._keyed(rung, system, text, max_output_tokens), completion
-                    )
+            good = usable(completion)
+            if good and self.cache is not None:
+                self.cache.put(
+                    self._keyed(rung, system, text, max_output_tokens), completion
+                )
+            # Reported once kept: a failing observer cannot lose a paid answer.
+            self._emit("call", completion.model, tag,
+                       detail=completion.finish.value, cost=completion.cost_usd)
+            if good:
                 return completion
             last = completion
             if completion.finish in _TERMINAL:
@@ -399,8 +403,6 @@ class LLMClient:
         self.budget.settle(estimate, cost)
         if self.usage is not None:
             self.usage.record(info.id, cost=cost)
-        self._emit("call", completion.model, request.tag,
-                   detail=completion.finish.value, cost=cost)
         return replace(completion, cost_usd=cost)
 
     @property
