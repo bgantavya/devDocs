@@ -60,6 +60,29 @@ _LISTED = 10             # written files an export names; --json lists them all
 _SAME_REQUEST = 1.0
 
 
+def _write(stream: TextIO, line: str) -> None:
+    """Print `line` and flush it, at best. What the stream cannot encode, as a
+    name in another script or one that is no text at all, it shows as an escape,
+    as stderr does. A stream that refuses the line, as one whose reader has gone
+    does (`| tee` ended by the same Ctrl-C), is pointed at os.devnull, as the
+    Python docs advise: no later line, nor Python's flush at exit, fails, so
+    unread output never ends a run or sets its status."""
+    try:
+        try:
+            print(line, file=stream, flush=True)
+        except UnicodeEncodeError:   # raised before any of `line` was written
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            print(line.encode(encoding, "backslashreplace").decode(encoding),
+                  file=stream, flush=True)
+    except OSError:
+        with contextlib.suppress(OSError, ValueError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, stream.fileno())
+            finally:
+                os.close(devnull)
+
+
 class _Output:
     """stderr for progress, stdout for results; `--json` and `--quiet` aware."""
 
@@ -72,16 +95,16 @@ class _Output:
 
     def info(self, message: str) -> None:
         if not self.quiet:
-            print(message, file=self.stderr, flush=True)
+            _write(self.stderr, message)
 
     def warn(self, message: str) -> None:
-        print(f"warning: {message}", file=self.stderr, flush=True)
+        _write(self.stderr, f"warning: {message}")
 
     def result(self, text: str, data: dict[str, Any]) -> None:
         if self.as_json:
-            print(json.dumps(data, indent=2, default=str), file=self.stdout)
+            _write(self.stdout, json.dumps(data, indent=2, default=str))
         else:
-            print(text, file=self.stdout)
+            _write(self.stdout, text)
 
     def event(self, event: CallEvent) -> None:
         if self.quiet:
@@ -785,11 +808,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             out.warn(str(err))
             return err.exit_code
         except DevDocsError as err:
-            print(f"devdocs: {err}", file=sys.stderr)
+            _write(out.stderr, f"devdocs: {err}")
             return err.exit_code
         except Exception as err:   # a bug: say so plainly, never as a clean stop
-            print(f"devdocs: internal error: {type(err).__name__}: {err}",
-                  file=sys.stderr)
+            _write(out.stderr, f"devdocs: internal error: {type(err).__name__}: {err}")
             if os.environ.get("DEVDOCS_DEBUG"):
                 raise
             return exit_code_for(err)
