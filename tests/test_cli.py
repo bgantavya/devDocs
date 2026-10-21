@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -416,6 +417,71 @@ class TestDoctorAndModels(CliCase):
         self.assertFalse(rows["gemini-3.1-flash-lite"])
 
 
+def gone() -> TextIO:
+    """A stream whose reader has gone, as `| tee` or `| jq` has once the
+    Ctrl-C that stops a run ends it too."""
+    read, write = os.pipe()
+    os.close(read)
+    return open(write, "w", encoding="utf-8")
+
+
+class TestOutput(unittest.TestCase):
+    def test_output_nobody_reads_is_dropped_and_nothing_fails(self) -> None:
+        # Regression: the line raised, or the result raised in Python's flush
+        # at exit, which made a stop's 130 a 120.
+        lines: dict[str, Callable[[cli._Output], None]] = {
+            "info": lambda out: out.info("progress"),
+            "warn": lambda out: out.warn("careful"),
+            "result": lambda out: out.result("done", {"documents": 6}),
+        }
+        for name, line in lines.items():
+            with self.subTest(name), gone() as stream:
+                out = cli._Output(as_json=True, stdout=stream, stderr=stream)
+                line(out)
+                line(out)
+                stream.flush()   # as Python does at exit
+
+    def test_what_a_stream_cannot_encode_is_shown_as_an_escape(self) -> None:
+        for encoding, line, shown in (
+            ("latin-1", "wrote café/日本", b"wrote caf\xe9/\\u65e5\\u672c\n"),
+            ("ascii", "café", b"caf\\xe9\n"),
+            ("utf-8", "caf\udcff.py", b"caf\\udcff.py\n"),   # a name that is no UTF-8
+            ("utf-8", "café", "café\n".encode()),
+        ):
+            with self.subTest(encoding=encoding, line=line):
+                raw = io.BytesIO()
+                with io.TextIOWrapper(raw, encoding=encoding) as stream:
+                    cli._write(stream, line)
+                    self.assertEqual(raw.getvalue(), shown)
+
+    def test_output_nobody_reads_is_dropped_even_if_it_cannot_be_encoded(self) -> None:
+        with gone() as stream:
+            cli._write(stream, "caf\udcff.py")
+            cli._write(stream, "next")
+            stream.flush()   # as Python does at exit
+
+    @unittest.skipUnless(sys.getfilesystemencoding() == "utf-8", "a name in UTF-8")
+    def test_a_name_stdout_cannot_encode_ends_no_command(self) -> None:
+        # Regression: an internal error, for init with its config written.
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory())) / "日本"
+        folder.mkdir()
+        (folder / "大.py").write_text("def f():\n    return 1\n", "utf-8")
+        for argv, shown in (
+            (["estimate", str(folder), "--explain", "--quiet"], b"  \\u5927.py  ("),
+            (["init", str(folder)], b"next: devdocs estimate "),
+        ):
+            with self.subTest(argv=argv):
+                raw = io.BytesIO()
+                err = io.StringIO()
+                with io.TextIOWrapper(raw, encoding="latin-1") as stdout, clean_env(), \
+                        contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(err):
+                    code = cli.main(argv)
+                    self.assertEqual(code, 0, err.getvalue())
+                    self.assertIn(shown, raw.getvalue())
+                self.assertNotIn("internal error", err.getvalue())
+
+
 def as_from_a_terminal(case: unittest.TestCase) -> None:
     """Give SIGINT and SIGTERM the handling a process started from a terminal
     has, until `case` ends: a test run in the background inherits SIGINT
@@ -525,6 +591,19 @@ class TestInterrupts(unittest.TestCase):
         self.assertEqual(self.halted, [130])
         self.assertIn("warning: stopped at once;", text)
 
+    def test_a_stop_whose_output_is_gone_still_stops(self) -> None:
+        # Regression: under `2>&1 | tee log`, whose tee the Ctrl-C ends too,
+        # the notices it could not print stayed buffered, to fail again when
+        # the stream closed, as at exit.
+        with gone() as stream:
+            interrupts = self.make(stream)
+            with interrupts.paying():
+                interrupts.handle(signal.SIGINT, None)
+                self.now += 2
+                interrupts.handle(signal.SIGINT, None)
+        self.assertTrue(interrupts.event.is_set())
+        self.assertEqual(self.halted, [130])
+
     def test_a_line_that_cannot_be_written_never_keeps_a_stop_from_stopping(
         self,
     ) -> None:
@@ -618,6 +697,42 @@ class SignalsMidRun(TaggedModel):
         return super().generate(request)
 
 
+class TeeEnds(TaggedModel):
+    """Sends SIGINT while shop/cli.py's call is on the wire, as a Ctrl-C to
+    `devdocs generate 2>&1 | tee log` does, and ends tee, the reader of the
+    `tee` pipe, as that Ctrl-C does: at once, or once tee has the stop's
+    notice. Answers once the run's stop is set, as a reply after the signal."""
+
+    def __init__(self, tee: int, *, after_notice: bool) -> None:
+        super().__init__()
+        self.tee = tee
+        self.after_notice = after_notice
+        self.stop = threading.Event()   # the run's, once the CLI made it
+
+    def end_tee(self) -> None:
+        if self.tee >= 0:
+            os.close(self.tee)
+            self.tee = -1
+
+    def generate(self, request: Request) -> Completion:
+        if request.tag == "shop/cli.py":
+            if not self.after_notice:
+                self.end_tee()
+            os.kill(os.getpid(), signal.SIGINT)
+            self.stop.wait(10)
+            if self.after_notice:
+                self.read_until(b"stopping:")
+                self.end_tee()
+        return super().generate(request)
+
+    def read_until(self, text: bytes) -> None:
+        seen = b""
+        while text not in seen:
+            if not select.select([self.tee], [], [], 10)[0]:
+                raise AssertionError(f"{text!r} never came")
+            seen += os.read(self.tee, 4096)
+
+
 @unittest.skipIf(sys.platform == "win32", "sends POSIX signals")
 class TestStopSignals(CliCase):
     """Real signals, end to end."""
@@ -679,6 +794,51 @@ class TestStopSignals(CliCase):
         code, summary, err = self.stopped_by(signal.SIGTERM)
         self.assertEqual(code, 143)
         self.check_written_and_recorded(summary, err)
+
+    def stopped_as_tee_ends(self, *, after_notice: bool) -> None:
+        """Stop a run whose output, stdout and stderr, goes through a tee the
+        Ctrl-C ends; check that it stops as it does with a reader."""
+        read, write = os.pipe()
+        model = TeeEnds(read, after_notice=after_notice)
+        self.addCleanup(model.end_tee)
+        stdout = self.enterContext(open(os.dup(write), "w", encoding="utf-8"))
+        stderr = self.enterContext(   # line-buffered, as sys.stderr is
+            open(write, "w", buffering=1, encoding="utf-8"))
+        real = cli._client
+
+        def client(*args: Any, **kwargs: Any) -> LLMClient:
+            made = real(*args, **kwargs)
+            model.stop = made.stop
+            return made
+
+        with clean_env(), mock.patch.object(cli, "make_provider", return_value=model), \
+                mock.patch.object(cli, "_client", client), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["generate", str(self.root), "--api-key", "k",
+                             "--concurrency", "1", "--json"])
+        for stream in (stdout, stderr):
+            stream.flush()   # as Python does at exit
+        self.assertEqual(code, 130)
+        docs = self.root / "docs"
+        self.assertIn(PROSE, (docs / "shop" / "cli.py.md").read_text("utf-8"))
+        with Database(self.root / ".devdocs" / "devdocs.db") as db:
+            (run,) = db.query("SELECT status FROM run")
+        self.assertEqual(run["status"], "interrupted")
+
+        # cli.py's answer, which came after the Ctrl-C, was cached.
+        self.assertEqual(self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      "--quiet")[0], 0)
+        self.assertEqual(sorted(r.tag for r in self.model.calls),
+                         ["shop", "shop/__init__.py", "shop/money.py"])
+
+    def test_a_stop_outlives_its_output(self) -> None:
+        # Regression: with stderr gone, a progress line raised into the run,
+        # which wrote no page, lost the answer on the wire and stayed "running".
+        self.stopped_as_tee_ends(after_notice=False)
+
+    def test_an_answer_that_comes_after_the_output_went_is_kept(self) -> None:
+        # Regression: its progress line raised before it was cached.
+        self.stopped_as_tee_ends(after_notice=True)
 
     def test_a_signal_while_the_pages_are_written_lets_them_be(self) -> None:
         # Regression: the write was abandoned, every page with it.

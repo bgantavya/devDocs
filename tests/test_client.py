@@ -285,6 +285,21 @@ class TestFailures(ClientCase):
         self.assertEqual(client.discover(), set(ALL_GEMINI))
         self.assertEqual(client.router.available, set(ALL_GEMINI))
 
+    def test_an_observer_that_fails_never_costs_the_answer(self) -> None:
+        # Regression: the call was reported before its answer was cached, so
+        # a progress line to a closed pipe threw a paid answer away.
+        client, model = self.make({LITE: ok(LITE)})
+
+        def gone(event: CallEvent) -> None:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        client.on_event = gone
+        with self.assertRaises(BrokenPipeError):
+            client.complete(Tier.FILE, "SYS", "a")
+        client.on_event = None
+        self.assertTrue(client.complete(Tier.FILE, "SYS", "a").cached)
+        self.assertEqual(model.calls, [LITE])
+
 
 class TestStop(ClientCase):
     """A stop request: nothing more is sent, retried or escalated, and the
