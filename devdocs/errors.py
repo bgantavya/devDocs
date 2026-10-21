@@ -186,7 +186,8 @@ class StorageError(DevDocsError):
 class Interrupted(DevDocsError):
     """Work a stop request refused to start; see `devdocs.llm.stop`.
 
-    Exits 130, as Ctrl-C does.
+    Exits 130, as Ctrl-C does. The CLI, which knows the signal, reports 143
+    when SIGTERM asked for the stop.
     """
 
     exit_code = 130
