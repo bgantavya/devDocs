@@ -1,7 +1,7 @@
 """Stopping a run on request, in every thread it started.
 
 A run has one stop signal, a `threading.Event` that `LLMClient.stop` holds
-and any thread may set, to request a stop. Whatever would start paid work, or
+and the CLI sets on Ctrl-C or SIGTERM. Whatever would start paid work, or
 wait before it, consults the signal first: the pipeline's scheduling,
 `RetryPolicy`, the client's escalation, `RateLimiter` and the embedding loop.
 Their sleeps are waits on it, so a stop ends them at once.

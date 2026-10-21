@@ -13,18 +13,28 @@ a bad key (3) from a budget stop (7) from a spent daily quota (10). Progress
 goes to stderr and results to stdout; `--json` makes stdout machine-readable.
 A v3-style invocation is translated by `devdocs.legacy`, with one notice; a
 command line that starts with a v4 command never is.
+
+Ctrl-C and SIGTERM stop a paid run gracefully, and a second one at once; see
+`_Interrupts`. Anything else they end at once, saying what that leaves behind.
+Either way the exit status is 130 for SIGINT, 143 for SIGTERM.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import queue
+import signal
 import sys
-from collections.abc import Sequence
+import threading
+import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
+from types import FrameType
 from typing import Any, TextIO
 
 from devdocs import __version__
@@ -37,6 +47,7 @@ from devdocs.llm.budget import Budget, Router
 from devdocs.llm.catalog import CATALOG, PRICES_CHECKED, Tier, catalogued
 from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.factory import PROVIDERS, OfflineModel, make_provider
+from devdocs.llm.stop import Interrupted, leave_signals
 from devdocs.render import PDF_ENGINES
 
 __all__ = ["build_parser", "main"]
@@ -44,6 +55,9 @@ __all__ = ["build_parser", "main"]
 COMMANDS = ("generate", "estimate", "export", "doctor", "init", "models", "cache")
 STATE_DIR = ".devdocs"
 _LISTED = 10             # written files an export names; --json lists them all
+# Deliveries of a stop signal this close together are one request: one sent to
+# the process group reaches devdocs and npm/bin/devdocs.js, which may pass it on.
+_SAME_REQUEST = 1.0
 
 
 class _Output:
@@ -75,6 +89,140 @@ class _Output:
         cost = f"  ${event.cost:.5f}" if event.cost else ""
         detail = f"  ({event.detail})" if event.detail and event.kind != "call" else ""
         self.info(f"  {event.kind:<9} {event.model:<24} {event.tag}{cost}{detail}")
+
+
+def _exit_now(code: int) -> None:
+    """End the process at once. Returning would not: Python joins the run's
+    worker threads before it exits, and those may be waiting on the wire."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(code)
+
+
+class _Interrupts:
+    """What SIGINT and SIGTERM do to a command, once `handling` installs this.
+
+    Outside `paying`, the first one stops the command at once, as Ctrl-C
+    always has: nothing bought is in flight. Inside, it sets `event`, the
+    run's stop signal: nothing more is sent, calls on the wire finish and
+    are kept, and the pages are written. A second delivery within
+    `_SAME_REQUEST` seconds of the first is the same request. A later one
+    ends the process at once, leaving the calls on the wire behind; the
+    answers received are cached, so the next run writes their pages free.
+
+    A stop exits with 128 plus the signal's number: 130 for SIGINT, 143 for
+    SIGTERM. 143 is what a shell, the npm wrapper, Docker and Kubernetes
+    report for a process SIGTERM ended, as it ended devdocs before this
+    handler; it stays, and tells a run its environment cancelled (`kill`,
+    timeout(1), a service manager's stop) from one stopped at the keyboard.
+    Stopping devdocs' own container gives 130: the image's STOPSIGNAL and
+    compose.yaml's stop_signal are SIGINT, which `docker stop`, compose and
+    the runtimes that honour STOPSIGNAL send.
+    """
+
+    def __init__(
+        self,
+        out: _Output,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        halt: Callable[[int], object] = _exit_now,
+    ) -> None:
+        self.event = threading.Event()
+        self.signum = 0          # the signal that asked to stop; 0 before one
+        self.paid = False        # `paying` has begun: answers may have been bought
+        self.writing = False     # `init` has begun on its files
+        self._asked = 0.0        # when, by `clock`
+        self._paying = False
+        self._requests: queue.SimpleQueue[int] = queue.SimpleQueue()  # for `_relay`
+        self._out = out
+        self._clock = clock
+        self._halt = halt
+
+    @property
+    def code(self) -> int:
+        """The exit status of a stop: 130, or 143 when SIGTERM asked for it."""
+        return 128 + (self.signum or signal.SIGINT)
+
+    @contextlib.contextmanager
+    def paying(self) -> Iterator[None]:
+        """While this lasts, a stop request lets the run end gracefully."""
+        relay = threading.Thread(target=self._relay, name="devdocs-stop", daemon=True)
+        relay.start()
+        try:
+            self.paid = self._paying = True
+            yield
+        finally:
+            self._paying = False
+            self._requests.put(0)
+            relay.join()
+
+    def _relay(self) -> None:
+        """Set `event` for each stop request `handle` queues, until a 0.
+        `handle` cannot: it may interrupt a wait on `event`, such as the
+        embedding limiter's on the main thread, where the wait holds the lock
+        `Event.set` takes. `SimpleQueue.put` is safe there."""
+        leave_signals()
+        while self._requests.get():
+            self.event.set()
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
+        """The handler of SIGINT and SIGTERM. It runs on the main thread
+        between two bytecodes, so it takes no lock that thread may hold, and
+        a line it cannot print never keeps it from acting."""
+        now = self._clock()
+        if self.signum:
+            if now - self._asked < _SAME_REQUEST:
+                return
+            try:
+                self._say("stopped at once; the answers received are cached, so "
+                          "the next run writes their pages for free"
+                          if self.paid else "stopped at once", warn=True)
+            finally:
+                self._halt(128 + signum)
+            return
+        self.signum, self._asked = signum, now
+        if not self._paying:
+            raise KeyboardInterrupt
+        self._requests.put(signum)
+        self._say("stopping: requests already sent finish and are kept, then the "
+                  "pages are written; interrupt again to stop at once")
+
+    def _say(self, message: str, *, warn: bool = False) -> None:
+        """Print from the handler, at best. If the main thread was itself
+        printing to stderr, the stream refuses a second writer: write to its
+        fd instead."""
+        try:
+            (self._out.warn if warn else self._out.info)(message)
+        except Exception:
+            line = f"{'warning: ' if warn else ''}{message}\n"
+            with contextlib.suppress(Exception):
+                os.write(self._out.stderr.fileno(), line.encode(errors="replace"))
+
+    @contextlib.contextmanager
+    def handling(self) -> Iterator[None]:
+        """Install `handle` for SIGINT and SIGTERM while the command runs,
+        then restore the handlers found. A signal the platform lacks, one
+        ignored when devdocs started (as for a background job), or one
+        handled outside Python is left alone."""
+        found: list[tuple[int, Any]] = []
+        for name in ("SIGINT", "SIGTERM"):
+            signum: int | None = getattr(signal, name, None)
+            if signum is None:
+                continue
+            previous = signal.getsignal(signum)
+            if previous is None or previous == signal.SIG_IGN:
+                continue
+            try:
+                signal.signal(signum, self.handle)
+            except ValueError:   # not the main thread: none can be installed
+                break
+            found.append((signum, previous))
+        try:
+            yield
+        finally:
+            for signum, previous in found:
+                signal.signal(signum, previous)
 
 
 # -- arguments -------------------------------------------------------------------
@@ -256,10 +404,16 @@ def _key(config: Config, explicit: str, out: _Output) -> str:
 
 
 def _client(
-    config: Config, db: Database, out: _Output, *, key: str | None
+    config: Config,
+    db: Database,
+    out: _Output,
+    *,
+    key: str | None,
+    stop: threading.Event | None = None,
 ) -> LLMClient:
     """The model client. With `key=None` it is offline: it can quote prices
-    and read the cache, and refuses to send anything."""
+    and read the cache, and refuses to send anything. `stop` is the run's
+    stop signal."""
     model = make_provider(config.provider, key) if key is not None else OfflineModel(
         "anthropic" if config.provider.startswith("anthropic") else config.provider
     )
@@ -272,25 +426,30 @@ def _client(
         usage=DailyUsage(db),
         free_tier=config.free_tier,
         on_event=out.event,
+        stop=stop,
     )
 
 
 # -- commands --------------------------------------------------------------------
 
 
-def _generate(args: argparse.Namespace, out: _Output) -> int:
+def _generate(
+    args: argparse.Namespace, out: _Output, interrupts: _Interrupts
+) -> int:
     from devdocs.generate import Pipeline
 
     config = _config(args)
     key = _key(config, args.api_key, out)
     with _state(config) as db:
-        client = _client(config, db, out, key=key)
+        client = _client(config, db, out, key=key, stop=interrupts.event)
         pipeline = Pipeline(config, client=client, db=db, log=out.info,
                             project=config.name, description=config.description)
         available = client.discover()
         out.info(f"{config.provider}: {len(available)} models available to this key")
         prepared = pipeline.prepare()
-        summary = pipeline.run(prepared, resume=not args.no_resume, force=args.force)
+        with interrupts.paying():
+            summary = pipeline.run(prepared, resume=not args.no_resume,
+                                   force=args.force)
 
     lines = [
         f"{summary.documents} documents ({summary.prose} with prose, "
@@ -311,6 +470,8 @@ def _generate(args: argparse.Namespace, out: _Output) -> int:
     data = asdict(summary)
     out.result("\n".join(lines), data)
 
+    if interrupts.signum or summary.stopped == "interrupted":
+        return interrupts.code   # asked to stop, even with nothing left to cut
     if summary.stopped == "budget":
         return 7
     if summary.stopped == "quota":
@@ -492,11 +653,12 @@ out = "docs"
 """
 
 
-def _init(args: argparse.Namespace, out: _Output) -> int:
+def _init(args: argparse.Namespace, out: _Output, interrupts: _Interrupts) -> int:
     root = Path(args.path).resolve()
     target = root / CONFIG_FILENAME
     if target.exists() and not args.force:
         raise ConfigError(f"{target} already exists", hint="pass --force to replace it")
+    interrupts.writing = True
     target.write_text(_TEMPLATE.format(provider=args.provider), "utf-8")
     out.info(f"wrote {target}")
 
@@ -556,15 +718,39 @@ def _cache(args: argparse.Namespace, out: _Output) -> int:
     return 0
 
 
-_HANDLERS = {
-    "generate": _generate,
+_HANDLERS = {   # and generate and init, which also take the interrupts
     "estimate": _estimate,
     "export": _export,
     "doctor": _doctor,
-    "init": _init,
     "models": _models,
     "cache": _cache,
 }
+
+_LEFT_BY_A_STOP = {   # and generate, init and cache; see `_left_by_a_stop`
+    "estimate": "nothing was sent, so nothing was spent",
+    "export": "each file written so far is whole; export again for the rest, for free",
+    "doctor": "the checks did not finish; nothing was changed",
+    "models": "nothing was changed",
+}
+
+
+def _left_by_a_stop(args: argparse.Namespace, interrupts: _Interrupts) -> str:
+    """What a stop that ended the command left behind, true wherever in the
+    command it came. For generate that turns on whether its paid part began.
+    For init, on whether it began on its files: only then may --force be
+    advised, which before that would replace a config it never touched. For
+    cache, on the action: a clear is one transaction, and stats only reads."""
+    if args.command == "generate":
+        if interrupts.paid:
+            return "documents written so far are kept, run again to resume"
+        return "nothing was bought and no documents were written"
+    if args.command == "init":
+        return ("its files may be unfinished; run it again with --force to finish "
+                "them" if interrupts.writing else "nothing was written")
+    if args.command == "cache":
+        return ("the cache is empty or as it was; `devdocs cache stats` tells which"
+                if args.action == "clear" else "the cache is as it was")
+    return _LEFT_BY_A_STOP[args.command]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -584,19 +770,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     out = _Output(as_json=getattr(args, "json", False),
                   quiet=getattr(args, "quiet", False))
-    try:
-        return _HANDLERS[args.command](args, out)
-    except KeyboardInterrupt:
-        out.warn("interrupted; documents written so far are kept, run again to resume")
-        return 130
-    except AuthError as err:
-        out.warn(str(err))
-        return err.exit_code
-    except DevDocsError as err:
-        print(f"devdocs: {err}", file=sys.stderr)
-        return err.exit_code
-    except Exception as err:   # a bug: say so plainly, never as a clean stop
-        print(f"devdocs: internal error: {type(err).__name__}: {err}", file=sys.stderr)
-        if os.environ.get("DEVDOCS_DEBUG"):
-            raise
-        return exit_code_for(err)
+    interrupts = _Interrupts(out)
+    with interrupts.handling():
+        try:
+            if args.command == "generate":
+                return _generate(args, out, interrupts)
+            if args.command == "init":
+                return _init(args, out, interrupts)
+            return _HANDLERS[args.command](args, out)
+        except (KeyboardInterrupt, Interrupted):
+            out.warn(f"interrupted; {_left_by_a_stop(args, interrupts)}")
+            return interrupts.code
+        except AuthError as err:
+            out.warn(str(err))
+            return err.exit_code
+        except DevDocsError as err:
+            print(f"devdocs: {err}", file=sys.stderr)
+            return err.exit_code
+        except Exception as err:   # a bug: say so plainly, never as a clean stop
+            print(f"devdocs: internal error: {type(err).__name__}: {err}",
+                  file=sys.stderr)
+            if os.environ.get("DEVDOCS_DEBUG"):
+                raise
+            return exit_code_for(err)
