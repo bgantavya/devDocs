@@ -32,8 +32,9 @@ function hasControllingTerminal() {
 
 /**
  * Whether to pass a SIGINT on: never on Windows, where kill() ends the child outright, nor under
- * a controlling terminal, whose Ctrl+C already reached the child and would be doubled, cutting
- * devdocs' graceful stop short. A SIGINT sent to this process alone then stays here.
+ * a controlling terminal, whose Ctrl+C already reached the child. A copy sent within 1 s would be
+ * harmless, one request to devdocs, but a stalled wrapper's later copy would read as a second
+ * request and stop it at once. A SIGINT sent to this process alone then stays here.
  */
 function forwardsSigint(platform = process.platform, terminal = hasControllingTerminal) {
   return platform !== 'win32' && !terminal();

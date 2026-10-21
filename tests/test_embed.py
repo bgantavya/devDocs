@@ -39,7 +39,7 @@ class Counting:
 
 
 class StopsMidBatch(Counting):
-    """Sets `stop` while its first batch is out."""
+    """Sets `stop` while its first batch is out, as a Ctrl-C would."""
 
     def __init__(self, stop: threading.Event) -> None:
         super().__init__()

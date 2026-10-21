@@ -39,7 +39,8 @@ LABEL org.opencontainers.image.title="devdocs" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}"
 
-# As PID 1, Python ignores SIGTERM; SIGINT reaches devdocs' Ctrl-C handler.
+# devdocs stops alike on SIGTERM (exit 143), but the kernel drops one sent to
+# PID 1 before its handler is set; Python handles SIGINT from startup.
 STOPSIGNAL SIGINT
 ENTRYPOINT ["devdocs"]
 CMD ["--help"]

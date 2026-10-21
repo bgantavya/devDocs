@@ -15,11 +15,11 @@ useful work. Every paid answer is cached the moment it lands and every item
 is recorded in the run ledger, so an interrupted run writes what it has,
 stubs the rest, and resumes next time without paying twice.
 
-A stop request (the client's `stop` set, from any thread) sends nothing more,
-but the waves still run through: calls already sent finish and are kept, and
-every other prompt gets the answer an earlier run paid for, from the cache, or
-a stub. So a stop never costs a page that was already bought, and the run is
-recorded as interrupted, to resume.
+A stop request (the client's `stop` set, as the CLI does on Ctrl-C or
+SIGTERM) sends nothing more, but the waves still run through: calls already
+sent finish and are kept, and every other prompt gets the answer an earlier
+run paid for, from the cache, or a stub. So a stop never costs a page that
+was already bought, and the run is recorded as interrupted, to resume.
 
 Rendering comes last and costs nothing: one renderer per configured format
 turns the composed documents into files. A format whose renderer fails, such

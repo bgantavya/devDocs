@@ -215,7 +215,7 @@ class TestRun(PipelineCase):
 
 class OnTheWire(TaggedModel):
     """Answers `tags` only once all are out at once; the first sets `stop`,
-    and the others answer after it."""
+    as a Ctrl-C would, and the others answer after it."""
 
     def __init__(self, *tags: str) -> None:
         super().__init__()
@@ -267,7 +267,7 @@ class Limited(TaggedModel):
 
 
 class TestStop(PipelineCase):
-    """A stop request, set here while a call is out."""
+    """A stop request, set here as the CLI's signal handler sets it."""
 
     def test_calls_on_the_wire_finish_and_are_kept(self) -> None:
         model = OnTheWire("shop/cart.py", "shop/cli.py")
