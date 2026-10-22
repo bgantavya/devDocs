@@ -326,6 +326,30 @@ class TestInitAndCache(CliCase):
         self.assertEqual(code, 2)
         self.assertIn("already exists", err)
 
+    def test_a_bad_path_is_refused_before_anything_is_written(self) -> None:
+        # Regression: an internal error, or the current directory for an empty path.
+        file = self.root / "pyproject.toml"
+        for path, said in ((str(self.root / "no" / "such"), "does not exist"),
+                           (str(file), "is not a directory"),
+                           ("", "path is empty"),
+                           ("a\0b", "path contains a NUL")):
+            with self.subTest(path=path), contextlib.chdir(self.root):
+                before = sorted(p.name for p in self.root.iterdir())
+                code, _, err = self.run_cli("init", path)
+                self.assertEqual(code, 2)
+                self.assertIn(said, err)
+                self.assertNotIn("internal error", err)
+                self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
+        self.assertFalse((self.root / "no").exists())
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_directory_it_cannot_open_is_refused(self) -> None:
+        self.root.chmod(0o000)
+        self.addCleanup(self.root.chmod, 0o755)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot open project root", err)
+
     def test_every_option_the_template_mentions_is_valid(self) -> None:
         self.run_cli("init", str(self.root))
         text = (self.root / "devdocs.toml").read_text("utf-8")
