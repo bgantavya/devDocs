@@ -375,6 +375,9 @@ class TestOutputDirectory(unittest.TestCase):
     def setUp(self) -> None:
         self.root = project("shop/cart.py")
 
+    def out_refused(self, out: str) -> ConfigError:
+        return refused(self, {"path": str(self.root), "out": out})
+
     def test_an_empty_out_is_refused(self) -> None:
         # Regression: read as ".", the project root; see below.
         cases = {
@@ -396,6 +399,62 @@ class TestOutputDirectory(unittest.TestCase):
                              env={"DEVDOCS_OUT": ""})
         self.assertEqual((config.out, config.origin_of("out")),
                          (Path("manual"), "file"))
+
+    def test_out_cannot_be_the_root(self) -> None:
+        # Regression: README.md, architecture.md, index.json and a page per
+        # module were written among the sources, after the calls were paid.
+        for out in (".", "./", "shop/..", str(self.root)):
+            with self.subTest(out=out):
+                error = self.out_refused(out)
+                self.assertEqual(error.message, f"out is the project root, {self.root}")
+                self.assertIn("docs", error.hint or "")
+
+    def test_out_cannot_be_above_the_root(self) -> None:
+        # Regression: the same pages went into the directory holding the project.
+        parents = self.root.parents
+        for out, above in (("..", parents[0]), ("../..", parents[1]),
+                           (self.root.anchor, parents[-1])):
+            with self.subTest(out=out):
+                self.assertEqual(self.out_refused(out).message,
+                                 f"out {above} contains the project root, {self.root}")
+
+    def test_out_through_a_directory_not_made_yet(self) -> None:
+        # Regression: new/.. could not be looked at, so it passed; making new
+        # then put every page in the root, over its README.md without --force.
+        root, parent = self.root, self.root.parent
+        cases = {
+            "new/..": f"out is the project root, {root}",
+            "new/deeper/../..": f"out is the project root, {root}",
+            "new/../..": f"out {parent} contains the project root, {root}",
+        }
+        for out, message in cases.items():
+            with self.subTest(out=out):
+                self.assertEqual(self.out_refused(out).message, message)
+        self.assertFalse((root / "new").exists())
+
+    def test_another_name_for_the_root_is_the_root(self) -> None:
+        names: dict[str, str] = {}
+        with contextlib.suppress(OSError):   # no symlinks without the privilege
+            (self.root / "site").symlink_to(self.root, target_is_directory=True)
+            names["a symlink"] = "site"
+        if Path(str(self.root).swapcase()).exists():   # a case-insensitive disk
+            names["another case"] = str(self.root).swapcase()
+        if not names:
+            self.skipTest("no other name for a directory here")
+        for name, out in names.items():
+            with self.subTest(name):
+                self.assertEqual(self.out_refused(out).message,
+                                 f"out is the project root, {self.root}")
+
+    def test_out_may_be_anywhere_else(self) -> None:
+        # A source directory too: telling it from a docs/ of hand-written
+        # pages takes a scan, and the writer replaces no file it did not write.
+        elsewhere = project()
+        for out in ("docs", "shop", "../site", str(elsewhere)):
+            with self.subTest(out=out):
+                config = load_config({"path": str(self.root), "out": out},
+                                     config_file=None, env={})
+                self.assertEqual(config.out, Path(out))
 
     def test_paths_are_strings_without_nul(self) -> None:
         # Regression: `out = false` wrote to a directory named False, and a
