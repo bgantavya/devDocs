@@ -5,8 +5,9 @@
 #   export DEVDOCS_UID=$(id -u) DEVDOCS_GID=$(id -g)
 #   docker compose -f path/to/devDocs/compose.yaml run --rm devdocs estimate
 # The image is pulled from ghcr.io, or built from this checkout if that fails.
-# Stopping sends SIGINT and allows 150 s before SIGKILL: in-flight calls (120 s
-# HTTP timeout) finish and are cached, then the pages are written.
+# Stopping sends SIGINT and allows 150 s before SIGKILL: nothing new is sent,
+# in-flight calls (120 s HTTP timeout) finish and are cached, the pages are
+# written, and devdocs exits 130.
 services:
   devdocs:
     image: ghcr.io/bgantavya/devdocs:latest
