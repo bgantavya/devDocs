@@ -5,9 +5,11 @@
 # Run it as yourself so docs/ and .devdocs/ belong to you:
 #   docker run --rm -it -u "$(id -u):$(id -g)" -v "$PWD:/work" \
 #     -e GEMINI_API_KEY ghcr.io/bgantavya/devdocs estimate
-# `docker stop` sends SIGINT, devdocs' Ctrl-C: in-flight calls finish and are
-# cached, then pages are written. Allow 150 s for that (`docker stop -t 150`,
-# `docker run --stop-timeout 150`); by default SIGKILL follows after 10 s.
+# `docker stop` sends SIGINT, devdocs' Ctrl-C: nothing new is sent, in-flight
+# calls finish and are cached, the pages are written, and it exits 130. Allow
+# 150 s for that (`docker stop -t 150`, `docker run --stop-timeout 150`); by
+# default SIGKILL follows after 10 s. A second signal a second or more later
+# (`docker kill -s INT`) stops at once; the answers received stay cached.
 
 FROM --platform=$BUILDPLATFORM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb AS build
 WORKDIR /src
