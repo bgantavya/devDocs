@@ -1,17 +1,37 @@
 """Config precedence, validation, and key resolution.
 
 No network and no os.environ mutation: `load_config` and `resolve_api_key` both
-take an `env` mapping so these run in any order and in parallel.
+take an `env` mapping so these run in any order and in parallel. The commands
+that take a project path run too, reading no DEVDOCS_* variable of the shell's
+and with making a model patched to fail, to show that a refused path stops
+each before it creates or buys anything.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import functools
+import io
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
-from devdocs.config import Config, load_config, resolve_api_key
+from devdocs import cli
+from devdocs.config import (
+    Config,
+    load_config,
+    project_root,
+    resolve_api_key,
+)
 from devdocs.errors import ConfigError
+
+REPO = Path(__file__).resolve().parent.parent
 
 
 def write_config(body: str) -> Path:
@@ -19,6 +39,24 @@ def write_config(body: str) -> Path:
     path = directory / "devdocs.toml"
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def refused(test: unittest.TestCase, overrides: dict[str, Any] | None = None, *,
+            config_file: Path | None = None,
+            env: dict[str, str] | None = None) -> ConfigError:
+    """The ConfigError `load_config` raises; a failure of `test` without one."""
+    with test.assertRaises(ConfigError) as caught:
+        load_config(overrides, config_file=config_file, env=env or {})
+    return caught.exception
+
+
+def project(*names: str) -> Path:
+    """A new directory, resolved, holding an empty file at each of `names`."""
+    root = Path(tempfile.mkdtemp()).resolve()
+    for name in names:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).touch()
+    return root
 
 
 class TestPrecedence(unittest.TestCase):
@@ -227,6 +265,194 @@ class TestValidation(unittest.TestCase):
         path = write_config('[devdocs]\nconcurrency = "four"\n')
         with self.assertRaises(ConfigError):
             load_config(config_file=path, env={})
+
+
+class TestProjectRoot(unittest.TestCase):
+    def test_a_missing_root_is_refused_from_every_layer(self) -> None:
+        # Regression: estimate and generate made it, with .devdocs/devdocs.db
+        # in it, scanned nothing and exited 0.
+        missing = project() / "no" / "such"
+        cases = {
+            "flag": ({"path": str(missing)}, None, {}),
+            "environment": ({}, None, {"DEVDOCS_PATH": str(missing)}),
+            "file": ({}, write_config(f"path = '{missing}'\n"), {}),
+        }
+        for name, (overrides, path, env) in cases.items():
+            with self.subTest(name):
+                error = refused(self, overrides, config_file=path, env=env)
+                self.assertEqual(error.message,
+                                 f"project root {missing} does not exist")
+        self.assertFalse(missing.parent.exists())
+
+    def test_the_flags_root_is_checked_before_a_config_file_above_it(self) -> None:
+        # So a broken devdocs.toml found above a typo cannot hide the typo.
+        parent = project()
+        (parent / "devdocs.toml").write_text("out = 5\n", encoding="utf-8")
+        typo = parent / "typo"
+        error = refused(self, {"path": str(typo)})
+        self.assertEqual(error.message, f"project root {typo} does not exist")
+
+    def test_a_file_is_not_a_root(self) -> None:
+        # Regression: a storage error, from making .devdocs inside the file.
+        root = project("setup.py")
+        error = refused(self, {"path": str(root / "setup.py")})
+        self.assertEqual(error.message,
+                         f"project root {root / 'setup.py'} is not a directory")
+        self.assertEqual(error.hint, f"pass the directory that holds it, {root}")
+
+    def test_an_empty_path_is_not_the_current_directory(self) -> None:
+        # Regression: read as ".", so `devdocs generate "$UNSET"` documented,
+        # and paid for, whatever directory it ran in.
+        cases = {
+            "flag": ({"path": ""}, None),
+            "blank flag": ({"path": "  "}, None),
+            "file": ({}, write_config('path = ""\n')),
+        }
+        for name, (overrides, path) in cases.items():
+            with self.subTest(name):
+                error = refused(self, overrides, config_file=path)
+                self.assertEqual(error.message, "path is empty")
+                self.assertIn('"."', error.hint or "")
+
+    def test_a_root_that_cannot_be_opened_is_a_config_error(self) -> None:
+        # Regression: a symlink loop was an internal error on 3.11 and a
+        # storage error on 3.13.
+        loop = project() / "loop"
+        try:
+            loop.symlink_to(loop)
+        except OSError:
+            self.skipTest("this system cannot make symlinks")
+        error = refused(self, {"path": str(loop)})
+        self.assertIn(f"project root {loop}", error.message)
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "needs POSIX permissions, not root")
+    def test_a_root_it_cannot_list_or_search_is_refused(self) -> None:
+        # Regression: one it could search but not list was scanned as empty,
+        # with .devdocs made in it, and exit 0; one it could not search was
+        # an internal error on 3.11 and 3.13.
+        root = project("app.py")
+        self.addCleanup(root.chmod, 0o700)
+        denied = os.strerror(errno.EACCES)
+        for mode in (0o000, 0o300, 0o400):   # neither, search and write, list only
+            with self.subTest(mode=oct(mode)):
+                root.chmod(mode)
+                error = refused(self, {"path": str(root)})
+                self.assertEqual(error.message,
+                                 f"cannot open project root {root}: {denied}")
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot remove the current directory")
+    def test_a_removed_current_directory_is_a_config_error(self) -> None:
+        # Regression: resolving "." raised FileNotFoundError, an internal error.
+        script = (
+            "import os, sys, tempfile\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from devdocs.config import load_config\n"
+            "from devdocs.errors import ConfigError\n"
+            "gone = tempfile.mkdtemp()\n"
+            "os.chdir(gone)\n"
+            "os.rmdir(gone)\n"
+            "try:\n"
+            "    load_config(config_file=None, env={})\n"
+            "except ConfigError as err:\n"
+            "    print(err.message)\n"
+        )
+        run = subprocess.run([sys.executable, "-c", script, str(REPO)],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(run.stdout.strip(), "project root . does not exist",
+                         run.stderr)
+
+    def test_project_root_resolves_and_refuses_as_load_config_does(self) -> None:
+        root = project("setup.py")
+        self.assertEqual(project_root(str(root)), root)
+        self.assertEqual(project_root("."), Path.cwd().resolve())
+        for bad in ("", str(root / "setup.py"), str(root / "missing")):
+            with self.subTest(bad), self.assertRaises(ConfigError):
+                project_root(bad)
+
+
+class TestOutputDirectory(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = project("shop/cart.py")
+
+    def test_an_empty_out_is_refused(self) -> None:
+        # Regression: read as ".", the project root; see below.
+        cases = {
+            "flag": ({"out": ""}, None),
+            "blank flag": ({"out": " "}, None),
+            "file": ({}, write_config('out = ""\n')),
+        }
+        for name, (overrides, path) in cases.items():
+            with self.subTest(name):
+                error = refused(self, {"path": str(self.root), **overrides},
+                                config_file=path)
+                self.assertEqual(error.message, "out is empty")
+                self.assertIn("docs", error.hint or "")
+
+    def test_a_blank_variable_is_unset_not_empty(self) -> None:
+        # As every DEVDOCS_* variable: the next layer decides.
+        config = load_config({"path": str(self.root)},
+                             config_file=write_config('out = "manual"\n'),
+                             env={"DEVDOCS_OUT": ""})
+        self.assertEqual((config.out, config.origin_of("out")),
+                         (Path("manual"), "file"))
+
+    def test_paths_are_strings_without_nul(self) -> None:
+        # Regression: `out = false` wrote to a directory named False, and a
+        # NUL in a path was an internal error.
+        for body, message in (("out = false", "out must be a string"),
+                              ("out = 5", "out must be a string"),
+                              ("path = []", "path must be a string"),
+                              ('out = "docs\\u0000"', "out contains a NUL character")):
+            with self.subTest(body):
+                error = refused(self, {"path": str(self.root)},
+                                config_file=write_config(f"{body}\n"))
+                self.assertEqual(error.message, message)
+
+
+class CommandCase(unittest.TestCase):
+    def run_cli(self, *argv: str) -> tuple[int, str]:
+        """The exit code and all output. Making a model fails the command, and
+        no DEVDOCS_* variable set in the shell is read."""
+        printed = io.StringIO()
+        settings = functools.partial(load_config, env={})
+        with mock.patch.object(cli, "make_provider",
+                               side_effect=AssertionError("a model was made")), \
+                mock.patch.object(cli, "load_config", settings), \
+                contextlib.redirect_stdout(printed), \
+                contextlib.redirect_stderr(printed):
+            code = cli.main(list(argv))
+        return code, printed.getvalue()
+
+
+class TestCommandsRefuseFirst(CommandCase):
+    def test_a_missing_root_is_never_made(self) -> None:
+        # Regression: generate, estimate and cache made it, with
+        # .devdocs/devdocs.db inside, and exited 0; doctor passed it.
+        missing = project() / "no" / "such"
+        commands = {
+            "generate": ["generate", "--api-key", "k"],
+            "estimate": ["estimate"],
+            "export": ["export"],
+            "doctor": ["doctor", "--offline", "--api-key", "k"],
+            "cache stats": ["cache", "stats"],
+            "cache clear": ["cache", "clear"],
+        }
+        for name, command in commands.items():
+            with self.subTest(name):
+                code, printed = self.run_cli(*command, str(missing))
+                self.assertEqual(code, 2, printed)
+                self.assertIn(f"project root {missing} does not exist", printed)
+                self.assertFalse(missing.parent.exists())
+
+    def test_an_empty_out_is_refused_before_anything_is_bought(self) -> None:
+        # Regression: the calls were bought, then the pages written among the sources.
+        root = project("app.py")
+        code, printed = self.run_cli("generate", str(root), "--out", "",
+                                     "--api-key", "k")
+        self.assertEqual(code, 2, printed)
+        self.assertIn("out is empty", printed)
+        self.assertEqual([path.name for path in root.iterdir()], ["app.py"])
 
 
 class TestEnvironment(unittest.TestCase):

@@ -38,7 +38,13 @@ from types import FrameType
 from typing import Any, TextIO
 
 from devdocs import __version__
-from devdocs.config import CONFIG_FILENAME, Config, load_config, resolve_api_key
+from devdocs.config import (
+    CONFIG_FILENAME,
+    Config,
+    load_config,
+    project_root,
+    resolve_api_key,
+)
 from devdocs.errors import AuthError, ConfigError, DevDocsError, exit_code_for
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
@@ -677,7 +683,7 @@ out = "docs"
 
 
 def _init(args: argparse.Namespace, out: _Output, interrupts: _Interrupts) -> int:
-    root = Path(args.path).resolve()
+    root = project_root(args.path)   # before anything is written
     target = root / CONFIG_FILENAME
     if target.exists() and not args.force:
         raise ConfigError(f"{target} already exists", hint="pass --force to replace it")

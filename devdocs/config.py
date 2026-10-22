@@ -4,6 +4,9 @@ Precedence is fixed and total: an explicit flag beats the environment, which
 beats the config file, which beats the built-in defaults. Nothing merges
 silently, so `devdocs doctor` can always name where a value came from.
 
+Paths are checked too, early enough for a command to refuse them before it
+creates anything: the project root must be an existing directory.
+
 The API key is resolved separately by `resolve_api_key` because it has one
 extra step at the bottom: a bundled demo key that lets someone try the tool
 without signing up. That key's quota is shared by every user of it, so it warns
@@ -17,13 +20,20 @@ import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PurePath
+from stat import S_ISDIR
 from typing import Any
 
 from devdocs.errors import ConfigError
 from devdocs.render import FORMATS, PAGE_SIZES, PDF_ENGINES
 
-__all__ = ["Config", "KeySource", "load_config", "resolve_api_key"]
+__all__ = [
+    "Config",
+    "KeySource",
+    "load_config",
+    "project_root",
+    "resolve_api_key",
+]
 
 CONFIG_FILENAME = "devdocs.toml"
 
@@ -88,6 +98,48 @@ _CONTEXT = {"off", "standard", "semantic"}
 _PROVIDERS = set(_ENV_KEYS)
 _FORMATS = set(FORMATS)
 _PAGE_SIZES = {size.casefold(): size for size in PAGE_SIZES}   # "letter" -> "Letter"
+_OWN_DIRECTORY = "give the docs a directory of their own, such as docs (the default)"
+_EMPTY_PATH = {
+    "path": 'use "." for the current directory',
+    "out": _OWN_DIRECTORY,
+}
+
+
+def _as_path(name: str, value: Any) -> Path:
+    """`value` as a path. Empty is refused, not read as ".": an unset
+    variable must not stand for the current directory or the root."""
+    if not isinstance(value, str | PurePath):
+        raise ConfigError(f"{name} must be a string")
+    text = str(value)
+    if not text.strip():
+        raise ConfigError(f"{name} is empty", hint=_EMPTY_PATH.get(name))
+    if "\0" in text:
+        raise ConfigError(f"{name} contains a NUL character")
+    return Path(text)
+
+
+def project_root(path: str | PurePath) -> Path:
+    """The project directory `path` names, resolved.
+
+    Raises ConfigError unless it is an existing directory devdocs can list
+    and search, so a command can refuse a typo, or a root it would scan as
+    empty, before it creates any state there.
+    """
+    root = _as_path("path", path)
+    try:
+        root = root.resolve()
+        if not S_ISDIR(root.stat().st_mode):
+            raise ConfigError(f"project root {root} is not a directory",
+                              hint=f"pass the directory that holds it, {root.parent}")
+        with os.scandir(root):   # stat passes a root it cannot list,
+            pass
+        os.stat(os.path.join(root, os.curdir))   # or search
+    except (FileNotFoundError, NotADirectoryError):   # also a removed cwd
+        raise ConfigError(f"project root {root} does not exist") from None
+    except (OSError, RuntimeError) as err:   # no access; a symlink loop
+        reason = getattr(err, "strerror", None) or err
+        raise ConfigError(f"cannot open project root {root}: {reason}") from None
+    return root
 
 
 def find_config_file(start: Path) -> Path | None:
@@ -124,7 +176,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
 def _coerce(name: str, value: Any, current: Any) -> Any:
     """Convert a TOML value to the dataclass field's type, or explain why not."""
     if isinstance(current, Path):
-        return Path(str(value))
+        return _as_path(name, value)
     if isinstance(current, tuple):
         if isinstance(value, str):
             return tuple(part.strip() for part in value.split(",") if part.strip())
@@ -239,8 +291,9 @@ def load_config(
     config = Config()
     known = {f.name for f in fields(Config)} - {"sources", "key_source"}
 
-    path_hint = Path(str((overrides or {}).get("path") or "."))
-    file_path = config_file or find_config_file(path_hint)
+    flagged = (overrides or {}).get("path")
+    start = project_root("." if flagged is None else flagged)   # before any file
+    file_path = config_file or find_config_file(start)
     if file_path is not None:
         for key, value in _read_toml(file_path).items():
             name = key.replace("-", "_")
@@ -270,6 +323,7 @@ def load_config(
 
     config.page_size = _PAGE_SIZES.get(config.page_size.casefold(), config.page_size)
     _validate(config)
+    project_root(config.path)   # the file or DEVDOCS_PATH may move the root
     return config
 
 
