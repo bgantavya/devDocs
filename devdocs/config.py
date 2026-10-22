@@ -5,7 +5,9 @@ beats the config file, which beats the built-in defaults. Nothing merges
 silently, so `devdocs doctor` can always name where a value came from.
 
 Paths are checked too, early enough for a command to refuse them before it
-creates anything: the project root must be an existing directory.
+creates anything: the project root must be an existing directory, and the
+output directory can be neither the root nor above it, where the docs would
+mix with the project's own files.
 
 The API key is resolved separately by `resolve_api_key` because it has one
 extra step at the bottom: a bundled demo key that lets someone try the tool
@@ -140,6 +142,34 @@ def project_root(path: str | PurePath) -> Path:
         reason = getattr(err, "strerror", None) or err
         raise ConfigError(f"cannot open project root {root}: {reason}") from None
     return root
+
+
+def _stat(path: Path) -> os.stat_result | None:
+    """The status of what `path` will name once its missing directories are
+    made, as `new/..` then names the one holding new; None if nothing yet."""
+    try:
+        return os.stat(os.path.realpath(path))
+    except OSError:
+        return None
+
+
+def _check_out(root: Path, out: Path) -> None:
+    """Refuse an `out` that is the project root or a directory above it,
+    where the pages, the manifest and their pruning would mix with the
+    project's own files. Compared by identity, not name, so `src/..`, a
+    symlink and another case on a case-insensitive disk are caught too;
+    and as it will be once made, so `new/..` is too."""
+    made = _stat(root / out)
+    if made is None:   # to be made, so neither the root nor above it
+        return
+    for directory in (root, *root.parents):
+        there = _stat(directory)
+        if there is None or not os.path.samestat(made, there):
+            continue
+        if directory == root:
+            raise ConfigError(f"out is the project root, {root}", hint=_OWN_DIRECTORY)
+        raise ConfigError(f"out {directory} contains the project root, {root}",
+                          hint=_OWN_DIRECTORY)
 
 
 def find_config_file(start: Path) -> Path | None:
@@ -323,7 +353,8 @@ def load_config(
 
     config.page_size = _PAGE_SIZES.get(config.page_size.casefold(), config.page_size)
     _validate(config)
-    project_root(config.path)   # the file or DEVDOCS_PATH may move the root
+    # the file or DEVDOCS_PATH may move the root
+    _check_out(project_root(config.path), config.out)
     return config
 
 

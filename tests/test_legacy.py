@@ -299,6 +299,23 @@ class TestWhereV3Wrote(CliCase):
         self.assertEqual(sorted(p.name for p in self.root.iterdir()),
                          sorted({"app", *(rel.split("/")[0] for rel in PROJECT)}))
 
+    def test_an_output_on_the_project_or_above_it_runs_nothing(self) -> None:
+        # v3 mixed its pages with the project's own files; config refuses them.
+        def tree() -> list[Path]:
+            return sorted(self.root.rglob("*"))
+
+        before = tree()
+        root, above = "out is the project root", "contains the project root"
+        for flags, says in ((["-p", "app", "--output", "."], root),
+                            (["-p", ".", "--output", "."], root),
+                            (["-p", ".", "--output", ".."], above)):
+            with self.subTest(flags=flags):
+                code, _, err = self.run_cli(*flags, "--api-key", "k")
+                self.assertEqual(code, 2)
+                self.assertIn(says, err)
+                self.assertEqual(self.model.calls, [])
+                self.assertEqual(tree(), before)
+
 
 class TestFactory(unittest.TestCase):
     def test_unknown_provider_is_a_config_error(self) -> None:

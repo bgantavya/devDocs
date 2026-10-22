@@ -25,7 +25,9 @@ the source directory being read, instead of into the output directory; v4
 writes only inside its output directory, so the flag is accepted and no
 longer applies. `--authors` and `--keywords` are accepted and ignored, having
 no v4 use. An empty `-p` or `--output`, on which v3 crashed before writing a
-page, exits 2.
+page, exits 2. So does a line whose output lands on the project root or above
+it (`-p . --output .`), where v3 mixed its pages with the project's own files:
+config refuses such an out.
 """
 
 from __future__ import annotations
