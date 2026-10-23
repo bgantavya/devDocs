@@ -28,6 +28,9 @@ no v4 use. An empty `-p` or `--output`, on which v3 crashed before writing a
 page, exits 2. So does a line whose output lands on the project root or above
 it (`-p . --output .`), where v3 mixed its pages with the project's own files:
 config refuses such an out.
+
+A `~` in `-p` or `--output` means what it means to config, where no shell
+expanded it, as none does in `--path=~/app`.
 """
 
 from __future__ import annotations
@@ -112,6 +115,7 @@ def _place(path: str) -> str:
     the current directory, else the path from there. v3 cut the current
     directory's text out of the project's own, so a path outside it keeps
     its full name: `-p /srv/app` wrote docs/srv/app."""
+    path = os.path.expanduser(path)
     # v3's getcwd() inside the project: the real path, but as typed on Windows
     inside = os.path.abspath(path) if os.name == "nt" else os.path.realpath(path)
     return inside.replace(os.getcwd(), "").lstrip("\\/").replace("\\", "/")
@@ -127,7 +131,7 @@ def translate(argv: Sequence[str]) -> list[str]:
     args, rest = _read(argv)
     out = args.output
     if args.path != ".":
-        out = str(Path.cwd() / args.output / _place(args.path))
+        out = str(Path.cwd() / os.path.expanduser(args.output) / _place(args.path))
     translated = ["generate", args.path, "--per-file", "--out", out]
     if args.include:
         translated += ["--include", args.include]

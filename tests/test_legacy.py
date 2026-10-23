@@ -100,6 +100,26 @@ class TestTranslation(InTempDir):
                 translated = translate(argv)
                 self.assertEqual(translated[translated.index("--out") + 1], str(out))
 
+    def test_a_tilde_means_what_it_means_to_config(self) -> None:
+        # Regression: no shell expands `--path=~/app`, so its --out was
+        # <cwd>/docs/~/app, and config looked for the project at ./~/app.
+        here = self.here
+        home = here / "home"
+        for argv, out in (
+            (["--path=~/app"], here / "docs" / "home" / "app"),
+            (["-p", "~/app"], here / "docs" / "home" / "app"),
+            (["--path=~"], here / "docs" / "home"),
+            (["--output=~/manual"], "~/manual"),   # config expands it
+            (["-p", "app", "--output=~/manual"], home / "manual" / "app"),
+            (["--path=~/app", "--output=~/manual"], home / "manual" / "home" / "app"),
+        ):
+            with self.subTest(argv=argv), \
+                    mock.patch.dict(os.environ, {"HOME": str(home),
+                                                 "USERPROFILE": str(home)}):
+                translated = translate(argv)
+                self.assertEqual(translated[translated.index("--out") + 1], str(out))
+        self.assertEqual(translate(["--path=~/app"])[1], "~/app")   # config expands it
+
     def test_a_v4_command_line_comes_back_as_it_is(self) -> None:
         for command in cli.COMMANDS:
             argv = [command, "app", "--format", "pdf"]
@@ -129,6 +149,12 @@ class TestNotice(InTempDir):
                     "v4 never replaces a page it has no record of writing: if "
                     f"{os.path.join(*docs.split('/'), '')} still holds v3 pages, "
                     "add --force once to take them over", legacy.notice(argv))
+
+    def test_a_tilde_is_expanded_where_it_says_the_pages_are(self) -> None:
+        with mock.patch.dict(os.environ, {"HOME": str(self.here),
+                                          "USERPROFILE": str(self.here)}):
+            self.assertIn(f"if {os.path.join('docs', 'app', '')} still holds v3",
+                          legacy.notice(["--path=~/app"]))
 
     def test_overwrite_no_longer_applies(self) -> None:
         self.assertIn("devdocs: --overwrite no longer applies; v4 never replaces",
@@ -298,6 +324,15 @@ class TestWhereV3Wrote(CliCase):
         self.assertEqual(self.model.calls, [])
         self.assertEqual(sorted(p.name for p in self.root.iterdir()),
                          sorted({"app", *(rel.split("/")[0] for rel in PROJECT)}))
+
+    def test_a_tilde_finds_the_project_and_keeps_the_pages_here(self) -> None:
+        # Regression: refused, as no project is at ./~/app; --out was docs/~/app.
+        code, _, err = self.run_cli("--path=~/app", "--api-key", "k",
+                                    env={"HOME": str(self.root),
+                                         "USERPROFILE": str(self.root)})
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.root / "docs" / "app" / "README.md").is_file())
+        self.assertFalse((self.root / "docs" / "~").exists())
 
     def test_an_output_on_the_project_or_above_it_runs_nothing(self) -> None:
         # v3 mixed its pages with the project's own files; config refuses them.
