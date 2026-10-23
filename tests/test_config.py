@@ -456,6 +456,14 @@ class TestOutputDirectory(unittest.TestCase):
                                      config_file=None, env={})
                 self.assertEqual(config.out, Path(out))
 
+    def test_a_leading_tilde_is_the_home_directory(self) -> None:
+        # Regression: it made a directory named ~ in the project, which
+        # `rm -rf ~` does not remove: it removes the home directory.
+        config = load_config({"path": str(self.root), "out": "~/devdocs-site"},
+                             config_file=None, env={})
+        self.assertEqual(config.out, Path.home() / "devdocs-site")
+        self.assertEqual(project_root("~"), Path.home().resolve())
+
     def test_paths_are_strings_without_nul(self) -> None:
         # Regression: `out = false` wrote to a directory named False, and a
         # NUL in a path was an internal error.

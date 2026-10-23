@@ -108,8 +108,8 @@ _EMPTY_PATH = {
 
 
 def _as_path(name: str, value: Any) -> Path:
-    """`value` as a path. Empty is refused, not read as ".": an unset
-    variable must not stand for the current directory or the root."""
+    """`value` as a path, `~` expanded. Empty is refused, not read as ".": an
+    unset variable must not stand for the current directory or the root."""
     if not isinstance(value, str | PurePath):
         raise ConfigError(f"{name} must be a string")
     text = str(value)
@@ -117,11 +117,11 @@ def _as_path(name: str, value: Any) -> Path:
         raise ConfigError(f"{name} is empty", hint=_EMPTY_PATH.get(name))
     if "\0" in text:
         raise ConfigError(f"{name} contains a NUL character")
-    return Path(text)
+    return Path(os.path.expanduser(text))
 
 
 def project_root(path: str | PurePath) -> Path:
-    """The project directory `path` names, resolved.
+    """The project directory `path` names, resolved and `~` expanded.
 
     Raises ConfigError unless it is an existing directory devdocs can list
     and search, so a command can refuse a typo, or a root it would scan as
