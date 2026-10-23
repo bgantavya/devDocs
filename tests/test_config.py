@@ -1,10 +1,11 @@
-"""Config precedence, validation, and key resolution.
+"""Config precedence, the search for the file, validation, and key resolution.
 
 No network and no os.environ mutation: `load_config` and `resolve_api_key` both
-take an `env` mapping so these run in any order and in parallel. The commands
-that take a project path run too, reading no DEVDOCS_* variable of the shell's
-and with making a model patched to fail, to show that a refused path stops
-each before it creates or buys anything.
+take an `env` mapping so these run in any order. The commands that take a
+project path run too, reading no DEVDOCS_* variable of the shell's and with
+making a model patched to fail, to show that a refused path stops each before
+it creates or buys anything; one has a scripted model, to show where the
+file's paths lead a paid run.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import contextlib
 import errno
 import functools
 import io
+import json
 import os
 import subprocess
 import sys
@@ -28,8 +30,11 @@ from devdocs.config import (
     load_config,
     project_root,
     resolve_api_key,
+    search_start,
 )
 from devdocs.errors import ConfigError
+from devdocs.generate import Pipeline
+from tests.test_generate import PROJECT, TaggedModel
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -57,6 +62,14 @@ def project(*names: str) -> Path:
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).touch()
     return root
+
+
+def config_in(directory: Path, body: str) -> Path:
+    """`directory`'s devdocs.toml, holding `body`; the directory made if need be."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "devdocs.toml"
+    path.write_text(body, encoding="utf-8")
+    return path
 
 
 class TestPrecedence(unittest.TestCase):
@@ -371,6 +384,195 @@ class TestProjectRoot(unittest.TestCase):
                 project_root(bad)
 
 
+class TestConfigSearch(unittest.TestCase):
+    """The file is looked for from the project path a flag or DEVDOCS_PATH gives."""
+
+    def setUp(self) -> None:
+        self.base = project()
+        for name in ("flagged", "variable", "here"):
+            config_in(self.base / name, f'name = "{name}"\n')
+        self.enterContext(contextlib.chdir(self.base / "here"))
+
+    def test_the_variable_steers_the_search(self) -> None:
+        # Regression: only the flag did. The current directory's file applied
+        # to the project the variable named, whose own file was never read.
+        config = load_config(env={"DEVDOCS_PATH": str(self.base / "variable")})
+        self.assertEqual((config.name, config.origin_of("path")), ("variable", "env"))
+        self.assertEqual(config.path, self.base / "variable")
+
+    def test_the_flag_steers_it_over_the_variable(self) -> None:
+        config = load_config({"path": str(self.base / "flagged")},
+                             env={"DEVDOCS_PATH": str(self.base / "variable")})
+        self.assertEqual((config.name, config.origin_of("path")), ("flagged", "flag"))
+        # The flag makes the variable irrelevant, even a typo in it.
+        config = load_config({"path": str(self.base / "flagged")},
+                             env={"DEVDOCS_PATH": str(self.base / "typo")})
+        self.assertEqual(config.name, "flagged")
+
+    def test_the_current_directory_when_neither_names_a_project(self) -> None:
+        for env in ({}, {"DEVDOCS_PATH": ""}, {"DEVDOCS_PATH": "  "}):
+            with self.subTest(env=env):
+                config = load_config({"path": None}, env=env)
+                self.assertEqual((config.name, config.origin_of("path")),
+                                 ("here", "default"))
+
+    def test_the_variable_is_read_as_that_layer_reads_it(self) -> None:
+        # Relative to the current directory, and stripped.
+        for value in ("../variable", " ../variable "):
+            with self.subTest(value=value):
+                config = load_config(env={"DEVDOCS_PATH": value})
+                self.assertEqual(config.name, "variable")
+                self.assertEqual(project_root(config.path), self.base / "variable")
+
+    def test_the_search_walks_up_from_the_project_the_variable_names(self) -> None:
+        nested = self.base / "variable" / "deep" / "er"
+        nested.mkdir(parents=True)
+        config = load_config(env={"DEVDOCS_PATH": str(nested)})
+        self.assertEqual((config.name, config.path), ("variable", nested))
+
+    def test_the_variables_root_is_checked_before_a_config_file_above_it(self) -> None:
+        config_in(self.base / "variable", "out = 5\n")
+        typo = self.base / "variable" / "typo"
+        error = refused(self, env={"DEVDOCS_PATH": str(typo)})
+        self.assertEqual(error.message, f"project root {typo} does not exist")
+
+    def test_a_path_in_the_file_cannot_steer_the_search_for_it(self) -> None:
+        config_in(self.base / "here", 'name = "here"\npath = "../variable"\n')
+        config = load_config(env={})
+        self.assertEqual((config.name, config.origin_of("path")), ("here", "file"))
+        self.assertEqual(project_root(config.path), self.base / "variable")
+
+    def test_the_search_starts_where_the_flag_or_variable_says(self) -> None:
+        variable = {"DEVDOCS_PATH": str(self.base / "variable")}
+        self.assertEqual(search_start(str(self.base / "flagged"), variable),
+                         self.base / "flagged")
+        self.assertEqual(search_start(None, variable), self.base / "variable")
+        for env in ({}, {"DEVDOCS_PATH": " "}):
+            with self.subTest(env=env):
+                self.assertEqual(search_start(None, env), self.base / "here")
+        with self.assertRaises(ConfigError):
+            search_start(None, {"DEVDOCS_PATH": str(self.base / "typo")})
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot remove the current directory")
+    def test_a_removed_current_directory_is_no_matter_to_the_variable(self) -> None:
+        # Regression: refused as "project root . does not exist", for a run
+        # that names its project.
+        script = (
+            "import os, sys, tempfile\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from devdocs.config import load_config\n"
+            "gone = tempfile.mkdtemp()\n"
+            "os.chdir(gone)\n"
+            "os.rmdir(gone)\n"
+            "print(load_config(env={'DEVDOCS_PATH': sys.argv[2]}).name)\n"
+        )
+        run = subprocess.run([sys.executable, "-c", script, str(REPO),
+                              str(self.base / "variable")],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(run.stdout.strip(), "variable", run.stderr)
+
+
+class TestPathsInTheFile(unittest.TestCase):
+    """A relative `path` there means from the file; a relative `out`, from the
+    project, as it does from every layer."""
+
+    def setUp(self) -> None:
+        self.base = project("src/app.py", "elsewhere/src/stray.py")
+        self.src = self.base / "src"
+        self.enterContext(contextlib.chdir(self.base / "elsewhere"))
+
+    def test_a_relative_path_is_read_from_the_files_directory(self) -> None:
+        # Regression: read from the current directory, so one file named
+        # another project, or none, depending on where the run started.
+        file = config_in(self.base, 'path = "src"\n')
+        for name, config_file in (("found by the search", None), ("given", file)):
+            with self.subTest(name):
+                config = load_config(config_file=config_file, env={})
+                self.assertEqual((config.path, config.origin_of("path")),
+                                 (self.src, "file"))
+
+    def test_the_directory_is_the_one_that_holds_the_file(self) -> None:
+        config_in(self.base, 'path = "src"\n')
+        nested = self.base / "elsewhere" / "src"
+        with contextlib.chdir(nested):
+            self.assertEqual(load_config(env={}).path, self.src)
+        file = config_in(self.base / "sub" / "dir", 'path = "../.."\n')
+        self.assertEqual(project_root(load_config(config_file=file, env={}).path),
+                         self.base)
+        relative = Path(os.path.relpath(file))
+        self.assertEqual(project_root(load_config(config_file=relative, env={}).path),
+                         self.base)
+
+    def test_a_file_with_no_path_leaves_the_project_where_the_run_is(self) -> None:
+        config_in(self.base, 'name = "above"\n')
+        config = load_config(env={})
+        self.assertEqual((config.name, config.origin_of("path")), ("above", "default"))
+        self.assertEqual(project_root(config.path), self.base / "elsewhere")
+
+    def test_a_linked_file_belongs_where_it_is_found(self) -> None:
+        # One file shared by several projects: each reads `path` from itself.
+        shared = config_in(project(), 'path = "src"\n')
+        try:
+            (self.base / "devdocs.toml").symlink_to(shared)
+        except OSError:
+            self.skipTest("this system cannot make symlinks")
+        self.assertEqual(load_config(env={}).path, self.src)
+
+    def test_a_dot_is_the_files_directory_not_the_current_one(self) -> None:
+        config_in(self.base, 'path = "."\n')
+        self.assertEqual(project_root(load_config(env={}).path), self.base)
+
+    def test_a_missing_path_is_named_as_the_file_places_it(self) -> None:
+        config_in(self.base, 'path = "typo"\n')
+        error = refused(self)
+        self.assertEqual(error.message,
+                         f"project root {self.base / 'typo'} does not exist")
+
+    def test_an_absolute_or_home_path_is_left_alone(self) -> None:
+        other = project()
+        for value, expected in ((str(other), other), ("~", Path.home())):
+            with self.subTest(value=value):
+                file = config_in(self.base, f"path = '{value}'\n")
+                self.assertEqual(load_config(config_file=file, env={}).path, expected)
+
+    def test_a_flag_or_variable_is_still_read_from_the_current_directory(self) -> None:
+        file = config_in(self.base, 'path = "src"\n')
+        here = self.base / "elsewhere" / "src"
+        for name, overrides, env in (("flag", {"path": "src"}, {}),
+                                     ("variable", None, {"DEVDOCS_PATH": "src"})):
+            with self.subTest(name):
+                config = load_config(overrides, config_file=file, env=env)
+                self.assertEqual(project_root(config.path), here)
+
+    def test_a_relative_out_stays_relative_to_the_project(self) -> None:
+        # Not to the file: the file only names the project.
+        file = config_in(self.base, 'path = "src"\nout = "manual"\n')
+        config = load_config(config_file=file, env={})
+        self.assertEqual(config.out, Path("manual"))
+        self.assertEqual(Pipeline(config).out, self.src / "manual")
+        other = project()
+        config = load_config({"path": str(other)}, config_file=file, env={})
+        self.assertEqual(Pipeline(config).out, other / "manual")
+
+    def test_the_checks_on_out_measure_from_the_project(self) -> None:
+        cases = {
+            ".": f"out is the project root, {self.src}",
+            "..": f"out {self.base} contains the project root, {self.src}",
+        }
+        for out, message in cases.items():
+            with self.subTest(out=out):
+                file = config_in(self.base, f'path = "src"\nout = "{out}"\n')
+                self.assertEqual(refused(self, config_file=file).message, message)
+        file = config_in(self.base, 'path = "src"\nout = "../site"\n')
+        self.assertEqual(Pipeline(load_config(config_file=file, env={})).out.resolve(),
+                         self.base / "site")
+
+    def test_the_hint_for_an_empty_path_says_what_a_dot_means_there(self) -> None:
+        # Regression: "the current directory", which it no longer is.
+        error = refused(self, config_file=config_in(self.base, 'path = ""\n'))
+        self.assertIn("devdocs.toml for its own", error.hint or "")
+
+
 class TestOutputDirectory(unittest.TestCase):
     def setUp(self) -> None:
         self.root = project("shop/cart.py")
@@ -478,18 +680,55 @@ class TestOutputDirectory(unittest.TestCase):
 
 
 class CommandCase(unittest.TestCase):
-    def run_cli(self, *argv: str) -> tuple[int, str]:
-        """The exit code and all output. Making a model fails the command, and
-        no DEVDOCS_* variable set in the shell is read."""
+    def run_cli(self, *argv: str, env: dict[str, str] | None = None,
+                model: Any = None) -> tuple[int, str]:
+        """The exit code and all output. Making a model fails the command
+        unless `model` is given, and the DEVDOCS_* variables read are those of
+        `env`, none set in the shell."""
         printed = io.StringIO()
-        settings = functools.partial(load_config, env={})
-        with mock.patch.object(cli, "make_provider",
-                               side_effect=AssertionError("a model was made")), \
+        make = ({"side_effect": AssertionError("a model was made")} if model is None
+                else {"return_value": model})
+        settings = functools.partial(load_config, env=env or {})
+        with mock.patch.object(cli, "make_provider", **make), \
                 mock.patch.object(cli, "load_config", settings), \
                 contextlib.redirect_stdout(printed), \
                 contextlib.redirect_stderr(printed):
             code = cli.main(list(argv))
         return code, printed.getvalue()
+
+
+class TestCommandsReadTheFile(CommandCase):
+    def test_a_run_from_below_the_file_works_in_the_project_it_names(self) -> None:
+        # Regression: `path` was read from the current directory, where it
+        # named nothing, and the run was refused.
+        base = project()
+        for relpath, text in PROJECT.items():
+            (base / "app" / relpath).parent.mkdir(parents=True, exist_ok=True)
+            (base / "app" / relpath).write_text(text, encoding="utf-8")
+        config_in(base, 'path = "app"\nout = "manual"\n')
+        (base / "scripts").mkdir()
+        with contextlib.chdir(base / "scripts"):
+            code, printed = self.run_cli("generate", "--api-key", "k",
+                                         model=TaggedModel())
+        self.assertEqual(code, 0, printed)
+        self.assertTrue((base / "app" / "manual" / "README.md").is_file())
+        self.assertTrue((base / "app" / ".devdocs" / "devdocs.db").is_file())
+        self.assertEqual(list((base / "scripts").iterdir()), [])
+
+    def test_the_variable_names_the_project_and_so_its_file(self) -> None:
+        # Regression: the project's own quality was not read.
+        root = project()
+        (root / "app.py").write_text("def main():\n    return 0\n", "utf-8")
+        config_in(root, 'quality = "high"\n')
+        here = project()
+        env = {"DEVDOCS_PATH": str(root)}
+        with contextlib.chdir(here):
+            _, printed = self.run_cli("doctor", "--offline", "--api-key", "k", env=env)
+            self.assertIn("quality=high", printed)
+            code, printed = self.run_cli("estimate", "--json", "--quiet", env=env)
+            self.assertEqual(code, 0, printed)
+        self.assertEqual(json.loads(printed)["files"], 1)   # root's app.py
+        self.assertEqual(list(here.iterdir()), [])
 
 
 class TestCommandsRefuseFirst(CommandCase):

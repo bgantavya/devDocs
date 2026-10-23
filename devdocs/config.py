@@ -4,6 +4,12 @@ Precedence is fixed and total: an explicit flag beats the environment, which
 beats the config file, which beats the built-in defaults. Nothing merges
 silently, so `devdocs doctor` can always name where a value came from.
 
+The file is looked for from the project path that a flag or DEVDOCS_PATH gives,
+else from the current directory, up to a repo root; see `find_config_file`. A
+relative `path` is read from where it was given: in the file, from the
+directory that holds the file; as a flag or a variable, from the current
+directory. A relative `out`, from any layer, is read from the project.
+
 Paths are checked too, early enough for a command to refuse them before it
 creates anything: the project root must be an existing directory, and the
 output directory can be neither the root nor above it, where the docs would
@@ -35,6 +41,7 @@ __all__ = [
     "load_config",
     "project_root",
     "resolve_api_key",
+    "search_start",
 ]
 
 CONFIG_FILENAME = "devdocs.toml"
@@ -102,7 +109,7 @@ _FORMATS = set(FORMATS)
 _PAGE_SIZES = {size.casefold(): size for size in PAGE_SIZES}   # "letter" -> "Letter"
 _OWN_DIRECTORY = "give the docs a directory of their own, such as docs (the default)"
 _EMPTY_PATH = {
-    "path": 'use "." for the current directory',
+    "path": f'use "." for the current directory, or in {CONFIG_FILENAME} for its own',
     "out": _OWN_DIRECTORY,
 }
 
@@ -306,13 +313,23 @@ def _validate(config: Config) -> None:
         raise ConfigError("concurrency must be at least 1")
 
 
+def search_start(flagged: Any, environment: Mapping[str, str]) -> Path:
+    """Where the search for the config file starts: the project path the flag
+    gives, else DEVDOCS_PATH, else the current directory; a blank variable is
+    unset. A `path` in the file cannot steer it. Checked here, so a typo is
+    reported as one, not by a config file found above it."""
+    if flagged is not None:
+        return project_root(flagged)
+    return project_root(environment.get("DEVDOCS_PATH", "").strip() or ".")
+
+
 def load_config(
     overrides: dict[str, Any] | None = None,
     *,
     config_file: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Config:
-    """Build a Config from defaults, then the file, then flags.
+    """Build a Config from defaults, then the file, the environment and flags.
 
     `overrides` holds parsed CLI flags and wins over everything. A None value
     means the flag was absent, so it never masks a configured value. `env` is
@@ -320,9 +337,9 @@ def load_config(
     """
     config = Config()
     known = {f.name for f in fields(Config)} - {"sources", "key_source"}
+    environment: Mapping[str, str] = os.environ if env is None else env
 
-    flagged = (overrides or {}).get("path")
-    start = project_root("." if flagged is None else flagged)   # before any file
+    start = search_start((overrides or {}).get("path"), environment)
     file_path = config_file or find_config_file(start)
     if file_path is not None:
         for key, value in _read_toml(file_path).items():
@@ -334,9 +351,10 @@ def load_config(
                 )
             setattr(config, name, _coerce(name, value, getattr(config, name)))
             config.sources[name] = "file"
+        if config.origin_of("path") == "file":
+            config.path = file_path.parent / config.path
 
     # Keys are resolved apart by `resolve_api_key`, so never land in Config.
-    environment: Mapping[str, str] = os.environ if env is None else env
     for name in sorted(known - {"api_key"}):
         raw = environment.get(f"DEVDOCS_{name.upper()}", "")
         if not raw.strip():
@@ -353,8 +371,7 @@ def load_config(
 
     config.page_size = _PAGE_SIZES.get(config.page_size.casefold(), config.page_size)
     _validate(config)
-    # the file or DEVDOCS_PATH may move the root
-    _check_out(project_root(config.path), config.out)
+    _check_out(project_root(config.path), config.out)   # the file may move the root
     return config
 
 
