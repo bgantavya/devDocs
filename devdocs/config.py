@@ -40,6 +40,7 @@ from devdocs.render import FORMATS, PAGE_SIZES, PDF_ENGINES
 __all__ = [
     "Config",
     "KeySource",
+    "key_variables",
     "load_config",
     "project_root",
     "resolve_api_key",
@@ -413,6 +414,13 @@ def load_config(
     return config
 
 
+def key_variables(provider: str) -> tuple[str, ...]:
+    """The environment variables `resolve_api_key` reads for `provider`'s key,
+    in order; none for a provider it does not know. A message naming the
+    user's choices names these."""
+    return _ENV_KEYS.get(provider, ())
+
+
 def resolve_api_key(
     config: Config,
     *,
@@ -425,7 +433,7 @@ def resolve_api_key(
     Order: flag, then the provider's environment variables, then the config
     file, then `demo_key` if the caller has one, reported as shared so the
     caller can warn. None ships (see `devdocs.demo`), so with no key of the
-    user's own this raises a ConfigError.
+    user's own this raises a ConfigError naming the flag and the variables.
     """
     environment: Mapping[str, str] = os.environ if env is None else env
 
@@ -443,7 +451,8 @@ def resolve_api_key(
     if demo_key:
         return demo_key, KeySource("demo", shared=True)
 
+    variables = ", ".join(f"${var}" for var in _ENV_KEYS[config.provider])
     raise ConfigError(
         f"no API key for provider {config.provider!r}",
-        hint=f"pass --api-key or set ${_ENV_KEYS[config.provider][1]}",
+        hint=f"pass --api-key or set one of: {variables}",
     )

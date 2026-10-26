@@ -41,6 +41,7 @@ from devdocs import __version__
 from devdocs.config import (
     CONFIG_FILENAME,
     Config,
+    key_variables,
     load_config,
     project_root,
     resolve_api_key,
@@ -425,9 +426,11 @@ def _key(config: Config, explicit: str, out: _Output) -> str:
     key, source = resolve_api_key(config, explicit=explicit, demo_key=demo)
     config.key_source = source
     if source.shared:
+        *others, last = key_variables(config.provider)
         out.warn(
-            "using the shared demo key; its free quota is shared by everyone. "
-            "Set GEMINI_API_KEY to use your own."
+            "using the shared demo key, whose free quota everyone shares. To use "
+            f"your own, pass --api-key, set {', '.join(others)} or {last}, or set "
+            f"api_key in {CONFIG_FILENAME}."
         )
     return key
 
@@ -641,7 +644,7 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
         lines.append(f"ok api key              from {where}"
                      + (" (shared demo key)" if source and source.shared else ""))
     except ConfigError as err:
-        lines.append(f"!! api key              {err.message}")
+        lines.append(f"!! api key              {err}")
         key = ""
         blocking = True
 

@@ -22,7 +22,7 @@ from types import FrameType
 from typing import Any, TextIO
 from unittest import mock
 
-from devdocs import __version__, capabilities, cli
+from devdocs import __version__, capabilities, cli, demo
 from devdocs import generate as generate_module
 from devdocs.capabilities import Capability, Report
 from devdocs.config import load_config
@@ -385,6 +385,13 @@ class TestDoctorAndModels(CliCase):
         self.assertEqual(code, 1)
         self.assertIn("!! api key", out)
 
+    def test_doctor_says_how_to_give_a_missing_key(self) -> None:
+        # Regression: it showed the error without its hint.
+        _, out, _ = self.run_cli("doctor", str(self.root), "--offline")
+        self.assertIn("!! api key              no API key for provider 'gemini'\n"
+                      "  hint: pass --api-key or set one of: $DEVDOCS_API_KEY, "
+                      "$GEMINI_API_KEY, $GOOGLE_API_KEY\n", out)
+
     def test_doctor_lists_the_pdf_engines_it_finds(self) -> None:
         found = {"builtin": "/usr/bin/python3", "weasyprint": "/opt/bin/weasyprint"}
         with mock.patch.object(external, "available_engines", return_value=found):
@@ -439,6 +446,59 @@ class TestDoctorAndModels(CliCase):
         rows = {row["id"]: row["available"] for row in json.loads(out)["catalogued"]}
         self.assertTrue(rows["gemini-2.5-flash-lite"])
         self.assertFalse(rows["gemini-3.1-flash-lite"])
+
+
+class TestDemoKey(CliCase):
+    """None ships, and `devdocs.demo` is where one would go. The branch that
+    warns of it is reached only then."""
+
+    def demo(self, *argv: str) -> tuple[int, str, str]:
+        with mock.patch.object(demo, "DEMO_KEY", "DEMO-SECRET"):
+            return self.run_cli(*argv)
+
+    def test_none_ships(self) -> None:
+        self.assertEqual(demo.DEMO_KEY, "")
+        code, _, err = self.run_cli("generate", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("no API key", err)
+        self.assertNotIn("demo", err)
+
+    def test_the_warning_names_the_real_choices(self) -> None:
+        # Regression: it named GEMINI_API_KEY alone.
+        code, out, err = self.demo("generate", str(self.root), "--quiet")
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "warning: using the shared demo key, whose free quota everyone shares. "
+            "To use your own, pass --api-key, set DEVDOCS_API_KEY, GEMINI_API_KEY or "
+            "GOOGLE_API_KEY, or set api_key in devdocs.toml.\n", err)
+        self.assertNotIn("DEMO-SECRET", out + err)
+
+    def assert_own_key_used(self, *argv: str, **env: str) -> None:
+        """A run with the demo key there sends `own`, and says nothing of the demo."""
+        err = io.StringIO()
+        with mock.patch.object(demo, "DEMO_KEY", "DEMO-SECRET"), clean_env(**env), \
+                mock.patch.object(cli, "make_provider",
+                                  return_value=self.model) as made, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            code = cli.main(["generate", str(self.root), "--quiet", *argv])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertNotIn("demo", err.getvalue())
+        made.assert_called_once_with("gemini", "own")
+
+    def test_every_choice_it_names_beats_it(self) -> None:
+        # Each alone: a key in the file, there throughout, would hide the others.
+        self.assert_own_key_used("--api-key", "own")
+        for variable in ("DEVDOCS_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            with self.subTest(variable):
+                self.assert_own_key_used(**{variable: "own"})
+        (self.root / "devdocs.toml").write_text('api_key = "own"\n', "utf-8")
+        self.assert_own_key_used()
+
+    def test_it_serves_gemini_alone(self) -> None:
+        code, _, err = self.demo("generate", str(self.root), "--provider", "anthropic")
+        self.assertEqual(code, 2)
+        self.assertIn("no API key", err)
 
 
 def gone() -> TextIO:
