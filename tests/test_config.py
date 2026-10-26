@@ -28,6 +28,7 @@ from devdocs import cli, demo
 from devdocs.config import (
     Config,
     find_config_file,
+    key_variables,
     load_config,
     project_root,
     resolve_api_key,
@@ -941,6 +942,18 @@ class TestDemoKey(CommandCase):
         # As config's docstrings say. A public key gets revoked: see devdocs.demo.
         self.assertEqual(demo.DEMO_KEY, "")
 
+    def test_one_set_is_the_last_resort_for_gemini_and_warns(self) -> None:
+        root = project()
+        no_keys = functools.partial(resolve_api_key, env={})
+        with mock.patch.object(demo, "DEMO_KEY", "shared"), \
+                mock.patch.object(cli, "resolve_api_key", no_keys):
+            _, gemini = self.run_cli("doctor", str(root), "--offline")
+            _, anthropic = self.run_cli("doctor", str(root), "--offline",
+                                        "--provider", "anthropic")
+        self.assertIn("ok api key              from demo (shared demo key)", gemini)
+        self.assertIn("warning: using the shared demo key", gemini)
+        self.assertIn("!! api key              no API key", anthropic)
+
 
 class TestCommandsRefuseFirst(CommandCase):
     def test_a_missing_root_is_never_made(self) -> None:
@@ -1066,9 +1079,25 @@ class TestKeyResolution(unittest.TestCase):
         self.assertTrue(source.shared)
 
     def test_no_key_anywhere_explains_how_to_supply_one(self) -> None:
-        with self.assertRaises(ConfigError) as caught:
-            resolve_api_key(Config(), env={})
-        self.assertIn("GEMINI_API_KEY", str(caught.exception))
+        # Regression: the hint named one variable, hiding the one read first.
+        variables = {
+            "gemini": ("DEVDOCS_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            "anthropic": ("DEVDOCS_API_KEY", "ANTHROPIC_API_KEY"),
+            "anthropic-sdk": ("DEVDOCS_API_KEY", "ANTHROPIC_API_KEY"),
+        }
+        for provider, names in variables.items():
+            with self.subTest(provider):
+                with self.assertRaises(ConfigError) as caught:
+                    resolve_api_key(Config(provider=provider), env={})
+                listed = ", ".join(f"${name}" for name in names)
+                self.assertEqual(caught.exception.hint,
+                                 f"pass --api-key or set one of: {listed}")
+                for name in names:   # what it names is what is read
+                    _, source = resolve_api_key(Config(provider=provider),
+                                                env={name: "k"})
+                    self.assertEqual(source.detail, name)
+                self.assertEqual(key_variables(provider), names)   # as the demo warns
+        self.assertEqual(key_variables("openai"), ())
 
 
 if __name__ == "__main__":
