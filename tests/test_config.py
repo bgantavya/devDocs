@@ -275,6 +275,29 @@ class TestValidation(unittest.TestCase):
             load_config(config_file=path, env={})
         self.assertIn(str(path), str(caught.exception))
 
+    def test_a_file_tomllib_chokes_on_is_refused_naming_it(self) -> None:
+        # Regression: none of these is a TOMLDecodeError, so each was an
+        # internal error and exit 1, on every Python.
+        cases = {
+            "not UTF-8": b"\xff\xfep\x00",
+            "an integer too long to read": b"a = " + b"1" * 5000 + b"\n",
+            "arrays nested too deep": b"a = " + b"[" * 100_000 + b"]" * 100_000 + b"\n",
+            "tables nested too deep": b"a = " + b"{a=" * 100_000 + b"1"
+                                      + b"}" * 100_000 + b"\n",
+        }
+        for name, body in cases.items():
+            with self.subTest(name):
+                path = write_config("")
+                path.write_bytes(body)
+                self.assertIn(f"{path} is not valid TOML: ",
+                              refused(self, config_file=path).message)
+
+    def test_a_cost_past_any_float_is_refused(self) -> None:
+        # Regression: OverflowError, an internal error, though 1e400 was refused.
+        path = write_config(f"max_cost = 1{'0' * 400}\n")
+        self.assertEqual(refused(self, config_file=path).message,
+                         "max_cost must be a number of dollars, not inf")
+
     def test_wrong_type_is_rejected(self) -> None:
         path = write_config('[devdocs]\nconcurrency = "four"\n')
         with self.assertRaises(ConfigError):
@@ -576,6 +599,84 @@ class TestSearchStops(unittest.TestCase):
         self.assertEqual(printed, "0.5")
 
 
+class TestLinksInTheWalk(unittest.TestCase):
+    """A link the walk may not follow counts as there; one that leads nowhere
+    does not. The file above has no cost ceiling, which is what skipping a
+    project's own file could cost."""
+
+    def setUp(self) -> None:
+        self.base = project()
+        config_in(self.base, 'name = "above"\nmax_cost = 0\n')
+        self.root = self.base / "app"
+        self.root.mkdir()
+
+    def denied_target(self) -> Path:
+        """A file in a directory devdocs may not search."""
+        denied = project("x")
+        denied.chmod(0o000)
+        self.addCleanup(denied.chmod, 0o700)
+        return denied / "x"
+
+    def assert_refused_as_unreadable(self) -> None:
+        error = refused(self, {"path": str(self.root)})
+        self.assertIn(f"cannot read {self.root / 'devdocs.toml'}: ", error.message)
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "needs POSIX permissions, not root")
+    def test_a_config_link_it_may_not_follow_is_refused(self) -> None:
+        # Regression: an internal error on 3.11 and 3.13; on 3.15 it was
+        # skipped, and the run went on under the file above, with no ceiling.
+        (self.root / "devdocs.toml").symlink_to(self.denied_target())
+        self.assert_refused_as_unreadable()
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "needs POSIX permissions, not root")
+    def test_as_is_a_config_file_it_may_not_read(self) -> None:
+        file = config_in(self.root, 'name = "own"\n')
+        file.chmod(0o000)
+        self.addCleanup(file.chmod, 0o600)
+        self.assert_refused_as_unreadable()
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "needs POSIX permissions, not root")
+    def test_a_repo_link_it_may_not_follow_stops_the_walk(self) -> None:
+        # Regression: an internal error on 3.11 and 3.13; on 3.15 the walk
+        # went on past it, to the file above.
+        (self.root / ".git").symlink_to(self.denied_target())
+        config = load_config({"path": str(self.root)}, env={})
+        self.assertEqual((config.name, config.max_cost), ("", 0.5))
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "needs POSIX permissions, not root")
+    def test_a_directory_it_may_not_search_holds_no_file(self) -> None:
+        # What it cannot see is not a file. Not a link either: the walk goes on.
+        shut = self.root / "shut"
+        (shut / "below").mkdir(parents=True)
+        shut.chmod(0o000)
+        self.addCleanup(shut.chmod, 0o700)
+        for start in (shut, shut / "below"):
+            with self.subTest(start=start.name):
+                self.assertEqual(find_config_file(start, home=project()),
+                                 self.base / "devdocs.toml")
+
+    def test_a_directory_by_that_name_is_no_file(self) -> None:
+        (self.root / "devdocs.toml").mkdir()
+        self.assertEqual(load_config({"path": str(self.root)}, env={}).name, "above")
+
+    def test_a_link_that_leads_nowhere_is_neither_file_nor_repo(self) -> None:
+        for marker in ("devdocs.toml", ".git"):
+            link = self.root / marker
+            for target in (self.root / "gone", link):   # nothing; itself
+                try:
+                    link.symlink_to(target)
+                except OSError:
+                    self.skipTest("this system cannot make symlinks")
+                with self.subTest(marker, to=target.name):
+                    config = load_config({"path": str(self.root)}, env={})
+                    self.assertEqual(config.name, "above")
+                link.unlink()
+
+
 class TestPathsInTheFile(unittest.TestCase):
     """A relative `path` there means from the file; a relative `out`, from the
     project, as it does from every layer."""
@@ -863,6 +964,16 @@ class TestCommandsRefuseFirst(CommandCase):
         self.assertEqual(code, 2, printed)
         self.assertIn("out is empty", printed)
         self.assertEqual([path.name for path in root.iterdir()], ["app.py"])
+
+    def test_a_file_that_is_not_utf8_exits_2_and_makes_nothing(self) -> None:
+        # Regression: "internal error: UnicodeDecodeError" and exit 1.
+        root = project("app.py")
+        config_in(root, "").write_bytes(b"\xff\xfep\x00")
+        code, printed = self.run_cli("estimate", str(root))
+        self.assertEqual(code, 2, printed)
+        self.assertIn(f"{root / 'devdocs.toml'} is not valid TOML: ", printed)
+        self.assertEqual(sorted(path.name for path in root.iterdir()),
+                         ["app.py", "devdocs.toml"])
 
 
 class TestEnvironment(unittest.TestCase):

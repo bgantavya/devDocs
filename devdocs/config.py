@@ -179,6 +179,22 @@ def _check_out(root: Path, out: Path) -> None:
                           hint=_OWN_DIRECTORY)
 
 
+def _denied_link(path: Path) -> bool:
+    """Whether `path` is a link devdocs may not follow. The walk counts one as
+    there. Skipping such a file could trade its budget for that of a file
+    further up, so reading it refuses the run, as for any file it may not read;
+    such a `.git` is a stop, since git will not look past one either.
+    `Path.is_file` and `.exists` raise for one on 3.11 and 3.13 and say False
+    on 3.15, so the walk does not ask them."""
+    try:
+        os.stat(path)
+    except PermissionError:
+        return os.path.islink(path)
+    except OSError:
+        pass
+    return False
+
+
 def find_config_file(start: Path, *, home: Path | None = None) -> Path | None:
     """Walk up from `start` looking for devdocs.toml, stopping at the repo root
     or the home directory.
@@ -202,9 +218,10 @@ def find_config_file(start: Path, *, home: Path | None = None) -> Path | None:
         if at_home and directory != current:
             break
         candidate = directory / CONFIG_FILENAME
-        if candidate.is_file():
+        if os.path.isfile(candidate) or _denied_link(candidate):
             return candidate
-        if at_home or (directory / ".git").exists():
+        git = directory / ".git"
+        if at_home or os.path.exists(git) or _denied_link(git):
             break
     return None
 
@@ -213,7 +230,8 @@ def _read_toml(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
-    except tomllib.TOMLDecodeError as err:
+    except (ValueError, RecursionError) as err:
+        # TOMLDecodeError; not UTF-8; a number too long; nested too deep
         raise ConfigError(f"{path} is not valid TOML: {err}") from err
     except OSError as err:
         raise ConfigError(f"cannot read {path}: {err}") from err
@@ -245,7 +263,10 @@ def _coerce(name: str, value: Any, current: Any) -> Any:
     if isinstance(current, float):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(f"{name} must be a number")
-        return float(value)
+        try:
+            return float(value)
+        except OverflowError:   # an integer past any float: as 1e400 reads
+            return math.inf
     return str(value)
 
 
