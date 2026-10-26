@@ -2,7 +2,9 @@
 
 Precedence is fixed and total: an explicit flag beats the environment, which
 beats the config file, which beats the built-in defaults. Nothing merges
-silently, so `devdocs doctor` can always name where a value came from.
+silently, so `Config.origin_of` can name the layer behind every setting. The
+API key has its own record, `KeySource`, and that is the only source `devdocs
+doctor` reports.
 
 The file is looked for from the project path that a flag or DEVDOCS_PATH gives,
 else from the current directory, up to a repo root or the home directory; see
@@ -16,9 +18,9 @@ output directory can be neither the root nor above it, where the docs would
 mix with the project's own files.
 
 The API key is resolved separately by `resolve_api_key` because it has one
-extra step at the bottom: a bundled demo key that lets someone try the tool
-without signing up. That key's quota is shared by every user of it, so it warns
-and is never a silent default.
+extra step at the bottom: a shared demo key, if `devdocs.demo` sets one. None
+ships, so a command that needs a key refuses without one. A demo key's quota is
+shared by every user of it, so it warns and is never a silent default.
 """
 
 from __future__ import annotations
@@ -98,7 +100,8 @@ class Config:
     sources: dict[str, str] = field(default_factory=dict)
 
     def origin_of(self, name: str) -> str:
-        """Report which layer supplied `name` ("flag", "env", "file", "default")."""
+        """Report which layer supplied `name` ("flag", "env", "file", "default").
+        Not for `api_key`, which is resolved apart: see `KeySource`."""
         return self.sources.get(name, "default")
 
 
@@ -420,8 +423,9 @@ def resolve_api_key(
     """Find a usable API key and say where it came from.
 
     Order: flag, then the provider's environment variables, then the config
-    file, then the bundled demo key. The demo key is last and is reported as
-    shared so the caller can warn; it exists so a first run needs no signup.
+    file, then `demo_key` if the caller has one, reported as shared so the
+    caller can warn. None ships (see `devdocs.demo`), so with no key of the
+    user's own this raises a ConfigError.
     """
     environment: Mapping[str, str] = os.environ if env is None else env
 

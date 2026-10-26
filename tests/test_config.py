@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from devdocs import cli
+from devdocs import cli, demo
 from devdocs.config import (
     Config,
     find_config_file,
@@ -936,6 +936,12 @@ class TestCommandsReadTheFile(CommandCase):
         self.assertEqual(list(here.iterdir()), [])
 
 
+class TestDemoKey(CommandCase):
+    def test_none_ships(self) -> None:
+        # As config's docstrings say. A public key gets revoked: see devdocs.demo.
+        self.assertEqual(demo.DEMO_KEY, "")
+
+
 class TestCommandsRefuseFirst(CommandCase):
     def test_a_missing_root_is_never_made(self) -> None:
         # Regression: generate, estimate and cache made it, with
@@ -1013,6 +1019,17 @@ class TestEnvironment(unittest.TestCase):
     def test_the_key_never_enters_config_from_env(self) -> None:
         config = load_config(config_file=None, env={"DEVDOCS_API_KEY": "secret"})
         self.assertEqual(config.api_key, "")
+
+    def test_only_key_source_names_where_the_key_came_from(self) -> None:
+        # As config's docstring says: origin_of never sees the winning key.
+        env = {"DEVDOCS_API_KEY": "k"}
+        config = load_config(config_file=None, env=env)
+        self.assertEqual(config.origin_of("api_key"), "default")
+        self.assertEqual(resolve_api_key(config, env=env)[1].origin, "env")
+        config = load_config(config_file=write_config('api_key = "f"\n'), env=env)
+        self.assertEqual(config.origin_of("api_key"), "file")
+        _, source = resolve_api_key(config, explicit="x", env=env)
+        self.assertEqual(source.origin, "flag")
 
 
 class TestKeyResolution(unittest.TestCase):
