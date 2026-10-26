@@ -1,11 +1,11 @@
 """Config precedence, the search for the file, validation, and key resolution.
 
 No network and no os.environ mutation: `load_config` and `resolve_api_key` both
-take an `env` mapping so these run in any order. The commands that take a
-project path run too, reading no DEVDOCS_* variable of the shell's and with
-making a model patched to fail, to show that a refused path stops each before
-it creates or buys anything; one has a scripted model, to show where the
-file's paths lead a paid run.
+take an `env` mapping, and `find_config_file` a `home`, so these run in any
+order. The commands that take a project path run too, reading no DEVDOCS_*
+variable of the shell's and with making a model patched to fail, to show that a
+refused path stops each before it creates or buys anything; one has a scripted
+model, to show where the file's paths lead a paid run.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from unittest import mock
 from devdocs import cli
 from devdocs.config import (
     Config,
+    find_config_file,
     load_config,
     project_root,
     resolve_api_key,
@@ -470,6 +471,109 @@ class TestConfigSearch(unittest.TestCase):
                               str(self.base / "variable")],
                              capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual(run.stdout.strip(), "variable", run.stderr)
+
+
+class TestSearchStops(unittest.TestCase):
+    """The walk up ends at a repo root or the home directory; only outside home
+    can it reach the disk's root."""
+
+    def setUp(self) -> None:
+        self.home = project()
+        self.below = self.home / "work" / "app"
+        self.below.mkdir(parents=True)
+        self.stray = config_in(self.home, "max_cost = 99.0\n")
+
+    def in_a_child(self, *lines: str, cwd: Path | None = None) -> str:
+        """What `lines` print in a Python whose home is `self.home`, with
+        load_config, project_root and the path of `self.below` to hand."""
+        script = "\n".join(("import sys",
+                            "sys.path.insert(0, sys.argv[1])",
+                            "from devdocs.config import load_config, project_root",
+                            "below = sys.argv[2]",
+                            *lines))
+        home = {"HOME": str(self.home), "USERPROFILE": str(self.home)}
+        run = subprocess.run([sys.executable, "-c", script, str(REPO), str(self.below)],
+                             capture_output=True, text=True, timeout=60, check=False,
+                             cwd=cwd, env={**os.environ, **home})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.strip()
+
+    def test_a_search_from_below_home_does_not_read_its_file(self) -> None:
+        # Regression: it set the budget of every project under home with no
+        # file of its own and no repo around it.
+        self.assertIsNone(find_config_file(self.below, home=self.home))
+
+    def test_a_search_from_home_reads_it(self) -> None:
+        self.assertEqual(find_config_file(self.home, home=self.home), self.stray)
+
+    def test_the_file_a_search_from_home_reads_can_name_a_project_below(self) -> None:
+        # The stop is where the search starts, not where the project is.
+        config_in(self.home, 'path = "work/app"\nmax_cost = 0\n')
+        printed = self.in_a_child("config = load_config(env={})",
+                                  "print(project_root(config.path), config.max_cost)",
+                                  cwd=self.home)
+        self.assertEqual(printed, f"{self.below} 0.0")
+
+    def test_nothing_above_home_is_read(self) -> None:
+        above = project()
+        config_in(above, "max_cost = 99.0\n")
+        home = above / "me"
+        (home / "app").mkdir(parents=True)
+        self.assertIsNone(find_config_file(home, home=home))
+        self.assertIsNone(find_config_file(home / "app", home=home))
+
+    def test_a_file_below_home_is_found_from_the_directories_under_it(self) -> None:
+        file = config_in(self.home / "work", "max_cost = 1.0\n")
+        self.assertEqual(find_config_file(self.below, home=self.home), file)
+
+    def test_a_repo_at_home_does_not_make_its_file_a_projects(self) -> None:
+        (self.home / ".git").mkdir()   # dotfiles
+        self.assertIsNone(find_config_file(self.below, home=self.home))
+        self.assertEqual(find_config_file(self.home, home=self.home), self.stray)
+
+    def test_a_repo_below_home_stops_the_walk_first(self) -> None:
+        config_in(self.home / "work", "max_cost = 1.0\n")
+        (self.below / ".git").mkdir()
+        self.assertIsNone(find_config_file(self.below, home=self.home))
+
+    def test_outside_home_the_walk_runs_on(self) -> None:
+        self.assertEqual(find_config_file(self.below, home=project()), self.stray)
+
+    def test_a_home_that_is_not_there_stops_nothing(self) -> None:
+        missing = self.home / "no" / "such"
+        self.assertEqual(find_config_file(self.below, home=missing), self.stray)
+
+    @unittest.skipIf(os.name == "nt", "Windows has no passwd database")
+    def test_a_home_that_cannot_be_determined_stops_nothing(self) -> None:
+        # No HOME and a uid with no passwd entry. Path.home() raises there,
+        # which would be an internal error.
+        printed = self.in_a_child(
+            "import os, pwd, unittest.mock",
+            "del os.environ['HOME']",
+            "pwd.getpwuid = unittest.mock.Mock(side_effect=KeyError)",
+            "print(load_config({'path': below}, env={}).max_cost)",
+        )
+        self.assertEqual(printed, "99.0")
+
+    def test_another_name_for_home_is_home(self) -> None:
+        names: dict[str, Path] = {}
+        link = project() / "link"
+        with contextlib.suppress(OSError):   # no symlinks without the privilege
+            link.symlink_to(self.home, target_is_directory=True)
+            names["a symlink"] = link
+        if Path(str(self.home).swapcase()).exists():   # a case-insensitive disk
+            names["another case"] = Path(str(self.home).swapcase())
+        if not names:
+            self.skipTest("no other name for a directory here")
+        for name, home in names.items():
+            with self.subTest(name):
+                self.assertIsNone(find_config_file(self.below, home=home))
+
+    def test_the_real_home_directory_is_the_stop(self) -> None:
+        printed = self.in_a_child(
+            "print(load_config({'path': below}, env={}).max_cost)",
+        )
+        self.assertEqual(printed, "0.5")
 
 
 class TestPathsInTheFile(unittest.TestCase):

@@ -5,10 +5,10 @@ beats the config file, which beats the built-in defaults. Nothing merges
 silently, so `devdocs doctor` can always name where a value came from.
 
 The file is looked for from the project path that a flag or DEVDOCS_PATH gives,
-else from the current directory, up to a repo root; see `find_config_file`. A
-relative `path` is read from where it was given: in the file, from the
-directory that holds the file; as a flag or a variable, from the current
-directory. A relative `out`, from any layer, is read from the project.
+else from the current directory, up to a repo root or the home directory; see
+`find_config_file`. A relative `path` is read from where it was given: in the
+file, from the directory that holds the file; as a flag or a variable, from the
+current directory. A relative `out`, from any layer, is read from the project.
 
 Paths are checked too, early enough for a command to refuse them before it
 creates anything: the project root must be an existing directory, and the
@@ -179,18 +179,32 @@ def _check_out(root: Path, out: Path) -> None:
                           hint=_OWN_DIRECTORY)
 
 
-def find_config_file(start: Path) -> Path | None:
-    """Walk up from `start` looking for devdocs.toml, stopping at the repo root.
+def find_config_file(start: Path, *, home: Path | None = None) -> Path | None:
+    """Walk up from `start` looking for devdocs.toml, stopping at the repo root
+    or the home directory.
 
     Walking up means a subdirectory run picks up the project's config instead
-    of silently using defaults.
+    of silently using defaults. A file in home is read only by a search that
+    starts at home, even if home is a repo: read from below, a stray one would
+    set the budget, the provider and even the project of every run with no
+    nearer file or repo. Read from home, its `path` can still name a project
+    below. With neither stop on the way, the walk runs to the filesystem root;
+    a home that cannot be determined is no stop. `home` is injectable so tests
+    need not mutate os.environ.
     """
     current = start.resolve()
+    # expanduser, as Path.home() raises if none can be determined
+    ceiling = _stat(Path(os.path.expanduser("~")) if home is None else home)
     for directory in (current, *current.parents):
+        there = _stat(directory)
+        at_home = (ceiling is not None and there is not None
+                   and os.path.samestat(ceiling, there))
+        if at_home and directory != current:
+            break
         candidate = directory / CONFIG_FILENAME
         if candidate.is_file():
             return candidate
-        if (directory / ".git").exists():
+        if at_home or (directory / ".git").exists():
             break
     return None
 
