@@ -27,11 +27,19 @@ as an external PDF engine, costs only itself: the others and the manifest
 are still written. `export` renders the documents of the last run again,
 read back from its manifest, so another format, or one that failed, needs
 neither a key nor a model.
+
+Which files a run writes depends on its documents, not on their prose. So
+before the first paid call, `check` renders the documents with the prose the
+cache holds, a placeholder for what the budget lets the run buy, and has the
+writer refuse now what it would refuse once paid for: a file devdocs did not
+write in the way, a name the file system cannot hold, an out dir it cannot
+write.
 """
 
 from __future__ import annotations
 
 import builtins
+import contextlib
 import hashlib
 import json
 import posixpath
@@ -40,7 +48,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -82,7 +90,7 @@ from devdocs.render import (
     renderer_for,
 )
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
-from devdocs.render.style import StyleGuard, acceptable, parse_reply
+from devdocs.render.style import Reply, StyleGuard, acceptable, parse_reply
 from devdocs.retrieve import Retriever
 from devdocs.scan import Scanner, ScanResult, SourceFile
 
@@ -107,6 +115,10 @@ _EMBED_SHARE = 0.5
 
 # Stops after which nothing can be asked; after "interrupted" the cache can.
 _EXHAUSTED = frozenset({"budget", "quota"})
+
+# The check's stand-in for prose still to buy: a purpose no reply has, as the
+# guard strips control characters from every one.
+_UNBOUGHT = Prose(reply=Reply(purpose="\x00Prose still to buy.\x00"), model="", tier="")
 
 # On Windows a Ctrl-C may not wake a lock wait; waking this often lets its
 # handler run.
@@ -259,7 +271,7 @@ class Pipeline:
     """One configured run over one project.
 
     `client` is required for `price`, `estimate` and `run`; `prepare`,
-    `write` and `export` need none. `log` receives one-line progress
+    `check`, `write` and `export` need none. `log` receives one-line progress
     messages for the CLI. Without `renderers`, there is one per configured
     format, built now so that a missing PDF engine fails before any call.
     `warnings` and `failures` describe the last write.
@@ -509,6 +521,54 @@ class Pipeline:
             if rel in prepared.files and facts.module_docstring
         }
 
+    def _walk(
+        self, prepared: Prepared, answer: Callable[[Prompt], Prose | None]
+    ) -> None:
+        """Build every planned prompt as a run would: files, then modules,
+        with the purposes `answer` gives the files', then the overview, with
+        the modules'. Docstrings stand in where `answer` gives no prose."""
+        summaries = self._docstring_summaries(prepared)
+        for prompt in list(self._file_prompts(prepared)):
+            prose = answer(prompt)
+            if prose is not None and prose.reply.purpose:
+                summaries[prompt.key] = first_sentence(prose.reply.purpose)
+        module_summaries: dict[str, str] = {}
+        for prompt in list(self._module_prompts(prepared, summaries)):
+            prose = answer(prompt)
+            if prose is not None and prose.reply.purpose:
+                module_summaries[prompt.key] = first_sentence(prose.reply.purpose)
+        overview = self._architecture_prompt(prepared, module_summaries)
+        if overview is not None:
+            answer(overview)
+
+    def _foreseen(self, prepared: Prepared) -> dict[tuple[str, str], Prose]:
+        """The prose a run will have, as far as can be told before it buys
+        any: none for an item the budget cuts, as `price` finds on a copy of
+        the plan, with nothing yet spent on embedding; for the rest what the
+        cache holds, as a run would take it, else `_UNBOUGHT`. That stands in
+        for the purposes it sums up too, so a prompt built on one is unbought
+        as well. Without a client every item is. Those prompts are built
+        without retrieved context, which only the price depends on, as no
+        cache key holds it, so they cost little."""
+        plan = replace(prepared.plan, files=[*prepared.plan.files],
+                       modules=[*prepared.plan.modules])
+        fitted = replace(prepared, plan=plan, prompts={})
+        if self.client is not None:
+            self.price(fitted, embedding=False)
+        guard = StyleGuard(known=self._known(prepared))
+        describe = {p.relpath: p.describe for p in prepared.plan.files}
+        foreseen: dict[tuple[str, str], Prose] = {}
+
+        def answer(prompt: Prompt) -> Prose:
+            allowed = describe.get(prompt.key, ()) if prompt.kind == "file" else ()
+            cached = (self._cached_prose(prompt, guard, allowed)
+                      if self.client is not None else None)
+            prose = foreseen[(prompt.kind, prompt.key)] = cached or _UNBOUGHT
+            return prose
+
+        self._walk(replace(fitted, retriever=None), answer)
+        return foreseen
+
     def price(self, prepared: Prepared, *, embedding: bool = True) -> Estimate:
         """Quote every planned call and cut the plan to the budget.
 
@@ -542,19 +602,7 @@ class Pipeline:
             allowed = describe.get(prompt.key, ()) if prompt.kind == "file" else ()
             return self._cached_prose(prompt, guard, allowed)
 
-        summaries = self._docstring_summaries(prepared)
-        for prompt in list(self._file_prompts(prepared)):
-            prose = quote(prompt)
-            if prose is not None and prose.reply.purpose:
-                summaries[prompt.key] = first_sentence(prose.reply.purpose)
-        module_summaries: dict[str, str] = {}
-        for prompt in list(self._module_prompts(prepared, summaries)):
-            prose = quote(prompt)
-            if prose is not None and prose.reply.purpose:
-                module_summaries[prompt.key] = first_sentence(prose.reply.purpose)
-        overview = self._architecture_prompt(prepared, module_summaries)
-        if overview is not None:
-            quote(overview)
+        self._walk(prepared, quote)
 
         embeddings = self._embeddings() if embedding else None
         if embeddings is not None:
@@ -599,7 +647,12 @@ class Pipeline:
     # -- the run -----------------------------------------------------------
 
     def run(
-        self, prepared: Prepared, *, resume: bool = True, force: bool = False
+        self,
+        prepared: Prepared,
+        *,
+        resume: bool = True,
+        force: bool = False,
+        checked: bool = False,
     ) -> RunSummary:
         """Send the priced plan, then compose and write every document.
 
@@ -610,11 +663,20 @@ class Pipeline:
         "interrupted". A KeyboardInterrupt in a wave, as Python raises on Ctrl-C
         when no handler sets the stop instead, is raised again once the documents
         are written. A format that fails to render is reported in `failed`,
-        the others written. A write refused for a file devdocs did not
-        write, see `write`, raises ConfigError; the answers are cached by
-        then, so running again costs nothing.
+        the others written.
+
+        A write that would be refused, see `check`, raises ConfigError
+        before anything is bought, and a KeyboardInterrupt while that is
+        checked ends the run there, writing nothing. With `checked`, the
+        caller has made that check itself: the CLI does, outside the part of
+        the run a Ctrl-C stops gracefully. A write refused later all the
+        same, as for a file that appeared meanwhile, raises ConfigError once
+        the answers bought are cached, its hint saying that running again
+        costs nothing.
         """
         client = self._client()
+        if not checked:
+            self.check(prepared, force=force)
         self._embed(prepared)
         self.price(prepared, embedding=False)
         summary = RunSummary()
@@ -655,11 +717,9 @@ class Pipeline:
 
         docset = self._compose(prepared, prose)
         budget = client.budget
-        docset.run = RunInfo(
-            generator=f"devdocs {__version__}",
+        docset.run = replace(
+            self._run_info(prepared),
             generated_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
-            git_commit=prepared.head,
-            provider=self.config.provider,
             requests=budget.requests,
             cache_hits=hits[0],
             input_tokens=sum(p.input_tokens for p in prose.values()),
@@ -932,6 +992,12 @@ class Pipeline:
             ))
         return docset
 
+    def _run_info(self, prepared: Prepared) -> RunInfo:
+        """The run's record before it counts anything: all that its
+        documents show of it, the generator and the commit, and the provider."""
+        return RunInfo(generator=f"devdocs {__version__}", git_commit=prepared.head,
+                       provider=self.config.provider)
+
     @property
     def out(self) -> Path:
         """The output directory: `config.out`, under the root when relative."""
@@ -957,6 +1023,41 @@ class Pipeline:
         return OutputWriter(self.out).write(
             files, docset, prune=prune and not self.failures, force=force
         )
+
+    def check(self, prepared: Prepared, *, force: bool = False) -> None:
+        """Raise what writing this run's documents would raise, but before
+        anything is bought, and write nothing: ConfigError for a file devdocs
+        has no record of writing where an output goes, unless `force`; for
+        a name the file system cannot hold; for an out dir devdocs cannot
+        write. See `OutputWriter.check`.
+
+        The documents are composed with the prose the cache already holds,
+        and a placeholder no page holds for prose still to buy; see
+        `_foreseen`. Their paths are the run's, as paths depend on the
+        documents alone. A page the run would write exactly as it is passes,
+        as it will then: one the cache makes so, or a stub the budget keeps a
+        stub. One that holds or sums up prose to buy counts as replaced, as it
+        is once that prose is bought. A format that fails to render is left to
+        the write, which reports it.
+        """
+        docset = self._compose(prepared, self._foreseen(prepared))
+        docset.run = self._run_info(prepared)
+        files: dict[str, bytes] = {}
+        for renderer in self._stand_ins():
+            with contextlib.suppress(DevDocsError):
+                files.update(renderer.render(docset))
+        OutputWriter(self.out).check(files, docset, force=force)
+
+    def _stand_ins(self) -> list[Renderer]:
+        """The renderers, but the builtin engine for an external PDF one: it
+        names the book alike, in a fraction of the time."""
+        return [
+            renderer_for("pdf")
+            if renderer.format == "pdf"
+            and getattr(renderer, "engine", "builtin") != "builtin"
+            else renderer
+            for renderer in self.renderers
+        ]
 
     def export(self, *, force: bool = False) -> ExportSummary:
         """Render the last run's documents again, in the configured formats.
