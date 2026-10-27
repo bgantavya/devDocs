@@ -479,9 +479,10 @@ def _generate(
         available = client.discover()
         out.info(f"{config.provider}: {len(available)} models available to this key")
         prepared = pipeline.prepare()
+        pipeline.check(prepared, force=args.force)   # buys nothing: a stop is at once
         with interrupts.paying():
             summary = pipeline.run(prepared, resume=not args.no_resume,
-                                   force=args.force)
+                                   force=args.force, checked=True)
 
     lines = [
         f"{summary.documents} documents ({summary.prose} with prose, "

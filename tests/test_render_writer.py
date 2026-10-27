@@ -783,6 +783,99 @@ class TestFailures(WriterCase):
         self.assertEqual((docs / MANIFEST).read_bytes(), before)
 
 
+class TestChecking(WriterCase):
+    """`check` is `write` up to its probes: it refuses what `write` would,
+    with the same error, and changes nothing."""
+
+    def check(self, files: dict[str, bytes], *, force: bool = False) -> None:
+        OutputWriter(self.out).check(files, self.docset, force=force)
+
+    def assert_refused_alike(self, files: dict[str, bytes]) -> ConfigError:
+        """The error `check` raises for `files`, once it is the one `write`
+        raises next, and once the check is seen to change nothing."""
+        before = (self.out.exists(), self.tree(), self.dirs())
+        with self.assertRaises(ConfigError) as checked:
+            self.check(files)
+        self.assertEqual((self.out.exists(), self.tree(), self.dirs()), before)
+        with self.assertRaises(ConfigError) as written:
+            self.write(files)
+        error = checked.exception
+        self.assertEqual((error.message, error.hint),
+                         (written.exception.message, written.exception.hint))
+        return error
+
+    def test_a_file_devdocs_did_not_write(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.plant("README.md")
+        error = self.assert_refused_alike({"a.md": b"A2\n", "README.md": b"R\n"})
+        self.assertIn("devdocs has no record of writing: README.md", error.message)
+        self.check({"a.md": b"A2\n", "README.md": b"R\n"}, force=True)
+        self.assertEqual(self.tree()["README.md"], b"hand-written\n")
+
+    def test_a_manifest_devdocs_cannot_read(self) -> None:
+        self.plant(MANIFEST, b'{"another": "tool"}\n')
+        self.assert_refused_alike({"a.md": b"A\n"})
+
+    def test_a_directory_in_the_way(self) -> None:
+        (self.out / "a.md").mkdir(parents=True)
+        self.assert_refused_alike({"a.md": b"A\n"})
+
+    def test_a_name_the_file_system_cannot_hold(self) -> None:
+        for name in (f"{ODD}.py.md", f"new/{ODD}/x.py.md"):
+            with self.subTest(name=name), unnameable(ODD):
+                self.assert_refused_alike({"a.md": b"A\n", name: b"X\n"})
+        self.assertFalse(self.out.exists())
+
+    @unittest.skipIf(os.name == "nt", "Windows has its own limits and errors")
+    def test_a_name_too_long(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.assert_refused_alike({"a.md": b"A\n", f"new/{'x' * 300}.md": b"X\n"})
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_an_out_dir_devdocs_cannot_write(self) -> None:
+        self.write({"a.md": b"A\n"})
+        os.chmod(self.out, 0o555)
+        self.addCleanup(os.chmod, self.out, 0o755)
+        error = self.assert_refused_alike({"a.md": b"A2\n"})
+        self.assertEqual(error.hint, f"devdocs needs write access to {self.out}")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_an_out_dir_that_cannot_be_made(self) -> None:
+        site = self.base / "site"
+        site.mkdir()
+        os.chmod(site, 0o555)
+        self.addCleanup(os.chmod, site, 0o755)
+        self.out = site / "docs"
+        self.assert_refused_alike({"a.md": b"A\n"})
+
+    def test_a_check_that_passes_changes_nothing(self) -> None:
+        self.check({"a.md": b"A\n", "sub/deep/b.md": b"B\n"})
+        self.assertFalse(self.out.exists())
+        self.write({"a.md": b"A\n"})
+        before = (self.tree(), self.dirs())
+        self.check({"a.md": b"A2\n", "new/deep/c.md": b"C\n"})
+        self.assertEqual((self.tree(), self.dirs()), before)
+
+    def test_a_check_cut_short_leaves_nothing_behind(self) -> None:
+        # As a Ctrl-C does, with a probe's temp file made and a directory too.
+        real_close = os.close
+        closed: list[int] = []
+
+        def interrupted(handle: int) -> None:
+            real_close(handle)
+            closed.append(handle)
+            if len(closed) == 3:
+                raise KeyboardInterrupt
+
+        with mock.patch("devdocs.render.os.close", side_effect=interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            self.check({"a.md": b"A\n", "sub/b.md": b"B\n", "sub/c.md": b"C\n"})
+        self.assertEqual(len(closed), 3)
+        self.assertFalse(self.out.exists())
+
+
 class TestAdding(WriterCase):
     """`add`, as export uses it: new files join the last write's, whose
     record is kept exactly as it was."""

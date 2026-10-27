@@ -248,16 +248,18 @@ class TestOverV3Docs(CliCase):
         return {name: (self.docs / name).read_text(encoding="utf-8") for name in pages}
 
     def test_its_pages_are_kept_until_forced(self) -> None:
+        # Regression: every v3 line over v3 docs paid for its calls, then
+        # refused to write.
         pages = {"README.md": _V3_PAGE, "shop/cart.md": _V3_PAGE}
         self.plant(pages)
         code, _, err = self.run_cli("-p", ".", "--api-key", "k")
         self.assertEqual(code, 2)
         self.assertIn("has no record of writing: README.md, shop/cart.md", err)
         self.assertEqual(self.found(pages), pages)
-        calls = len(self.model.calls)
+        self.assertEqual(self.model.calls, [])
         code, _, err = self.run_cli("-p", ".", "--api-key", "k", "--force")
         self.assertEqual(code, 0, err)
-        self.assertEqual(len(self.model.calls), calls)
+        self.assertGreater(len(self.model.calls), 0)
         listed = json.loads((self.docs / "index.json").read_bytes())["files"]
         for name, text in self.found(pages).items():
             self.assertNotEqual(text, _V3_PAGE, name)

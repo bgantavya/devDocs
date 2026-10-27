@@ -11,11 +11,10 @@ The pages go where v3 put them, in its per-file layout: under `--output` in
 the current directory, at the project's path from there, so `-p app` writes
 docs/app/ and leaves app/docs/ alone. Nothing is forced, by `--overwrite` or
 otherwise. v4 never replaces a file it has no record of writing, and v3 kept
-no record, so over a v3 tree the run stops before writing and names the
-pages; `--force` then takes them over at no cost, the model's answers being
-cached. Forcing every run would also replace hand-written files at paths
-only v4 writes (architecture.md, index.md, index.json), which v3 never
-touched.
+no record, so over a v3 tree the run stops before it buys anything and names
+the pages; `--force` then takes them over. Forcing every run would also
+replace hand-written files at paths only v4 writes (architecture.md,
+index.md, index.json), which v3 never touched.
 
 Three flags change meaning, deliberately. `--include` and `--exclude` were
 inverted in v3 (an include landed on the skip list); they now do what their

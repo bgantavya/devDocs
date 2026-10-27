@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 from typing import Any
@@ -185,6 +186,18 @@ class TestExport(ExportCase):
         self.generate()
         self.assertFalse((self.docs / "index.html").exists())
         self.assertTrue((self.docs / ".nojekyll").is_file())
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_an_out_dir_it_cannot_write_is_named_and_left_alone(self) -> None:
+        # Export buys nothing, so needs no check first: its write refuses.
+        os.chmod(self.docs, 0o555)
+        self.addCleanup(os.chmod, self.docs, 0o755)
+        code, _, err = self.export("--format", "pdf")
+        self.assertEqual(code, 2)
+        self.assertIn(f"hint: devdocs needs write access to {self.docs.resolve()}",
+                      err)
+        self.assertEqual(tree(self.docs), self.generated)
 
     def test_force_replaces_a_hand_written_page(self) -> None:
         (self.docs / "index.html").write_bytes(b"<p>Ours.</p>\n")
