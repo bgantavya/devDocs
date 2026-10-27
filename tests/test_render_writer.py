@@ -29,6 +29,7 @@ from devdocs.render import (
     OutputWriter,
     Renderer,
     WriteReport,
+    generated_files,
     read_manifest,
     renderer_for,
 )
@@ -874,6 +875,347 @@ class TestChecking(WriterCase):
             self.check({"a.md": b"A\n", "sub/b.md": b"B\n", "sub/c.md": b"C\n"})
         self.assertEqual(len(closed), 3)
         self.assertFalse(self.out.exists())
+
+
+class TestOutAsGiven(WriterCase):
+    """Every file call goes to what `out` names once its missing directories
+    are made, the check's as much as the write's, and every message keeps
+    `out` as given."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.given = self.out / "new" / ".."
+
+    def test_a_directory_not_made_yet_hides_no_file(self) -> None:
+        """Regression: `new/..` led nowhere until `new` was made, so the look
+        found nothing, and the rename, by then with `new` made, replaced the
+        hand-written README.md without `force`."""
+        self.plant("README.md")
+        writer = OutputWriter(self.given)
+        for act in (writer.check, writer.write):
+            with self.subTest(act=act.__name__):
+                with self.assertRaises(ConfigError) as caught:
+                    act({"README.md": b"R\n"}, self.docset)
+                self.assertEqual(caught.exception.message, (
+                    f"refusing to replace 1 file in {self.given} that devdocs has "
+                    "no record of writing: README.md"))
+                self.assertEqual(self.tree(), {"README.md": b"hand-written\n"})
+                self.assertEqual(self.dirs(), [])
+
+    def test_a_relative_out_is_looked_through_and_named_as_given_too(self) -> None:
+        self.plant("README.md")
+        given = Path("docs", "new", "..")
+        with contextlib.chdir(self.base), self.assertRaises(ConfigError) as caught:
+            OutputWriter(given).write({"README.md": b"R\n"}, self.docset)
+        self.assertEqual(caught.exception.message, (
+            f"refusing to replace 1 file in {given} that devdocs has no record of "
+            "writing: README.md"))
+        self.assertEqual(self.tree(), {"README.md": b"hand-written\n"})
+
+    def test_adding_refuses_it_too(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.plant("README.md")
+        with self.assertRaises(ConfigError) as caught:
+            OutputWriter(self.given).add({"README.md": b"R\n"})
+        self.assertIn("no record of writing: README.md", caught.exception.message)
+        self.assertEqual(self.tree()["README.md"], b"hand-written\n")
+        self.assertEqual(self.dirs(), [])
+
+    def test_force_replaces_it_and_no_directory_is_made_on_the_way(self) -> None:
+        self.plant("README.md")
+        OutputWriter(self.given).write({"README.md": b"R\n"}, self.docset, force=True)
+        self.assertEqual(self.tree()["README.md"], b"R\n")
+        self.assertEqual(self.dirs(), [])
+
+    def test_directories_past_it_are_made_and_it_is_not(self) -> None:
+        OutputWriter(self.given / "deep" / "er").write({"a.md": b"A\n"}, self.docset)
+        self.assertEqual(self.dirs(), ["deep", "deep/er"])
+        self.assertEqual(sorted(self.tree()),
+                         ["deep/er/a.md", f"deep/er/{MANIFEST}"])
+
+    def test_a_check_that_passes_makes_nothing_there(self) -> None:
+        OutputWriter(self.given / "deep").check({"sub/a.md": b"A\n"}, self.docset)
+        self.assertFalse(self.out.exists())
+
+    def test_the_manifest_is_found_there(self) -> None:
+        """Regression: a run spelling `out` so found no record of the run
+        before it, so took its pages for files it never wrote, and `export`
+        said nothing was generated."""
+        self.write({"a.md": b"A\n", "old.md": b"O\n"})
+        self.assertEqual(generated_files(self.given), {"a.md", "old.md"})
+        self.assertEqual(read_manifest(self.given).project, "demo")
+        report = OutputWriter(self.given).write({"a.md": b"A2\n"}, self.docset)
+        self.assertEqual(report, WriteReport(written=["a.md", MANIFEST],
+                                             removed=["old.md"]))
+        report = OutputWriter(self.given).add({"b.md": b"B\n"})
+        self.assertEqual(report.written, ["b.md", MANIFEST])
+        self.assertEqual(self.manifest()["files"], ["a.md", "b.md"])
+        self.assertEqual(self.dirs(), [])
+
+    def test_a_missing_manifest_is_named_as_given(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            read_manifest(self.given)
+        self.assertEqual(
+            caught.exception.message,
+            f"no generated documentation in {self.given}: {MANIFEST} is missing")
+        with self.assertRaises(ConfigError) as caught:
+            OutputWriter(self.given).add({"a.md": b"A\n"})
+        self.assertEqual(caught.exception.message,
+                         f"no devdocs manifest in {self.given} to add files to")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_above_it_is_named_by_its_shortest_spelling(self) -> None:
+        site = self.base / "site"
+        site.mkdir()
+        os.chmod(site, 0o555)
+        self.addCleanup(os.chmod, site, 0o755)
+        given = site / "new" / ".." / "docs"
+        with self.assertRaises(ConfigError) as caught:
+            OutputWriter(given).write({"a.md": b"A\n"}, self.docset)
+        self.assertEqual(caught.exception.message,
+                         f"cannot write to {given}: {os.strerror(errno.EACCES)}")
+        self.assertEqual(caught.exception.hint, f"devdocs needs write access to {site}")
+
+    @unittest.skipIf(os.name == "nt", "Windows has its own limits and errors")
+    def test_a_name_too_long_past_it_is_the_outs_to_shorten(self) -> None:
+        """The kernel stops at `new`, so only the real path meets the long
+        name; it is still the out's, not a source file's, to shorten."""
+        given = self.base / "new" / ".." / ("d" * 300) / "docs"
+        writer = OutputWriter(given)
+        for act in (writer.check, writer.write):
+            with self.subTest(act=act.__name__):
+                with self.assertRaises(ConfigError) as caught:
+                    act({"a.md": b"A\n"}, self.docset)
+                self.assertEqual(caught.exception.message, (
+                    f"cannot write to {given}: {os.strerror(errno.ENAMETOOLONG)}"))
+                self.assertEqual(caught.exception.hint,
+                                 "choose an --out with a shorter path")
+                self.assertEqual(os.listdir(self.base), [])
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_inside_it_is_named_from_it(self) -> None:
+        self.write({"sub/a.md": b"A\n"})
+        os.chmod(self.out / "sub", 0o555)
+        self.addCleanup(os.chmod, self.out / "sub", 0o755)
+        with self.assertRaises(ConfigError) as caught:
+            OutputWriter(self.given).write({"sub/a.md": b"A2\n"}, self.docset)
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot write sub/a.md in {self.given}: {os.strerror(errno.EACCES)}")
+        self.assertEqual(caught.exception.hint,
+                         f"devdocs needs write access to {self.given / 'sub'}")
+
+    def test_a_locked_file_is_named_from_it(self) -> None:
+        self.write({"a.md": b"A\n"})
+
+        def locked(source: Any, target: Any) -> None:
+            raise PermissionError(errno.EACCES, "locked", os.fspath(source), None,
+                                  os.fspath(target))
+
+        with mock.patch("devdocs.render.os.replace", side_effect=locked), \
+                self.assertRaises(ConfigError) as caught:
+            OutputWriter(self.given).write({"a.md": b"A2\n"}, self.docset)
+        self.assertEqual(caught.exception.message,
+                         f"cannot write a.md in {self.given}: locked")
+        self.assertEqual(caught.exception.hint, (
+            f"{self.given / 'a.md'} is locked or read-only: close any program that "
+            "has it open, or clear its read-only or immutable flag, then run again"))
+
+    @unittest.skipIf(os.name == "nt", "reading a directory is EACCES on Windows")
+    def test_a_manifest_it_cannot_read_is_named_once_as_given(self) -> None:
+        """Regression: the OSError's own text added the real path, a second
+        spelling of one file."""
+        (self.out / MANIFEST).mkdir(parents=True)
+        with self.assertRaises(ConfigError) as caught:
+            read_manifest(self.given)
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot read {self.given / MANIFEST}: {os.strerror(errno.EISDIR)}")
+
+    def test_a_read_error_with_no_reason_of_its_own_is_shown_whole(self) -> None:
+        self.write({"a.md": b"A\n"})
+        with mock.patch("devdocs.render.json.loads", side_effect=OSError("boom")), \
+                self.assertRaises(ConfigError) as caught:
+            read_manifest(self.given)
+        self.assertEqual(caught.exception.message,
+                         f"cannot read {self.given / MANIFEST}: boom")
+
+
+@unittest.skipIf(os.name == "nt", "Windows reads `..` before it looks at anything")
+class TestOutTheKernelRefuses(WriterCase):
+    """`os.path.realpath` reads `afile/..` as the directory holding `afile`,
+    but the kernel refuses that spelling, and no directory made could change
+    its mind. So it stays refused, by the check and `force` alike, as it was
+    before writes went through the real path. Regression: it ran, and wrote."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.afile = self.base / "afile"
+        self.afile.write_bytes(b"x\n")
+        self.given = self.afile / ".." / "docs"
+
+    def assert_write_refused(self, given: Path, reason: int, hint: str = "") -> None:
+        """The check and the write refuse `given`, for `reason`, naming it."""
+        writer = OutputWriter(given)
+        for act in (writer.check, writer.write):
+            for force in (False, True):
+                with self.subTest(act=act.__name__, force=force):
+                    with self.assertRaises(ConfigError) as caught:
+                        act({"a.md": b"A\n"}, self.docset, force=force)
+                    self.assertEqual(caught.exception.message,
+                                     f"cannot write to {given}: {os.strerror(reason)}")
+                    if hint:
+                        self.assertEqual(caught.exception.hint, hint)
+
+    def test_a_regular_file_in_the_way(self) -> None:
+        self.assert_write_refused(self.given, errno.ENOTDIR, "a file or directory is "
+                                  "in the way: move it away or choose another --out")
+        self.assertFalse(self.out.exists())
+
+    def test_it_writes_nothing_where_it_would_have_landed(self) -> None:
+        self.plant("afile")
+        self.plant("README.md")
+        before = self.tree()
+        self.assert_write_refused(self.out / "afile" / "..", errno.ENOTDIR)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_link_to_a_regular_file_in_the_way(self) -> None:
+        link = self.base / "link"
+        try:
+            link.symlink_to(self.afile)
+        except (OSError, NotImplementedError) as err:
+            self.skipTest(f"symlinks unavailable: {err}")
+        self.assert_write_refused(link / ".." / "docs", errno.ENOTDIR)
+        self.assertFalse(self.out.exists())
+
+    def test_nothing_is_read_through_it_either(self) -> None:
+        self.write({"a.md": b"A\n"})
+        before = self.tree()
+        self.assertEqual(generated_files(self.given), set())
+        with self.assertRaises(ConfigError) as caught:
+            read_manifest(self.given)
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot read {self.given / MANIFEST}: {os.strerror(errno.ENOTDIR)}")
+        with self.assertRaises(ConfigError):
+            OutputWriter(self.given).add({"b.md": b"B\n"})
+        self.assertEqual(self.tree(), before)
+
+    def test_a_name_too_long_to_make(self) -> None:
+        given = self.base / ("x" * 300) / ".." / "docs"
+        self.assert_write_refused(given, errno.ENAMETOOLONG,
+                                  "choose an --out with a shorter path")
+        self.assertFalse(self.out.exists())
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_it_may_not_pass_through(self) -> None:
+        shut = self.base / "shut"
+        shut.mkdir()
+        os.chmod(shut, 0)
+        self.addCleanup(os.chmod, shut, 0o755)
+        self.assert_write_refused(shut / ".." / "docs", errno.EACCES)
+        self.assertFalse(self.out.exists())
+
+    def test_a_directory_not_made_yet_still_leads_past_a_file(self) -> None:
+        """The kernel stops at `new`, so never gets to the file; the real path
+        is then all there is to go by, and it makes no `new`. A limit, not a
+        promise: nothing it writes escapes the guard on `docs`."""
+        given = self.base / "new" / ".." / "afile" / ".." / "docs"
+        self.plant("README.md")
+        with self.assertRaises(ConfigError) as caught:
+            OutputWriter(given).write({"README.md": b"R\n"}, self.docset)
+        self.assertIn("no record of writing: README.md", caught.exception.message)
+        OutputWriter(given).write({"a.md": b"A\n"}, self.docset)
+        self.assertEqual(self.tree()["a.md"], b"A\n")
+        self.assertFalse((self.base / "new").exists())
+
+
+@unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+class TestOutThroughALink(WriterCase):
+    """An `out` that is a link leads where it leads, even to a directory not
+    made yet, once a file in the way; messages name the link."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.real = self.base / "real"
+        self.out = self.base / "link"
+        self.out.symlink_to(self.real, target_is_directory=True)
+
+    def test_a_link_to_a_directory_not_made_yet_leads_to_it(self) -> None:
+        self.write({"a.md": b"A\n"})
+        self.assertTrue(self.out.is_symlink())
+        self.assertEqual((self.real / "a.md").read_bytes(), b"A\n")
+
+    def test_what_is_behind_a_link_is_refused_and_named_through_it(self) -> None:
+        self.real.mkdir()
+        (self.real / "README.md").write_bytes(b"hand-written\n")
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"README.md": b"R\n"})
+        self.assertEqual(caught.exception.message, (
+            f"refusing to replace 1 file in {self.out} that devdocs has no record "
+            "of writing: README.md"))
+        self.assertEqual((self.real / "README.md").read_bytes(), b"hand-written\n")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_behind_a_link_is_named_through_it(self) -> None:
+        self.real.mkdir()
+        os.chmod(self.real, 0o555)
+        self.addCleanup(os.chmod, self.real, 0o755)
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n"})
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot write index.json in {self.out}: {os.strerror(errno.EACCES)}")
+        self.assertEqual(caught.exception.hint,
+                         f"devdocs needs write access to {self.out}")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_only_a_link_leads_to_is_named_itself(self) -> None:
+        """The directory above the link's target has no name through `out`."""
+        self.real.mkdir()
+        target = self.real / "docs"
+        self.out.unlink()
+        self.out.symlink_to(target, target_is_directory=True)
+        os.chmod(self.real, 0o555)
+        self.addCleanup(os.chmod, self.real, 0o755)
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n"})
+        self.assertEqual(caught.exception.message,
+                         f"cannot write to {self.out}: {os.strerror(errno.EACCES)}")
+        self.assertEqual(caught.exception.hint,
+                         f"devdocs needs write access to {self.real.resolve()}")
+
+    def test_a_link_loop_is_named_as_any_other_failure(self) -> None:
+        # Path.resolve raises RuntimeError for one before 3.13.
+        self.out.unlink()
+        self.out.symlink_to(self.out)
+        with self.assertRaises(ConfigError) as caught:
+            self.write({"a.md": b"A\n"})
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot write index.json in {self.out}: {os.strerror(errno.ELOOP)}")
+        with self.assertRaises(ConfigError):
+            OutputWriter(self.out).check({"a.md": b"A\n"}, self.docset)
+        with self.assertRaises(ConfigError) as caught:
+            read_manifest(self.out)
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot read {self.out / MANIFEST}: {os.strerror(errno.ELOOP)}")
+        self.assertEqual(generated_files(self.out), set())
+
+    def test_a_manifest_it_cannot_read_is_named_through_it(self) -> None:
+        # Regression: as for `new/..`, the OSError's text added the real path.
+        (self.real / MANIFEST).mkdir(parents=True)
+        with self.assertRaises(ConfigError) as caught:
+            read_manifest(self.out)
+        self.assertEqual(
+            caught.exception.message,
+            f"cannot read {self.out / MANIFEST}: {os.strerror(errno.EISDIR)}")
 
 
 class TestAdding(WriterCase):

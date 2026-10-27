@@ -42,6 +42,7 @@ import builtins
 import contextlib
 import hashlib
 import json
+import os
 import posixpath
 import sys
 import time
@@ -377,7 +378,8 @@ class Pipeline:
         run wrote them. Hand-written files beside them are scanned as usual."""
         found = {posixpath.dirname(item.relpath) for item in scan.files
                  if posixpath.basename(item.relpath) == MANIFEST}
-        out = self.out.resolve()
+        # not resolve(): before 3.13 it raises on a symlink loop
+        out = Path(os.path.realpath(self.out))
         if out.is_relative_to(self.root):
             base = out.relative_to(self.root).as_posix()
             found.add("" if base == "." else base)
