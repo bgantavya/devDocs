@@ -5,9 +5,11 @@ key and no model, keeping every file the run wrote."""
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
+import shutil
 import unittest
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,57 @@ class ExportCase(CliCase):
     def manifest(self) -> dict[str, Any]:
         data: dict[str, Any] = json.loads((self.docs / MANIFEST).read_bytes())
         return data
+
+
+class TestOutInARun(CliCase):
+    """`--out` in a whole run: `shop/new/..`, where `new` does not exist yet;
+    `afile/../docs`, through a regular file; and `loop`, a link to itself."""
+
+    def test_a_run_refuses_before_it_buys_anything(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        hand = self.root / "shop" / "README.md"
+        hand.write_text("# Ours\n", encoding="utf-8")
+        argv = ("generate", str(self.root), "--api-key", "k", "--out", "shop/new/..")
+        code, _, err = self.run_cli(*argv)
+        self.assertEqual(code, 2)
+        self.assertIn("no record of writing: README.md", err)
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(hand.read_text(encoding="utf-8"), "# Ours\n")
+        self.assertFalse((self.root / "shop" / "new").exists())
+        code, _, err = self.run_cli(*argv, "--force")
+        self.assertEqual(code, 0, err)
+        self.assertNotEqual(hand.read_text(encoding="utf-8"), "# Ours\n")
+        self.assertFalse((self.root / "shop" / "new").exists())
+        code, _, err = self.run_cli(*argv)
+        self.assertEqual(code, 0, err)   # its own pages now, on its own record
+
+    @unittest.skipIf(os.name == "nt", "Windows reads `..` before it looks at anything")
+    def test_a_run_through_a_regular_file_buys_nothing(self) -> None:
+        # Regression: the real path read it as the directory beside the file.
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "afile").write_text("x\n", encoding="utf-8")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--out", "afile/../docs")
+        self.assertEqual(code, 2)
+        self.assertIn(f"cannot write to {self.root.resolve() / 'afile/../docs'}: "
+                      f"{os.strerror(errno.ENOTDIR)}", err)
+        self.assertEqual(self.model.calls, [])
+        self.assertFalse((self.root / "docs").exists())
+
+    @unittest.skipIf(os.name == "nt", "a symlink needs a privilege on Windows")
+    def test_a_run_into_a_symlink_loop_buys_nothing(self) -> None:
+        # Regression: before 3.13 both ended in an internal error, exit 1.
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        os.symlink("loop", self.root / "loop")
+        code, _, err = self.run_cli("estimate", str(self.root), "--out", "loop")
+        self.assertEqual(code, 0, err)
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--out", "loop")
+        self.assertEqual(code, 2, err)
+        self.assertIn(f"{os.strerror(errno.ELOOP)}\n  hint: check that devdocs can "
+                      f"write to {self.root.resolve() / 'loop'}", err)
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(os.readlink(self.root / "loop"), "loop")
 
 
 class TestExport(ExportCase):
@@ -197,6 +250,23 @@ class TestExport(ExportCase):
         self.assertEqual(code, 2)
         self.assertIn(f"hint: devdocs needs write access to {self.docs.resolve()}",
                       err)
+        self.assertEqual(tree(self.docs), self.generated)
+
+    def test_an_out_through_a_directory_not_made_yet_is_found(self) -> None:
+        # Regression: `docs/new/..` led to no manifest until `new` was made.
+        code, _, err = self.export("--format", "html", "--out", "docs/new/..")
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.docs / "index.html").is_file())
+        self.assertFalse((self.docs / "new").exists())
+
+    @unittest.skipIf(os.name == "nt", "Windows reads `..` before it looks at anything")
+    def test_an_out_through_a_regular_file_is_not_followed(self) -> None:
+        (self.root / "afile").write_text("x\n", encoding="utf-8")
+        code, _, err = self.export("--format", "html", "--out", "afile/../docs")
+        self.assertEqual(code, 2)
+        given = self.root.resolve() / "afile/../docs"
+        self.assertIn(f"cannot read {given / MANIFEST}: "
+                      f"{os.strerror(errno.ENOTDIR)}", err)
         self.assertEqual(tree(self.docs), self.generated)
 
     def test_force_replaces_a_hand_written_page(self) -> None:
