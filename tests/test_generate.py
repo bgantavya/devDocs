@@ -7,10 +7,13 @@ client, composition, rendering and writing end to end.
 
 from __future__ import annotations
 
+import errno
 import functools
 import hashlib
 import json
+import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -18,6 +21,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -29,7 +33,7 @@ from devdocs.errors import (
     ProviderError,
     RateLimited,
 )
-from devdocs.generate import Pipeline
+from devdocs.generate import Pipeline, Prepared
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
@@ -43,6 +47,7 @@ from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet
 from devdocs.render.pdf import PdfRenderer, external
 from devdocs.render.pdf.check import PdfFile, check
+from tests.test_render_writer import unnameable
 
 PROJECT = {
     "pyproject.toml": '[project]\nname = "shop"\n',
@@ -109,6 +114,7 @@ class TaggedModel:
 
 
 PROSE = "Implements part of the shop."      # TaggedModel's answer for a file
+NO_CALL_FITS = 0.0000001                    # a budget, in USD, that buys nothing
 
 
 class PipelineCase(unittest.TestCase):
@@ -359,6 +365,287 @@ class TestStop(PipelineCase):
         self.assertTrue(self.client.stop.is_set())
         self.assertIn("README.md", self.docs())
         self.assertEqual(self.last_run(), "interrupted")
+
+
+class FirstRender(MarkdownRenderer):
+    """Markdown whose first render, the run's check of its output, comes
+    with `act`: a stop request, say, or Python's own Ctrl-C."""
+
+    def __init__(self, act: Callable[[], None]) -> None:
+        super().__init__()
+        self.act: Callable[[], None] | None = act
+
+    def render(self, docset: DocSet) -> dict[str, bytes]:
+        act, self.act = self.act, None
+        if act is not None:
+            act()
+        return super().render(docset)
+
+
+class NoFiles(TaggedModel):
+    """Refuses every file prompt, so a run buys only the summing up."""
+
+    def generate(self, request: Request) -> Completion:
+        if "RELATION" not in request.system and "OVERVIEW" not in request.system:
+            raise ProviderError("refused", status=400)
+        return super().generate(request)
+
+
+class Attentive(TaggedModel):
+    """Sums a module up by what its prompt says of the files, as a model
+    does: their prose, once bought, changes its answer."""
+
+    def generate(self, request: Request) -> Completion:
+        if "RELATION" in request.system and PROSE.rstrip(".") in request.prompt:
+            self.calls.append(request)
+            return Completion("PURPOSE: Holds the parts of a shop.\n", request.model,
+                              "gemini", Finish.STOP,
+                              Usage(input_tokens=500, output_tokens=60))
+        return super().generate(request)
+
+
+class TestCheckedFirst(PipelineCase):
+    """What the write would refuse is refused before anything is bought."""
+
+    def plant(self, relpath: str, text: str = "# Ours\n") -> None:
+        page = self.tmp / "docs" / relpath
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(text, encoding="utf-8")
+
+    def refused(self, pipeline: Pipeline) -> ConfigError:
+        """The run's refusal, once it is checked that nothing was bought and
+        no run recorded."""
+        def runs() -> list[tuple[Any, ...]]:
+            return [tuple(row) for row in self.db.query("SELECT * FROM run")]
+
+        before, calls = runs(), len(self.model.calls)
+        with self.assertRaises(ConfigError) as caught:
+            pipeline.run(pipeline.prepare())
+        self.assertEqual(self.model.calls[calls:], [])
+        self.assertEqual(runs(), before)
+        return caught.exception
+
+    def stubbed(self) -> None:
+        """A first run whose budget buys nothing, so every page is a stub."""
+        first = self.pipeline(max_cost=NO_CALL_FITS)
+        self.assertEqual(first.run(first.prepare()).prose, 0)
+        self.assertEqual(self.model.calls, [])
+
+    def test_a_file_devdocs_did_not_write_costs_nothing(self) -> None:
+        # Regression: every call was paid for, then the write refused.
+        self.plant("README.md")
+        pipeline = self.pipeline()
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, (
+            f"refusing to replace 1 file in {pipeline.out} that devdocs has no "
+            "record of writing: README.md"))
+        self.assertEqual(error.hint,
+                         "move it away or choose another --out; --force replaces it")
+        self.assertEqual(self.docs(), {"README.md": "# Ours\n"})
+
+        forced = self.pipeline()
+        self.assertGreater(forced.run(forced.prepare(), force=True).prose, 0)
+        self.assertIn("Generated by devdocs", self.docs()["README.md"])
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_an_out_dir_devdocs_cannot_write_costs_nothing(self) -> None:
+        docs = self.tmp / "docs"
+        docs.mkdir()
+        docs.chmod(0o555)
+        self.addCleanup(docs.chmod, 0o755)
+        pipeline = self.pipeline()
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, f"cannot write index.json in {pipeline.out}: "
+                                        f"{os.strerror(errno.EACCES)}")
+        self.assertEqual(error.hint, f"devdocs needs write access to {pipeline.out}")
+
+    def test_a_page_the_file_system_cannot_name_costs_nothing(self) -> None:
+        # As macOS cannot name a Linux file's bytes that are not UTF-8.
+        (self.tmp / "shop" / "odd.py").write_text('"""Odd."""\n', encoding="utf-8")
+        pipeline = self.pipeline()
+        with unnameable("odd.py"):
+            error = self.refused(pipeline)
+        self.assertEqual(error.message, (
+            f"cannot write shop/odd.py.md in {pipeline.out}: the file system "
+            f"cannot name it ({os.strerror(errno.EILSEQ)})"))
+        self.assertFalse((self.tmp / "docs").exists())
+
+    def test_pages_already_right_are_no_conflict_without_a_manifest(self) -> None:
+        # The check composes with the prose the cache holds: stubs would make
+        # devdocs's own pages, the manifest lost, look like another's. (Not
+        # HTML: without its manifest, the site's scripts are scanned as source.)
+        formats = ("markdown", "pdf")
+        first = self.pipeline(formats=formats)
+        first.run(first.prepare())
+        (self.tmp / "docs" / "index.json").unlink()
+        calls = len(self.model.calls)
+        again = self.pipeline(formats=formats)
+        summary = again.run(again.prepare())
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertEqual(summary.written.written, ["index.json"])
+
+    def test_stubs_whose_prose_is_to_buy_are_replaced_pages(self) -> None:
+        # Regression: the check made these pages as the stubs they were, so
+        # passed; the run bought their prose, then refused to write it.
+        self.stubbed()
+        (self.tmp / "docs" / "index.json").unlink()
+        pipeline = self.pipeline()
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, (
+            f"refusing to replace 7 files in {pipeline.out} that devdocs has no "
+            "record of writing: README.md, architecture.md, shop/__init__.py.md, "
+            "shop/cart.py.md, shop/cli.py.md and 2 more"))
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_stubs_whose_prose_is_to_buy_are_probed(self) -> None:
+        # Regression: taken for unchanged, they went unprobed until paid for.
+        self.stubbed()
+        shop = self.tmp / "docs" / "shop"
+        shop.chmod(0o555)
+        self.addCleanup(shop.chmod, 0o755)
+        pipeline = self.pipeline()
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, f"cannot write shop/__init__.py.md in "
+                                        f"{pipeline.out}: {os.strerror(errno.EACCES)}")
+
+    def test_stubs_the_budget_keeps_stubs_are_no_conflict_without_a_manifest(
+        self,
+    ) -> None:
+        # Regression: the check took their prose for bought; the run, which
+        # buys none, would write them again as they are.
+        self.stubbed()
+        (self.tmp / "docs" / "index.json").unlink()
+        again = self.pipeline(max_cost=NO_CALL_FITS)
+        summary = again.run(again.prepare())
+        self.assertEqual((summary.prose, self.model.calls), (0, []))
+        self.assertEqual(summary.written.written, ["index.json"])
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_stubs_the_budget_keeps_stubs_need_no_writing(self) -> None:
+        # Regression: the check probed them, in a directory no write would touch.
+        self.stubbed()
+        shop = self.tmp / "docs" / "shop"
+        shop.chmod(0o555)
+        self.addCleanup(shop.chmod, 0o755)
+        again = self.pipeline(max_cost=NO_CALL_FITS)
+        summary = again.run(again.prepare())
+        self.assertEqual((summary.prose, self.model.calls), (0, []))
+        self.assertEqual(summary.written.unchanged[:1], ["README.md"])
+
+    def at_the_edge(self, page: str) -> Pipeline:
+        """A run whose budget fits shop/cart.py's prompt only without the
+        context it carries: the run leaves its page a stub and buys
+        shop/cli.py's with that money. `page`, as a stub, is all docs/ holds."""
+        probe = self.pipeline(max_cost=0)
+        prepared = probe.prepare()
+
+        def costs(of: Prepared) -> dict[str, float]:
+            return {item.key: item.cost
+                    for item in probe.price(of, embedding=False).items}
+
+        full, bare = costs(prepared), costs(replace(prepared, retriever=None))
+        budget = (full["shop/cart.py"] + bare["shop/cart.py"]) / 2
+        self.assertGreater(budget, full["shop/cli.py"])
+        self.stubbed()
+        docs = self.tmp / "docs"
+        stub = (docs / page).read_text("utf-8")
+        shutil.rmtree(docs)
+        self.plant(page, stub)
+        return self.pipeline(max_cost=budget)
+
+    def test_a_stub_the_budget_will_replace_is_found_by_the_runs_prices(self) -> None:
+        # Regression: priced without its context, shop/cart.py took the money
+        # in the check, so this stub seemed to stay; the run paid, then refused.
+        pipeline = self.at_the_edge("shop/cli.py.md")
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, (
+            f"refusing to replace 1 file in {pipeline.out} that devdocs has no "
+            "record of writing: shop/cli.py.md"))
+
+    def test_a_stub_the_budget_will_keep_is_found_by_the_runs_prices(self) -> None:
+        pipeline = self.at_the_edge("shop/cart.py.md")
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual([request.tag for request in self.model.calls], ["shop/cli.py"])
+        self.assertEqual(summary.prose, 1)
+
+    def test_with_no_client_all_prose_is_still_to_buy(self) -> None:
+        self.stubbed()
+        (self.tmp / "docs" / "index.json").unlink()
+        pipeline = Pipeline(Config(path=self.tmp))
+        with self.assertRaises(ConfigError) as caught:
+            pipeline.check(pipeline.prepare())
+        self.assertIn("refusing to replace 7 files", caught.exception.message)
+
+    def test_the_check_leaves_the_plan_to_the_run(self) -> None:
+        for budget in (NO_CALL_FITS, 0.0):
+            with self.subTest(budget=budget):
+                pipeline = self.pipeline(max_cost=budget)
+                prepared = pipeline.prepare()
+                calls = prepared.plan.calls()
+                self.assertGreater(calls, 0)
+                pipeline.check(prepared)
+                self.assertEqual(
+                    (prepared.plan.calls(), prepared.prompts),
+                    (calls, {}))
+
+    def test_a_page_summing_up_prose_to_buy_is_a_replaced_page(self) -> None:
+        # Regression: the module's answer, cached from a run that had only
+        # docstrings for its files, made the overview's summary of it look
+        # final; the run bought the files' prose, so a new module answer.
+        self.model = NoFiles()
+        first = self.pipeline()
+        self.assertEqual(len(first.run(first.prepare()).failed), 4)
+        docs = self.tmp / "docs"
+        overview = (docs / "architecture.md").read_bytes()
+        shutil.rmtree(docs)
+        self.plant("architecture.md", overview.decode("utf-8"))
+        self.model = Attentive()
+        pipeline = self.pipeline()
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, (
+            f"refusing to replace 1 file in {pipeline.out} that devdocs has no "
+            "record of writing: architecture.md"))
+
+    def test_a_stop_while_the_output_is_checked_sends_nothing(self) -> None:
+        # A stop request while `run` checks is one like any other: the pages
+        # are made from the cache, here empty, and the run is left to resume.
+        # (The CLI checks before it lets a Ctrl-C ask for one.)
+        pipeline = self.pipeline()
+        pipeline.renderers = [FirstRender(self.client.stop.set)]
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual((summary.stopped, self.model.calls), ("interrupted", []))
+        self.assertNotIn(PROSE, self.docs()["shop/cart.py.md"])
+        self.assertEqual(self.last_run(), "interrupted")
+
+    def test_pythons_own_ctrl_c_while_the_output_is_checked_ends_the_run(self) -> None:
+        def ctrl_c() -> None:
+            raise KeyboardInterrupt
+
+        pipeline = self.pipeline(renderers=[FirstRender(ctrl_c)])
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline.run(pipeline.prepare())
+        self.assertEqual(self.model.calls, [])
+        self.assertFalse((self.tmp / "docs").exists())
+        self.assertIsNone(self.db.query_one("SELECT id FROM run"))
+
+    def test_an_external_pdf_engine_is_not_run_to_check(self) -> None:
+        # The builtin engine names the book alike, in a fraction of the time.
+        printed: list[str] = []
+
+        def chrome(engine: str, docset: DocSet, *, page_size: str) -> bytes:
+            printed.append(engine)
+            return b"%PDF-1.7\n"
+
+        self.plant("shop.pdf", "a PDF of our own\n")
+        with mock.patch.object(external, "find", return_value="/bin/chrome"), \
+                mock.patch.object(external, "render", side_effect=chrome):
+            pipeline = self.pipeline(formats=("pdf",), pdf_engine="chrome")
+            error = self.refused(pipeline)
+        self.assertTrue(error.message.endswith(": shop.pdf"))
+        self.assertEqual(printed, [])
 
 
 class Noisy:
@@ -667,6 +954,16 @@ class TestSemanticContext(PipelineCase):
         again.run(again.prepare())
         # The batch embedded before the stop was kept: each chunk is sent once.
         self.assertEqual([len(b) for b in self.embedder.batches], [1] * chunks)
+
+    def test_a_run_that_would_be_refused_embeds_nothing(self) -> None:
+        # Regression: the chunks were embedded, and paid for, before anything.
+        readme = self.tmp / "docs" / "README.md"
+        readme.parent.mkdir()
+        readme.write_text("# Ours\n", encoding="utf-8")
+        pipeline = self.pipeline(context="semantic")
+        with self.assertRaises(ConfigError):
+            pipeline.run(pipeline.prepare())
+        self.assertEqual((self.embedder.batches, self.model.calls), ([], []))
 
     def test_embedding_never_takes_most_of_the_budget(self) -> None:
         messages: list[str] = []

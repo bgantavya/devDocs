@@ -36,6 +36,8 @@ a name the file system cannot hold (too long; or, on macOS, with bytes that
 are not UTF-8, as a tree from Linux may have), a directory devdocs may not
 write or a read-only disk fails there, any directory made goes again, and
 the last write's files and manifest stay exactly as they were.
+`OutputWriter.check` makes these probes, and every refusal above, without
+writing anything, so a run can refuse before it buys the prose.
 
 Each file is then written to a temp file and renamed into place in turn,
 so the disk needs room for only one more file at a time, and a process
@@ -242,6 +244,15 @@ class OutputWriter:
         return self._commit(files, docset.to_dict(include_run=True),
                             _load(Path(self.out)), prune=prune, force=force)
 
+    def check(
+        self, files: dict[str, bytes], docset: DocSet, *, force: bool = False
+    ) -> None:
+        """Raise what `write` would raise for `files` and `docset` before it
+        changed anything, and change nothing: the same code runs, up to the
+        probes, and directories a probe made go again."""
+        self._commit(files, docset.to_dict(include_run=True), _load(Path(self.out)),
+                     prune=True, force=force, dry=True)
+
     def add(self, files: dict[str, bytes], *, force: bool = False) -> WriteReport:
         """Write `files` beside the last write's, which all stay listed. The
         manifest keeps its record exactly as it was; only its list of files
@@ -264,10 +275,12 @@ class OutputWriter:
         *,
         prune: bool,
         force: bool,
+        dry: bool = False,
     ) -> WriteReport:
         """Write `files`, and `record` as the manifest, over what `last`, the
         manifest found in `out`, lists. The manifest's own path in `files` is
-        ignored."""
+        ignored. With `dry`, stop once every file the write would make or
+        replace is probed."""
         _validate(files)
         out = Path(self.out)
         outputs = {path: data for path, data in files.items() if path != MANIFEST}
@@ -290,7 +303,11 @@ class OutputWriter:
         batch = _Batch(out)
         try:
             pages = [(path, outputs[path]) for path in report.written]
-            kept.update(batch.write([(MANIFEST, ahead), *pages] if wrote else pages))
+            planned = [(MANIFEST, ahead), *pages] if wrote else pages
+            if dry:
+                batch.check(planned)
+                return report
+            kept.update(batch.write(planned))
             stale = _leftovers(out, previous.difference(outputs), kept)
             if prune:
                 report.removed = _prune(out, stale)
@@ -524,10 +541,14 @@ class _Batch:
         self.temp: Path | None = None   # the temp file in flight
         self.at = MANIFEST              # the path last worked on
 
-    def write(self, files: list[tuple[str, bytes]]) -> list[tuple[int, int]]:
-        """Probe every file, then write each; their (device, inode)."""
+    def check(self, files: list[tuple[str, bytes]]) -> None:
+        """Probe every file; `discard` then removes the directories made."""
         for path, _ in files:
             self.probe(path)
+
+    def write(self, files: list[tuple[str, bytes]]) -> list[tuple[int, int]]:
+        """Probe every file, then write each; their (device, inode)."""
+        self.check(files)
         done = [self.put(path, data) for path, data in files]
         self.made.clear()   # each holds a file now
         return done
