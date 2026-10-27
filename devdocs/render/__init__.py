@@ -27,6 +27,14 @@ identical file taken for devdocs's own. A manifest is recognised by its
 fields, and a corrupt one, or another tool's `index.json`, is itself a file
 devdocs did not write.
 
+Every file call goes through the out dir's real path, as it will be once its
+missing directories are made, so what a write looks at is what it writes to.
+With `--out shop/new/..`, where `new` does not exist yet, that is `shop`, whose
+files are refused like any other, and no `new` is made on the way. An `out` the
+kernel refuses for any other reason, as `shop/afile/..` goes through a regular
+file, is refused here too, as making directories could not change that.
+Messages keep `out` as given.
+
 A write the file system fails is a ConfigError naming the file, or the out
 dir, with what to do about it. Most such failures come before anything has
 changed, as each file the write makes or replaces is probed first, the
@@ -155,7 +163,7 @@ def read_manifest(out: Path) -> DocSet:
     """
     path = Path(out) / MANIFEST
     try:
-        data = json.loads(path.read_bytes())
+        data = _read_record(Path(out))
     except FileNotFoundError:
         raise ConfigError(
             f"no generated documentation in {path.parent}: {MANIFEST} is missing",
@@ -163,7 +171,9 @@ def read_manifest(out: Path) -> DocSet:
                  "directory it wrote",
         ) from None
     except (OSError, ValueError, RecursionError) as err:
-        raise ConfigError(f"cannot read {path}: {err}", hint=_REGENERATE) from err
+        # An OSError's own text names the real path, a second spelling of `path`.
+        reason = err.strerror if isinstance(err, OSError) and err.strerror else err
+        raise ConfigError(f"cannot read {path}: {reason}", hint=_REGENERATE) from err
     if not isinstance(data, dict) or "schema_version" not in data:
         raise ConfigError(f"{path} is not a devdocs manifest", hint=_REGENERATE)
 
@@ -283,9 +293,10 @@ class OutputWriter:
         replace is probed."""
         _validate(files)
         out = Path(self.out)
+        real = _real(out)
         outputs = {path: data for path, data in files.items() if path != MANIFEST}
         previous = _listed(last)
-        found = _inspect_all(out, outputs, previous, last, force=force)
+        found = _inspect_all(out, real, outputs, previous, last, force=force)
         owned = sorted(path for path in outputs if path not in found.left)
 
         report = WriteReport()
@@ -297,10 +308,10 @@ class OutputWriter:
                 kept.add(here.identity)
             else:
                 report.written.append(path)
-        manifest = out / MANIFEST
+        manifest = real / MANIFEST
         ahead = _encode(record, sorted(previous.union(owned)))
         wrote = not _holds(manifest, ahead)
-        batch = _Batch(out)
+        batch = _Batch(real)
         try:
             pages = [(path, outputs[path]) for path in report.written]
             planned = [(MANIFEST, ahead), *pages] if wrote else pages
@@ -308,9 +319,9 @@ class OutputWriter:
                 batch.check(planned)
                 return report
             kept.update(batch.write(planned))
-            stale = _leftovers(out, previous.difference(outputs), kept)
+            stale = _leftovers(real, previous.difference(outputs), kept)
             if prune:
-                report.removed = _prune(out, stale)
+                report.removed = _prune(real, stale)
             else:
                 owned = sorted([*owned, *stale])
             final = _encode(record, owned)
@@ -318,13 +329,35 @@ class OutputWriter:
                 batch.write([(MANIFEST, final)])
                 wrote = True
         except OSError as err:
-            raise _unwritable(out, batch.at, err) from err
+            raise _unwritable(out, real, batch.at, err) from err
         finally:
             batch.discard()
         (report.written if wrote else report.unchanged).append(MANIFEST)
         report.written.sort()
         report.unchanged.sort()
         return report
+
+
+def _real(out: Path) -> Path:
+    """What `out` names once its missing directories are made: `new/..` names
+    the directory that will hold `new`, which the kernel would not find until
+    then. Not `Path.resolve`, which raises on a symlink loop before 3.13; here
+    the file call on the path reports the loop.
+
+    Non-strict, it takes `..` by name and passes over what the kernel
+    refuses: `afile/..`, through a regular file, is the directory holding
+    `afile`. So callers also put `out` itself to `_occupant`, which says
+    whether the kernel refuses it as spelled."""
+    return Path(os.path.realpath(out))
+
+
+def _read_record(out: Path) -> Any:
+    """The JSON in `out`'s manifest, unless the kernel refuses `out` as spelled.
+    Raises OSError, or ValueError or RecursionError for JSON it cannot read."""
+    refused = _occupant(out).error
+    if refused is not None:
+        raise refused
+    return json.loads((_real(out) / MANIFEST).read_bytes())
 
 
 def _safe(path: object) -> bool:
@@ -376,7 +409,7 @@ def _load(out: Path) -> dict[str, Any] | None:
     schema version, its documents and its list of files. None when it is
     missing, unreadable or another tool's."""
     try:
-        data = json.loads((Path(out) / MANIFEST).read_bytes())
+        data = _read_record(out)
     except (OSError, ValueError, RecursionError):
         return None
     if (isinstance(data, dict) and "schema_version" in data
@@ -411,26 +444,28 @@ class _Inspection:
 
 def _inspect_all(
     out: Path,
+    real: Path,
     outputs: Mapping[str, bytes],
     previous: set[str],
     last: Mapping[str, Any] | None,
     *,
     force: bool,
 ) -> _Inspection:
-    """Look where every output goes before anything is written.
+    """Look where every output goes before anything is written: in `real`,
+    the real path of `out`, which the messages name.
 
     A file there is devdocs's when `previous` lists its path, or the same
     file under another name, as a case-insensitive disk spells one file two
     ways. Raises ConfigError where a directory is in the way or a path,
-    `out` itself first, cannot be looked at, as when a name in it is too
-    long, which `force` cannot help; and unless `force`, where an output
-    would replace any other file, the manifest included when it is not one
-    devdocs can read.
+    `out` itself first, real and as spelled, cannot be looked at, as when a
+    name in it is too long, which `force` cannot help; and unless `force`,
+    where an output would replace any other file, the manifest included when
+    it is not one devdocs can read.
     """
-    error = _occupant(out).error
+    error = _occupant(real).error or _occupant(out).error
     if error is not None:
-        raise _unwritable(out, MANIFEST, error)
-    found = {path: _inspect(out / path, data) for path, data in outputs.items()}
+        raise _unwritable(out, real, MANIFEST, error)
+    found = {path: _inspect(real / path, data) for path, data in outputs.items()}
     blocked = {path: found[path] for path in sorted(found)
                if found[path].state == _BLOCKED}
     unlisted = sorted(
@@ -438,13 +473,13 @@ def _inspect_all(
         if here.state in (_SAME, _OTHER) and path not in previous
     )
     if unlisted:
-        ours = _identities(out, previous)
+        ours = _identities(real, previous)
         unlisted = [path for path in unlisted if found[path].identity not in ours]
     left = [path for path in unlisted
             if found[path].state == _SAME and last is not None]
     foreign = [path for path in unlisted if found[path].state == _OTHER]
     if last is None:
-        manifest = _occupant(out / MANIFEST)
+        manifest = _occupant(real / MANIFEST)
         if manifest.state == _BLOCKED:
             blocked = {MANIFEST: manifest, **blocked}
         elif manifest.state == _OTHER:
@@ -452,7 +487,7 @@ def _inspect_all(
 
     for path, here in blocked.items():
         if here.error is not None:
-            raise _unwritable(out, path, here.error)
+            raise _unwritable(out, real, path, here.error)
     if blocked:
         directories = list(blocked)
         raise ConfigError(
@@ -642,17 +677,28 @@ def _temp(target: Path) -> tuple[int, Path]:
             whole = False
 
 
-def _unwritable(out: Path, path: str, err: OSError) -> ConfigError:
-    """`err`, met writing `path` into `out`, as an error that names the file
-    and says what to do about it. The file is the one the failing call
-    named: a rename's target, which may be held open or flagged immutable;
-    or `out` itself, or a directory above it, whose path is then to blame."""
+def _as_given(path: Path, out: Path, real: Path) -> Path:
+    """`path`, as a file call named it, spelled from `out` as given, whose real
+    path is `real`: a directory above it by the shortest spelling that leads
+    there, or its own name where none does, as past a link."""
+    if path == real or real in path.parents:
+        return out / path.relative_to(real)
+    return next((parent for parent in reversed(out.parents)
+                 if _real(parent) == path), path)
+
+
+def _unwritable(out: Path, real: Path, path: str, err: OSError) -> ConfigError:
+    """`err`, met writing `path` into `real`, the real path of `out`, as an
+    error that names the file and says what to do about it. The file is the
+    one the failing call named: a rename's target, which may be held open or
+    flagged immutable; or `out` itself, or a directory above it, whose path
+    is then to blame."""
     reason = err.strerror or str(err)
     named = err.filename if err.filename2 is None else err.filename2
-    failed = out / path
+    failed = real / path
     if isinstance(named, (str, bytes, os.PathLike)):
         failed = Path(os.fsdecode(named))
-    above = failed == out or failed in out.parents   # not a name devdocs chose
+    above = failed in (real, out) or failed in real.parents   # not a name devdocs chose
     if err.errno == errno.EILSEQ or getattr(err, "winerror", None) == _INVALID_NAME:
         reason = f"the file system cannot name it ({reason})"
         if above:
@@ -669,10 +715,12 @@ def _unwritable(out: Path, path: str, err: OSError) -> ConfigError:
         hint = shorter if above else f"shorten the source file's name, or {shorter}"
     elif err.errno in (errno.EACCES, errno.EPERM):
         if err.filename2 is not None:   # a rename, over a file that refuses it
-            hint = (f"{failed} is locked or read-only: close any program that has "
-                    "it open, or clear its read-only or immutable flag, then run again")
+            hint = (f"{_as_given(failed, out, real)} is locked or read-only: close any "
+                    "program that has it open, or clear its read-only or immutable "
+                    "flag, then run again")
         else:
-            hint = f"devdocs needs write access to {failed.parent}"
+            parent = _as_given(failed.parent, out, real)
+            hint = f"devdocs needs write access to {parent}"
     elif err.errno == errno.EROFS:
         hint = "choose an --out on a file system devdocs can write to"
     elif err.errno in _FULL:
@@ -686,20 +734,20 @@ def _unwritable(out: Path, path: str, err: OSError) -> ConfigError:
 
 
 def _leftovers(
-    out: Path, stale: Iterable[str], kept: set[tuple[int, int]]
+    real: Path, stale: Iterable[str], kept: set[tuple[int, int]]
 ) -> list[str]:
-    """The stale paths, sorted, that still name a regular file inside `out`.
+    """The stale paths, sorted, that still name a regular file inside `real`,
+    the out dir's real path.
 
     A path naming the same file as an output (a case-insensitive alias on
     macOS or Windows) is left out, or a renamed source would lose its new page.
     """
-    root = out.resolve()
     found: list[str] = []
     for path in sorted(stale):
-        target = out / path
+        target = real / path
         try:
             info = target.lstat()
-            inside = target.parent.resolve().is_relative_to(root)
+            inside = target.parent.resolve().is_relative_to(real)
         except (OSError, RuntimeError):   # RuntimeError: symlink loop before 3.13
             continue
         if stat.S_ISREG(info.st_mode) and inside and (
