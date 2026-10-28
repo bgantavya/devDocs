@@ -280,6 +280,16 @@ class TestChunkVectors(unittest.TestCase):
             # nor is one of a chunk not asked about
             self.assertEqual(store.vectors("embed-1", 3, {"other"}), ([], []))
 
+    def test_only_a_file_that_is_gone_is_pruned(self) -> None:
+        with Database(":memory:") as db:
+            store = ChunkStore(db)
+            for source in ("kept.py", "gone.py"):
+                store.replace(source, [Chunk(source, source, "f", 1, 3, "pass")])
+                store.store([(source, [0.5])], "embed-1")
+            self.assertEqual(store.prune(lambda source: source == "kept.py"), 1)
+            self.assertEqual(store.vectors("embed-1", 1, {"kept.py", "gone.py"})[0],
+                             ["kept.py"])
+
 
 class TestCliOnADamagedIndex(unittest.TestCase):
     def test_cache_stats_exits_with_the_storage_code(self) -> None:
