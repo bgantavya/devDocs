@@ -7,9 +7,11 @@ client, composition, rendering and writing end to end.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import functools
 import hashlib
+import io
 import json
 import os
 import re
@@ -39,7 +41,7 @@ from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
 from devdocs.index.ledger import DailyUsage
 from devdocs.llm import Completion, Finish, Request, Usage
-from devdocs.llm.budget import Budget, Router
+from devdocs.llm.budget import Budget, Router, token_ceiling
 from devdocs.llm.client import LLMClient
 from devdocs.llm.http import RetryPolicy
 from devdocs.render import Renderer
@@ -936,7 +938,7 @@ class TestSemanticContext(PipelineCase):
         prepared = pipeline.prepare()
 
         def unembedded() -> int:
-            embeddings = pipeline._embeddings()
+            embeddings = pipeline._embeddings(prepared)
             assert embeddings is not None
             return embeddings.quote().chunks
 
@@ -972,6 +974,139 @@ class TestSemanticContext(PipelineCase):
         pipeline.run(pipeline.prepare())
         self.assertEqual(self.embedder.batches, [])
         self.assertTrue(any("semantic context skipped" in m for m in messages))
+
+
+def dump(db: Database) -> dict[str, list[tuple[Any, ...]]]:
+    """Every row of every table."""
+    tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table'")
+    return {table["name"]: [tuple(row) for row in db.query(
+        f"SELECT * FROM {table['name']} ORDER BY 1, 2")] for table in tables}
+
+
+class VectorCase(PipelineCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.embedder = EmbeddingModel()
+        self.model = self.embedder
+
+    def semantic(self, **overrides: object) -> Pipeline:
+        return self.pipeline(context="semantic", **overrides)
+
+    def bought(self) -> None:
+        """A run that embeds every chunk of the project."""
+        first = self.semantic()
+        first.run(first.prepare())
+        self.embedder.batches.clear()
+
+    def vectors(self, source: str | None = None) -> int:
+        """Vectors the store holds, of one file or of all."""
+        rows = self.db.query("SELECT source FROM chunk WHERE embedding IS NOT NULL")
+        return sum(1 for row in rows if source is None or row["source"] == source)
+
+    def edit_the_cart(self) -> None:
+        cart = self.tmp / "shop" / "cart.py"
+        cart.write_text(cart.read_text("utf-8").replace("sum(", "total("), "utf-8")
+
+
+class TestEstimateChangesNothing(VectorCase):
+    """Regression: every estimate synced and pruned the chunks, so a narrower
+    --exclude deleted vectors already paid for (measured: 1,314 cut to 827)."""
+
+    def test_a_narrower_selection_deletes_nothing(self) -> None:
+        self.bought()
+        before = dump(self.db)
+        pipeline = self.semantic(exclude=("shop/cli.py",))
+        pipeline.estimate(pipeline.prepare())
+        self.assertGreater(self.vectors("shop/cli.py"), 0)
+        self.assertEqual(dump(self.db), before)
+
+    def test_edits_and_deletions_rewrite_nothing(self) -> None:
+        self.bought()
+        before = dump(self.db)
+        self.edit_the_cart()
+        (self.tmp / "shop" / "cli.py").unlink()
+        (self.tmp / "shop" / "new.py").write_text("def new() -> int:\n    return 1\n",
+                                                  encoding="utf-8")
+        pipeline = self.semantic()
+        pipeline.estimate(pipeline.prepare())
+        self.assertEqual(dump(self.db), before)
+
+    def test_a_first_estimate_writes_nothing(self) -> None:
+        before = dump(self.db)
+        pipeline = self.semantic()
+        estimate = pipeline.estimate(pipeline.prepare())
+        self.assertEqual(estimate.items[0].kind, "embed")
+        self.assertEqual(dump(self.db), before)
+
+    def test_it_quotes_the_files_selected_and_nothing_else(self) -> None:
+        def quoted(**overrides: object) -> tuple[int, int]:
+            pipeline = self.semantic(**overrides)
+            prepared = pipeline.prepare()
+            embed = [i for i in pipeline.estimate(prepared).items if i.kind == "embed"]
+            chunks = sum(len(group) for group in prepared.chunks.values())
+            return (embed[0].input_tokens if embed else 0), chunks
+
+        whole, chunks = quoted()
+        narrower, fewer = quoted(exclude=("shop/cli.py",))
+        self.assertLess(fewer, chunks)
+        self.assertLess(narrower, whole)
+        self.bought()
+        self.assertEqual(quoted()[0], 0)
+        self.assertEqual(quoted(exclude=("shop/cli.py",))[0], 0)
+
+    def test_an_estimate_of_an_edit_quotes_what_the_run_then_buys(self) -> None:
+        self.bought()
+        self.edit_the_cart()
+        pipeline = self.semantic()
+        prepared = pipeline.prepare()
+        estimate = pipeline.estimate(prepared)
+        self.assertEqual(self.embedder.batches, [])
+        embed = estimate.items[0]
+        self.assertEqual((embed.kind, embed.requests), ("embed", 1))
+
+        again = self.semantic()
+        again.run(again.prepare())
+        (batch,) = self.embedder.batches
+        self.assertEqual(embed.input_tokens, token_ceiling(*batch))
+        self.assertTrue(all(text.startswith("shop/cart.py") for text in batch))
+
+    def test_it_reads_the_vectors_of_the_selection_alone(self) -> None:
+        self.bought()
+        pipeline = self.semantic(exclude=("shop/cli.py",))
+        prepared = pipeline.prepare()
+        assert prepared.retriever is not None and prepared.retriever.vectors is not None
+        selected = {chunk.id for group in prepared.chunks.values() for chunk in group}
+        self.assertEqual(set(prepared.retriever.vectors.ids), selected)
+        self.assertEqual(self.vectors(), self.vectors("shop/cli.py") + len(selected))
+
+    def test_the_command_deletes_no_vector(self) -> None:
+        from devdocs.cli import main
+
+        self.bought()
+        before = dump(self.db)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = main(["estimate", str(self.tmp), "--context", "semantic",
+                         "--exclude", "shop/cli.py", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(dump(self.db), before)
+
+
+class TestVectorsPaidFor(VectorCase):
+    """What a run keeps of the vectors in the store."""
+
+    def test_a_run_that_is_refused_changes_nothing(self) -> None:
+        self.bought()
+        before = dump(self.db)
+        self.edit_the_cart()
+        docs = self.tmp / "docs"
+        shutil.rmtree(docs)
+        docs.mkdir()
+        (docs / "README.md").write_text("# Ours\n", encoding="utf-8")
+        pipeline = self.semantic(exclude=("shop/cli.py",))
+        with self.assertRaises(ConfigError):
+            pipeline.run(pipeline.prepare())
+        self.assertEqual(dump(self.db), before)
 
 
 if __name__ == "__main__":

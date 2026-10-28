@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 from array import array
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 
 from devdocs.index.db import Database
@@ -103,7 +103,13 @@ def chunk_file(relpath: str, source: str, facts: FileFacts | None) -> list[Chunk
 
 
 class ChunkStore:
-    """Repository over the `chunk` table: chunks and their vectors."""
+    """Repository over the `chunk` table: which chunks are known, and the
+    vectors bought for them.
+
+    A chunk's text comes from a run's scan, not from here: the store also
+    holds the ids of files the run left out, so what it is asked about a run,
+    it is asked about that run's chunks.
+    """
 
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -145,24 +151,16 @@ class ChunkStore:
                 ).rowcount
         return removed
 
-    def chunks(self) -> list[Chunk]:
+    def missing(self, chunks: Iterable[Chunk], model: str, dims: int) -> list[Chunk]:
+        """Those of `chunks` with no vector from this model at this size, each
+        once: two identical declarations in a file are one chunk."""
         rows = self.db.query(
-            "SELECT id, source, symbol, start_line, end_line, text FROM chunk "
-            "ORDER BY source, start_line, id"
-        )
-        return [Chunk(r["id"], r["source"], r["symbol"], r["start_line"],
-                      r["end_line"], r["text"]) for r in rows]
-
-    def missing(self, model: str, dims: int) -> list[Chunk]:
-        """Chunks with no vector from this model at this size."""
-        rows = self.db.query(
-            "SELECT id, source, symbol, start_line, end_line, text FROM chunk "
-            "WHERE embedding IS NULL OR model != ? OR dims != ? "
-            "ORDER BY source, start_line, id",
+            "SELECT id FROM chunk "
+            "WHERE embedding IS NOT NULL AND model = ? AND dims = ?",
             (model, dims),
         )
-        return [Chunk(r["id"], r["source"], r["symbol"], r["start_line"],
-                      r["end_line"], r["text"]) for r in rows]
+        have = {row["id"] for row in rows}
+        return list({c.id: c for c in chunks if c.id not in have}.values())
 
     def store(self, vectors: Sequence[tuple[str, Sequence[float]]], model: str) -> None:
         with self.db.transaction() as conn:
@@ -172,8 +170,11 @@ class ChunkStore:
                  for chunk_id, vector in vectors],
             )
 
-    def vectors(self, model: str, dims: int) -> tuple[list[str], list[array[float]]]:
-        """Ids and vectors stored for `model` at `dims`, in a stable order."""
+    def vectors(
+        self, model: str, dims: int, among: Collection[str]
+    ) -> tuple[list[str], list[array[float]]]:
+        """Ids and vectors stored for `model` at `dims`, of the chunks `among`
+        these ids, in a stable order."""
         rows = self.db.query(
             "SELECT id, embedding FROM chunk WHERE model = ? AND dims = ? "
             "AND embedding IS NOT NULL ORDER BY source, start_line, id",
@@ -182,6 +183,8 @@ class ChunkStore:
         ids: list[str] = []
         vectors: list[array[float]] = []
         for row in rows:
+            if row["id"] not in among:
+                continue
             vector: array[float] = array("f")
             vector.frombytes(row["embedding"])
             ids.append(row["id"])

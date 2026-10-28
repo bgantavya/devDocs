@@ -420,5 +420,108 @@ class TestInMemory(unittest.TestCase):
         self.assertFalse(backing.exists())
 
 
+class TestNotCreated(unittest.TestCase):
+    """`create=False`: a file not there yet is not made; the database is an
+    empty one in memory instead, for a command that only reads."""
+
+    def setUp(self) -> None:
+        self.state = scratch(self) / ".devdocs"
+        self.path = self.state / "devdocs.db"
+
+    def test_nothing_is_made_on_disk(self) -> None:
+        with Database(self.path, create=False) as db:
+            self.assertEqual(db.version, SCHEMA_VERSION)
+            self.assertEqual(db.query("SELECT key FROM response_cache"), [])
+            row = db.query_one("PRAGMA database_list")
+            assert row is not None
+            self.assertEqual(row["file"], "")   # SQLite's word for in memory
+        self.assertFalse(self.state.exists())
+
+    def test_threads_share_it(self) -> None:
+        with Database(self.path, create=False) as db:
+            with db.transaction() as conn:
+                conn.execute("INSERT INTO run(id, started_at) VALUES('r', 1.0)")
+            seen: dict[str, Any] = {}
+
+            def look() -> None:
+                seen["conn"] = db.connection
+                seen["rows"] = db.query("SELECT id FROM run")
+
+            worker = threading.Thread(target=look)
+            worker.start()
+            worker.join()
+            self.assertIsNot(seen["conn"], db.connection)
+            self.assertEqual([row["id"] for row in seen["rows"]], ["r"])
+
+    def test_each_is_its_own(self) -> None:
+        with Database(self.path, create=False) as first:
+            with first.transaction() as conn:
+                conn.execute("INSERT INTO run(id, started_at) VALUES('r', 1.0)")
+            with Database(self.path, create=False) as second:
+                self.assertEqual(second.query("SELECT id FROM run"), [])
+        self.assertFalse(self.state.exists())
+
+    def test_it_is_gone_at_close(self) -> None:
+        # Under one name, the next one would see this row had it outlived close.
+        with mock.patch("devdocs.index.db.os.urandom", return_value=bytes(8)):
+            with Database(self.path, create=False) as first, \
+                    first.transaction() as conn:
+                conn.execute("INSERT INTO run(id, started_at) VALUES('r', 1.0)")
+            with Database(self.path, create=False) as again:
+                self.assertEqual(again.query("SELECT id FROM run"), [])
+        self.assertFalse(self.state.exists())
+
+    def test_a_state_folder_that_is_a_file_is_left_as_it_is(self) -> None:
+        # Nothing can be in it: the database is an empty one, as with no folder.
+        self.state.write_text("not a folder\n", "utf-8")
+        with Database(self.path, create=False) as db:
+            self.assertEqual(db.query("SELECT key FROM response_cache"), [])
+        self.assertEqual(self.state.read_text("utf-8"), "not a folder\n")
+
+    def test_its_errors_give_no_hint_meant_for_a_file(self) -> None:
+        # A reader fails at once on a table being written, in a shared cache:
+        # no other process is in the way, as the hint for a lock would say.
+        with Database(self.path, create=False) as db:
+            holding, release = threading.Event(), threading.Event()
+
+            def write() -> None:
+                with db.transaction() as conn:
+                    conn.execute("INSERT INTO run(id, started_at) VALUES('w', 1.0)")
+                    holding.set()
+                    release.wait(10)
+
+            writer = threading.Thread(target=write)
+            writer.start()
+            try:
+                self.assertTrue(holding.wait(10))
+                with self.assertRaises(StorageError) as caught:
+                    db.query("SELECT id FROM run")
+            finally:
+                release.set()
+                writer.join()
+        self.assertIn("locked", caught.exception.message)
+        self.assertIsNone(caught.exception.hint)
+
+    def test_a_file_that_is_there_is_opened(self) -> None:
+        with Database(self.path) as made, made.transaction() as conn:
+            conn.execute("INSERT INTO run(id, started_at) VALUES('r', 1.0)")
+        with Database(self.path, create=False) as db:
+            self.assertEqual([row["id"] for row in db.query("SELECT id FROM run")],
+                             ["r"])
+            row = db.query_one("PRAGMA database_list")
+            assert row is not None
+            self.assertEqual(Path(row["file"]).resolve(), self.path.resolve())
+
+    @unittest.skipUnless(_POSIX_PERMISSIONS, "needs POSIX permissions, not root")
+    def test_a_file_that_cannot_be_looked_at_is_not_taken_for_none(self) -> None:
+        # It may hold the answers paid for: say so, as opening it always has.
+        self.state.mkdir()
+        os.chmod(self.state, 0)
+        self.addCleanup(os.chmod, self.state, stat.S_IRWXU)
+        with self.assertRaises(StorageError) as caught:
+            Database(self.path, create=False)
+        self.assertIn("write access", caught.exception.hint or "")
+
+
 if __name__ == "__main__":
     unittest.main()
