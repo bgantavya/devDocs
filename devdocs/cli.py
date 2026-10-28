@@ -415,8 +415,12 @@ def _pdf_flags(config: Config) -> list[str]:
     return [flag for name, flag in named.items() if config.origin_of(name) == "flag"]
 
 
-def _state(config: Config) -> Database:
-    return Database(Path(config.path).resolve() / STATE_DIR / "devdocs.db")
+def _state(config: Config, *, create: bool = True) -> Database:
+    """The project's state. With `create=False` none is made where there is
+    none yet, and the database is an empty one in memory: only generate,
+    which buys answers, makes .devdocs/."""
+    return Database(Path(config.path).resolve() / STATE_DIR / "devdocs.db",
+                    create=create)
 
 
 def _key(config: Config, explicit: str, out: _Output) -> str:
@@ -547,7 +551,7 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
     from devdocs.generate import Pipeline
 
     config = _config(args)
-    with _state(config) as db:
+    with _state(config, create=False) as db:   # none yet: an empty one in memory
         client = _client(config, db, out, key=None)
         pipeline = Pipeline(config, client=client, db=db, log=out.info,
                             project=config.name, description=config.description)
@@ -737,11 +741,15 @@ def _models(args: argparse.Namespace, out: _Output) -> int:
 
 def _cache(args: argparse.Namespace, out: _Output) -> int:
     config = load_config({"path": args.path})
-    with _state(config) as db:
+    with _state(config, create=False) as db:   # none yet: an empty one in memory
         cache = ResponseCache(db)
         if args.action == "clear":
             removed = cache.clear()
-            out.result(f"removed {removed} cached responses", {"removed": removed})
+            text = f"removed {removed} cached responses"
+            if not os.path.exists(db.path):   # in memory: there was none
+                root = Path(config.path).resolve()
+                text = f"nothing to clear: {root} has no cache yet"
+            out.result(text, {"removed": removed})
             return 0
         entries, cost = cache.stats()
     out.result(

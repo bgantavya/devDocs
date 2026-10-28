@@ -6,6 +6,10 @@ from the current model and size are sent. Each batch is reserved against the
 same `Budget` and paced by the same `RateLimiter` as generation, so turning
 semantic retrieval on can never push a run past its ceiling.
 
+`Embeddings` works on the chunks it is given, those of the files a run selected,
+whose rows `ChunkStore.replace` must have written before `update`. Quoting and
+reading vectors write nothing, so an estimate leaves the store as it found it.
+
 The embeddings endpoint reports no token usage, so a batch is reserved and
 booked at a ceiling (one token per UTF-8 byte), which can only overstate it.
 
@@ -50,6 +54,7 @@ class Embeddings:
     def __init__(
         self,
         store: ChunkStore,
+        chunks: Sequence[Chunk],
         *,
         model: ModelInfo,
         dims: int,
@@ -60,6 +65,7 @@ class Embeddings:
         stop: threading.Event | None = None,
     ) -> None:
         self.store = store
+        self.chunks = chunks
         self.model = model
         self.dims = dims
         self.embedder = embedder
@@ -120,11 +126,13 @@ class Embeddings:
         return done, spent
 
     def vectors(self) -> tuple[list[str], list[array[float]]]:
-        """Every stored vector of this model and size, with its chunk id."""
-        return self.store.vectors(self.model.id, self.dims)
+        """Every stored vector of this model and size for these chunks, with
+        its chunk id."""
+        wanted = {chunk.id for chunk in self.chunks}
+        return self.store.vectors(self.model.id, self.dims, wanted)
 
     def _batches(self) -> list[list[Chunk]]:
-        pending = self.store.missing(self.model.id, self.dims)
+        pending = self.store.missing(self.chunks, self.model.id, self.dims)
         return [pending[i : i + self.batch] for i in range(0, len(pending), self.batch)]
 
     @staticmethod
