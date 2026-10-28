@@ -1003,6 +1003,14 @@ class VectorCase(PipelineCase):
         rows = self.db.query("SELECT source FROM chunk WHERE embedding IS NOT NULL")
         return sum(1 for row in rows if source is None or row["source"] == source)
 
+    def a_subpackage(self) -> Path:
+        """A directory of the project holding one file with vectors to buy."""
+        sub = self.tmp / "shop" / "sub"
+        sub.mkdir()
+        (sub / "__init__.py").write_text('"""Sub."""\n\n\ndef sub() -> int:\n'
+                                         "    return 1\n", encoding="utf-8")
+        return sub
+
     def edit_the_cart(self) -> None:
         cart = self.tmp / "shop" / "cart.py"
         cart.write_text(cart.read_text("utf-8").replace("sum(", "total("), "utf-8")
@@ -1093,7 +1101,101 @@ class TestEstimateChangesNothing(VectorCase):
 
 
 class TestVectorsPaidFor(VectorCase):
-    """What a run keeps of the vectors in the store."""
+    """What a run keeps of the vectors in the store, and what it drops."""
+
+    def test_a_narrower_run_keeps_what_it_leaves_out(self) -> None:
+        self.bought()
+        kept = self.vectors("shop/cli.py")
+        self.assertGreater(kept, 0)
+        narrower = self.semantic(exclude=("shop/cli.py",))
+        narrower.run(narrower.prepare())
+        self.assertEqual(self.vectors("shop/cli.py"), kept)
+
+    def test_widening_the_selection_again_pays_nothing(self) -> None:
+        # Regression: pruned by the narrower run, they were all bought again.
+        self.bought()
+        narrower = self.semantic(exclude=("shop/cli.py",))
+        narrower.run(narrower.prepare())
+        wider = self.semantic()
+        summary = wider.run(wider.prepare())
+        self.assertEqual((self.embedder.batches, summary.requests), ([], 0))
+
+    def test_retrieval_does_not_see_what_is_left_out(self) -> None:
+        self.bought()
+        narrower = self.semantic(exclude=("shop/cli.py",))
+        prepared = narrower.prepare()
+        narrower.run(prepared)
+        assert prepared.retriever is not None and prepared.retriever.vectors is not None
+        self.assertFalse(set(prepared.retriever.vectors.ids)
+                         - {chunk.id for chunks in prepared.chunks.values()
+                            for chunk in chunks})
+
+    def test_a_file_that_is_gone_loses_its_vectors(self) -> None:
+        self.bought()
+        self.assertGreater(self.vectors("shop/cli.py"), 0)
+        (self.tmp / "shop" / "cli.py").unlink()
+        again = self.semantic()
+        again.run(again.prepare())
+        self.assertEqual(self.vectors("shop/cli.py"), 0)
+        self.assertGreater(self.vectors("shop/cart.py"), 0)
+
+    def test_a_file_where_a_directory_was_loses_its_vectors(self) -> None:
+        sub = self.a_subpackage()
+        self.bought()
+        (sub / "__init__.py").unlink()
+        sub.rmdir()
+        sub.write_text("not a directory now\n", encoding="utf-8")
+        again = self.semantic()
+        again.run(again.prepare())
+        self.assertEqual(self.vectors("shop/sub/__init__.py"), 0)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0,
+                     "POSIX permission bits, which root ignores")
+    def test_a_directory_the_run_cannot_read_keeps_its_files_vectors(self) -> None:
+        # Regression: that it could not see them was taken for their being gone,
+        # and they were bought again once it could.
+        sub = self.a_subpackage()
+        self.bought()
+        kept = self.vectors("shop/sub/__init__.py")
+        self.assertGreater(kept, 0)
+        sub.chmod(0)
+        self.addCleanup(sub.chmod, 0o755)
+        locked = self.semantic()
+        locked.run(locked.prepare())
+        self.assertEqual(self.vectors("shop/sub/__init__.py"), kept)
+
+        sub.chmod(0o755)
+        again = self.semantic()
+        self.assertEqual(again.run(again.prepare()).requests, 0)
+        self.assertEqual(self.embedder.batches, [])
+
+    @unittest.skipIf(os.name == "nt", "symbolic links need a privilege on Windows")
+    def test_a_file_replaced_by_a_broken_link_keeps_its_vectors(self) -> None:
+        # The name is still there, left out as links are, and the file may return.
+        self.bought()
+        kept = self.vectors("shop/cli.py")
+        self.assertGreater(kept, 0)
+        cli = self.tmp / "shop" / "cli.py"
+        cli.unlink()
+        cli.symlink_to(self.tmp / "nowhere.py")
+        again = self.semantic()
+        again.run(again.prepare())
+        self.assertEqual(self.vectors("shop/cli.py"), kept)
+
+    def test_a_file_that_changed_loses_only_its_stale_vectors(self) -> None:
+        self.bought()
+        ids = [row["id"] for row in self.db.query(
+            "SELECT id FROM chunk WHERE source = 'shop/cart.py' ORDER BY start_line")]
+        self.edit_the_cart()
+        again = self.semantic()
+        again.run(again.prepare())
+        now = {row["id"] for row in self.db.query(
+            "SELECT id FROM chunk "
+            "WHERE source = 'shop/cart.py' AND embedding IS NOT NULL")}
+        self.assertLess(len(now & set(ids)), len(ids))   # the edit's are replaced
+        self.assertTrue(now & set(ids))                  # the rest are not bought again
+        self.assertEqual(len(self.embedder.batches), 1)
+        self.assertLess(len(self.embedder.batches[0]), len(ids))
 
     def test_a_run_that_is_refused_changes_nothing(self) -> None:
         self.bought()

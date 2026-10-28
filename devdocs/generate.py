@@ -262,6 +262,18 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def _still_there(path: Path) -> bool:
+    """False only for a path nothing is at. `os.path.lexists` says that too of
+    a file in a directory this run cannot read, which is merely left out."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _retry(fmt: str, err: DevDocsError) -> str:
     """A failed format's error, as a run reports it: with how to make that
     format later without a key, from the manifest the run still wrote."""
@@ -459,6 +471,12 @@ class Pipeline:
         """Bring the store up to date with this run's files and embed the
         chunks that lack a vector, if that fits the limits.
 
+        Only the chunks of a file that changed or is gone lose their vectors.
+        A file this run merely leaves out or cannot reach keeps them: they stay
+        valid, they cost money, and widening the selection again must not pay
+        twice. It costs a few rows, which retrieval and quotes, working on this
+        run's chunks, do not see.
+
         A stop on budget or quota costs only semantic hits: the vectors
         stored so far are used and the run goes on.
         """
@@ -467,7 +485,7 @@ class Pipeline:
             return
         for rel, group in prepared.chunks.items():
             embeddings.store.replace(rel, group)
-        embeddings.store.prune(prepared.chunks)
+        embeddings.store.prune(lambda source: _still_there(self.root / source))
         quote = embeddings.quote()
         if not quote.chunks:
             return

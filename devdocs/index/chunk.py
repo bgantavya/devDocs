@@ -9,14 +9,15 @@ Chunk ids are content addresses — a hash of the file, the symbol and the text
 — so an unchanged declaration keeps its id across runs, and with it the
 embedding already paid for. `ChunkStore` replaces a file's chunks wholesale
 but keeps every row whose id survives, which is what makes re-indexing an
-edited repository cost only the edits.
+edited repository cost only the edits. A file left out of one run keeps its
+vectors too, as they stay valid and a later run may select it again.
 """
 
 from __future__ import annotations
 
 import hashlib
 from array import array
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 
 from devdocs.index.db import Database
@@ -135,14 +136,14 @@ class ChunkStore:
             )
         return len(fresh), len(stale)
 
-    def prune(self, sources: Iterable[str]) -> int:
-        """Drop chunks of files no longer in the project."""
-        keep = set(sources)
+    def prune(self, exists: Callable[[str], bool]) -> int:
+        """Drop the chunks of files no longer in the project, which `exists`
+        tells of each source stored. Returns how many."""
         with self.db.transaction() as conn:
             gone = [
                 row["source"]
                 for row in conn.execute("SELECT DISTINCT source FROM chunk")
-                if row["source"] not in keep
+                if not exists(row["source"])
             ]
             removed = 0
             for source in gone:
