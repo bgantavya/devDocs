@@ -17,6 +17,11 @@ Connections are per-thread because `sqlite3.threadsafety` is 1 on some
 builds, where sharing one across threads is unsafe. For the same reason
 ":memory:" is a private temporary file, deleted by `close`: a true in-memory
 database lives in a single connection, which a thread pool would share.
+With `create=False` a file that is not there yet is not made: the database is
+then an empty one in memory, which this instance's connections share through
+SQLite's shared cache, gone at `close`. It suits a command that only reads, as
+`estimate` does: in a shared cache a reader fails at once on a table another
+connection is writing, rather than waiting.
 
 No raw `sqlite3.Error` leaves this module. Opening, migrating, `query` and
 `transaction` raise StorageError, with a hint when the fix is known, and
@@ -166,17 +171,34 @@ def _code(err: BaseException) -> int:
     return int(getattr(err, "sqlite_errorcode", 0) or 0) & 0xFF
 
 
+def _nothing_at(path: Path) -> bool:
+    """Whether no file is at `path` yet. One that cannot be looked at is there:
+    opening it says what is wrong, as it would without `create=False`."""
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 class Database:
     """Owns the connections and the schema; repositories borrow both.
 
     One instance per run. `connection` is thread-local, so a thread pool gets
     a connection each while still sharing one file and one schema. Reads go
     through `query` / `query_one` and writes through `transaction`; all three
-    raise StorageError, never a raw sqlite3 error.
+    raise StorageError, never a raw sqlite3 error. With `create=False`, a file
+    not there yet is not made, and the database is an empty one in memory.
     """
 
     def __init__(
-        self, path: Path | str = ".devdocs/devdocs.db", *, timeout: float = 30.0
+        self,
+        path: Path | str = ".devdocs/devdocs.db",
+        *,
+        timeout: float = 30.0,
+        create: bool = True,
     ) -> None:
         self.path = Path(path)
         self.timeout = timeout          # seconds to wait for another writer
@@ -187,13 +209,17 @@ class Database:
             tuple[weakref.ref[threading.Thread], sqlite3.Connection]
         ] = []
         self._scratch: tempfile.TemporaryDirectory[str] | None = None
-        self._file = self.path
+        self._file: Path | str = self.path   # a str is a URI
         try:
             if self._memory:
                 self._scratch = tempfile.TemporaryDirectory(
                     prefix="devdocs-", ignore_cleanup_errors=True
                 )
                 self._file = Path(self._scratch.name) / "devdocs.db"
+            elif not create and _nothing_at(self.path):
+                self._memory = True
+                name = f"devdocs-{os.urandom(8).hex()}"   # one per instance
+                self._file = f"file:{name}?mode=memory&cache=shared"
             else:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
             self.migrate()
@@ -221,7 +247,8 @@ class Database:
     def _connect(self) -> sqlite3.Connection:
         try:
             conn = sqlite3.connect(
-                self._file, timeout=self.timeout, check_same_thread=False
+                self._file, timeout=self.timeout, check_same_thread=False,
+                uri=isinstance(self._file, str),
             )
         except sqlite3.Error as err:
             raise self._error(f"cannot open {self.path}", err) from err
@@ -384,7 +411,7 @@ class Database:
     def close(self) -> None:
         """Close every connection this instance opened, in any thread.
 
-        A ":memory:" database is deleted with them.
+        A ":memory:" database is deleted with them, and one in memory is gone.
         """
         with self._lock:
             opened, self._opened = self._opened, []

@@ -267,15 +267,18 @@ class TestChunkVectors(unittest.TestCase):
     def test_vectors_are_kept_per_model(self) -> None:
         with Database(":memory:") as db:
             store = ChunkStore(db)
-            store.replace("a.py", [Chunk("c1", "a.py", "f", 1, 3, "def f(): pass")])
-            self.assertEqual([c.id for c in store.missing("embed-1", 3)], ["c1"])
+            chunk = Chunk("c1", "a.py", "f", 1, 3, "def f(): pass")
+            store.replace("a.py", [chunk])
+            self.assertEqual(store.missing([chunk], "embed-1", 3), [chunk])
 
             store.store([("c1", [0.5, 0.25, 0.125])], "embed-1")
-            self.assertEqual(store.missing("embed-1", 3), [])
-            ids, vectors = store.vectors("embed-1", 3)
+            self.assertEqual(store.missing([chunk], "embed-1", 3), [])
+            ids, vectors = store.vectors("embed-1", 3, {"c1"})
             self.assertEqual((ids, list(vectors[0])), (["c1"], [0.5, 0.25, 0.125]))
             # another model's vector is not this one's
-            self.assertEqual([c.id for c in store.missing("embed-2", 3)], ["c1"])
+            self.assertEqual(store.missing([chunk], "embed-2", 3), [chunk])
+            # nor is one of a chunk not asked about
+            self.assertEqual(store.vectors("embed-1", 3, {"other"}), ([], []))
 
 
 class TestCliOnADamagedIndex(unittest.TestCase):

@@ -296,6 +296,27 @@ class TestEstimate(CliCase):
         self.assertGreater(data["max_cost_usd"], 0)
         self.assertEqual(self.model.calls, [])
 
+    def test_a_first_estimate_makes_no_state(self) -> None:
+        # Regression: it made .devdocs/devdocs.db, and with --context semantic
+        # synced the chunks into it.
+        state = self.root / ".devdocs"
+        for argv in ([], ["--context", "semantic"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli("estimate", str(self.root), "--quiet",
+                                              *argv)
+                self.assertEqual(code, 0, err)
+                self.assertIn(", 0 already cached\n", out)
+                self.assertFalse(state.exists())
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet")
+        self.assertEqual(code, 0, err)
+        with Database(state / "devdocs.db") as db:
+            runs = [row["status"] for row in db.query("SELECT status FROM run")]
+        self.assertEqual(runs, ["finished"])
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet")
+        self.assertEqual(code, 0, err)
+        self.assertIn("\n0 model calls (none), 5 already cached\n", out)
+
     def test_semantic_estimate_quotes_the_embeddings_first(self) -> None:
         code, out, _ = self.run_cli("estimate", str(self.root), "--context",
                                     "semantic", "--json")
@@ -381,6 +402,26 @@ class TestInitAndCache(CliCase):
         self.assertEqual(code, 0)
         self.assertGreater(json.loads(out)["entries"], 0)
         code, out, _ = self.run_cli("cache", "clear", str(self.root), "--json")
+        self.assertGreater(json.loads(out)["removed"], 0)
+
+    def test_only_generate_makes_state(self) -> None:
+        # Regression: cache stats and cache clear made an empty .devdocs/devdocs.db.
+        root, state = self.root.resolve(), self.root / ".devdocs"
+        said = {("cache", "stats"): "0 cached responses, bought for $0.0000 in total\n",
+                ("cache", "clear"): f"nothing to clear: {root} has no cache yet\n"}
+        with contextlib.chdir(self.root):   # models takes no path
+            for argv in (("estimate",), ("export",), ("doctor", "--api-key", "k"),
+                         ("models", "--api-key", "k"), *said, ("init",)):
+                with self.subTest(argv=argv):
+                    _, out, err = self.run_cli(*argv)
+                    made = state.exists()
+                    shutil.rmtree(state, ignore_errors=True)   # so it fails alone
+                    self.assertFalse(made, err)
+                    self.assertEqual(out, said.get(argv, out))
+            code, _, err = self.run_cli("generate", "--api-key", "k", "--quiet")
+            self.assertEqual(code, 0, err)
+            self.assertTrue((state / "devdocs.db").is_file())
+            _, out, _ = self.run_cli("cache", "clear", "--json")
         self.assertGreater(json.loads(out)["removed"], 0)
 
 
@@ -1117,6 +1158,7 @@ class TestWhatAStopSays(CliCase):
         with mock.patch.object(cli.ResponseCache, "stats", signals()):
             line = self.stopped("cache", "stats", str(self.root))
         self.assertEqual(line, "warning: interrupted; the cache is as it was")
+        self.assertFalse((self.root / ".devdocs").exists())   # stats makes no state
         self.assertIn("0 cached responses", self.run_cli("cache", "stats",
                                                          str(self.root))[1])
         with mock.patch.object(cli.ResponseCache, "clear", signals()):

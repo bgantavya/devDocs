@@ -6,7 +6,8 @@ retrieval indexes that give each prompt its cross-file context. `price`
 builds every prompt the plan implies, quotes it against the catalog and the
 response cache, and cuts the plan to the budget. `estimate` stops there;
 `run` goes on to send exactly what was priced, so an estimate describes the
-run that would follow it.
+run that would follow it. Both steps only read the index, so an estimate
+changes nothing stored there.
 
 Calls go out on a thread pool in three waves — files, then modules (which
 read the files' purposes), then the architecture overview (which reads the
@@ -67,7 +68,7 @@ from devdocs.errors import (
 )
 from devdocs.graph import GraphBuilder, ProjectGraph
 from devdocs.history import FileHistory, GitHistory
-from devdocs.index.chunk import ChunkStore, chunk_file
+from devdocs.index.chunk import Chunk, ChunkStore, chunk_file
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
 from devdocs.index.ledger import ItemStatus, LedgerItem, RunLedger, config_fingerprint
@@ -157,6 +158,7 @@ class Prepared:
     skipped: dict[str, str]
     languages: dict[str, int]
     prompts: dict[tuple[str, str], Prompt] = field(default_factory=dict)
+    chunks: dict[str, list[Chunk]] = field(default_factory=dict)   # by file
     retriever: Retriever | None = None
 
 
@@ -401,34 +403,33 @@ class Pipeline:
 
     def _retriever(self, prepared: Prepared) -> Retriever | None:
         """Structural and lexical retrieval, both free. In semantic mode the
-        chunks are also synced to the store, where a vector paid for once
-        stays valid until its chunk changes, and the stored ones are used."""
+        vectors stored for these chunks are used, as a vector paid for once
+        stays valid until its chunk changes. Nothing is written: only a run
+        changes the store; see `_embed`."""
         if self.config.context == "off":
             return None
-        by_file = {
+        prepared.chunks = {
             rel: chunk_file(rel, prepared.sources.get(rel, ""), prepared.facts.get(rel))
             for rel in sorted(prepared.files)
         }
-        chunks = [chunk for group in by_file.values() for chunk in group]
+        chunks = [chunk for group in prepared.chunks.values() for chunk in group]
         retriever = Retriever(
             StructuralContext(prepared.graph, prepared.facts, prepared.sources),
             chunks=chunks,
             lexical=LexicalIndex(chunks),
         )
-        embeddings = self._embeddings()
+        embeddings = self._embeddings(prepared)
         if embeddings is not None:
-            for rel, group in by_file.items():
-                embeddings.store.replace(rel, group)
-            embeddings.store.prune(by_file)
             self._attach(retriever, embeddings)
         return retriever
 
-    def _embeddings(self) -> Embeddings | None:
+    def _embeddings(self, prepared: Prepared) -> Embeddings | None:
         if self.config.context != "semantic" or self.db is None:
             return None
         info = find(EMBEDDING_MODEL) or assume(EMBEDDING_MODEL, "gemini")
+        chunks = [chunk for group in prepared.chunks.values() for chunk in group]
         embeddings = Embeddings(
-            ChunkStore(self.db), model=info, dims=EMBEDDING_DIMENSIONS
+            ChunkStore(self.db), chunks, model=info, dims=EMBEDDING_DIMENSIONS
         )
         client = self.client
         if client is not None:
@@ -455,14 +456,18 @@ class Pipeline:
         return not config.max_requests or requests <= config.max_requests * _EMBED_SHARE
 
     def _embed(self, prepared: Prepared) -> None:
-        """Embed the chunks that lack a vector, if that fits the limits.
+        """Bring the store up to date with this run's files and embed the
+        chunks that lack a vector, if that fits the limits.
 
         A stop on budget or quota costs only semantic hits: the vectors
         stored so far are used and the run goes on.
         """
-        embeddings = self._embeddings()
+        embeddings = self._embeddings(prepared)
         if embeddings is None or prepared.retriever is None:
             return
+        for rel, group in prepared.chunks.items():
+            embeddings.store.replace(rel, group)
+        embeddings.store.prune(prepared.chunks)
         quote = embeddings.quote()
         if not quote.chunks:
             return
@@ -606,7 +611,7 @@ class Pipeline:
 
         self._walk(prepared, quote)
 
-        embeddings = self._embeddings() if embedding else None
+        embeddings = self._embeddings(prepared) if embedding else None
         if embeddings is not None:
             need = embeddings.quote()
             if need.chunks and self._embedding_fits(need.requests, need.cost):

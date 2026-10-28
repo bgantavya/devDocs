@@ -4,7 +4,7 @@
 # python:3.13-slim and runs it as uid 10001 in /work, the only path it writes.
 # Run it as yourself so docs/ and .devdocs/ belong to you:
 #   docker run --rm -it -u "$(id -u):$(id -g)" -v "$PWD:/work" \
-#     -e GEMINI_API_KEY ghcr.io/bgantavya/devdocs estimate
+#     -e GEMINI_API_KEY ghcr.io/bgantavya/devdocs generate
 # `docker stop` sends SIGINT, devdocs' Ctrl-C: nothing new is sent, in-flight
 # calls finish and are cached, the pages are written, and it exits 130. Allow
 # 150 s for that (`docker stop -t 150`, `docker run --stop-timeout 150`); by

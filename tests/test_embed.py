@@ -7,7 +7,7 @@ import unittest
 from typing import Any
 
 from devdocs.errors import BudgetExceeded, ConfigError, ProviderError, QuotaExhausted
-from devdocs.index.chunk import ChunkStore, chunk_file
+from devdocs.index.chunk import Chunk, ChunkStore, chunk_file
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
 from devdocs.llm.budget import Budget, RateLimiter, token_ceiling
@@ -60,9 +60,12 @@ class EmbedCase(unittest.TestCase):
         self.db = Database(":memory:")
         self.addCleanup(self.db.close)
         self.store = ChunkStore(self.db)
+        self.chunks: list[Chunk] = []
         for rel, text in (("shop/money.py", MONEY), ("shop/cart.py", CART)):
-            self.store.replace(rel, chunk_file(rel, text, facts(rel, text)))
-        self.texts = [chunk.text for chunk in self.store.chunks()]
+            group = chunk_file(rel, text, facts(rel, text))
+            self.store.replace(rel, group)
+            self.chunks += group
+        self.texts = [chunk.text for chunk in self.chunks]
 
     def embeddings(
         self,
@@ -74,9 +77,9 @@ class EmbedCase(unittest.TestCase):
         stop: threading.Event | None = None,
     ) -> Embeddings:
         embedder = embedder or Counting()
-        return Embeddings(self.store, model=MODEL, dims=embedder.dimensions,
-                          embedder=embedder, budget=budget, limiter=limiter,
-                          batch=batch, stop=stop)
+        return Embeddings(self.store, self.chunks, model=MODEL,
+                          dims=embedder.dimensions, embedder=embedder, budget=budget,
+                          limiter=limiter, batch=batch, stop=stop)
 
 
 class TestQuote(EmbedCase):
@@ -89,10 +92,51 @@ class TestQuote(EmbedCase):
         self.assertAlmostEqual(quote.cost, tokens * 0.15 / 1e6)
 
     def test_quoting_needs_no_embedder(self) -> None:
-        quote = Embeddings(self.store, model=MODEL, dims=4).quote()
+        quote = Embeddings(self.store, self.chunks, model=MODEL, dims=4).quote()
         self.assertEqual(quote.chunks, len(self.texts))
         with self.assertRaises(ConfigError):
-            Embeddings(self.store, model=MODEL, dims=4).update()
+            Embeddings(self.store, self.chunks, model=MODEL, dims=4).update()
+
+
+class TestScope(EmbedCase):
+    """It works on the chunks it is given, whatever else the store holds."""
+
+    def test_quoting_and_reading_write_nothing(self) -> None:
+        def rows() -> list[tuple[Any, ...]]:
+            return [tuple(row) for row in self.db.query("SELECT * FROM chunk")]
+
+        self.embeddings().update()
+        before = rows()
+        fresh = Chunk("new", "shop/new.py", "", 1, 1, "shop/new.py\nx = 1")
+        embeddings = Embeddings(self.store, [fresh], model=MODEL, dims=4)
+        self.assertEqual(embeddings.quote().chunks, 1)
+        self.assertEqual(embeddings.vectors(), ([], []))
+        self.assertEqual(rows(), before)
+
+    def test_only_its_own_chunks_are_quoted_and_bought(self) -> None:
+        money = [chunk for chunk in self.chunks if chunk.source == "shop/money.py"]
+        embedder = Counting()
+        embeddings = Embeddings(self.store, money, model=MODEL, dims=4,
+                                embedder=embedder)
+        self.assertEqual(embeddings.quote().chunks, len(money))
+        embeddings.update()
+        self.assertEqual(embedder.batches, [[chunk.text for chunk in money]])
+
+    def test_only_its_own_vectors_are_read(self) -> None:
+        self.embeddings().update()
+        money = [chunk for chunk in self.chunks if chunk.source == "shop/money.py"]
+        embeddings = Embeddings(self.store, money, model=MODEL, dims=4)
+        self.assertEqual(embeddings.vectors()[0], [chunk.id for chunk in money])
+        self.assertEqual(embeddings.quote().chunks, 0)
+
+    def test_a_chunk_given_twice_is_bought_once(self) -> None:
+        embedder = Counting()
+        twice = [*self.chunks, self.chunks[0]]
+        embeddings = Embeddings(self.store, twice, model=MODEL, dims=4,
+                                embedder=embedder)
+        self.assertEqual(embeddings.quote().chunks, len(self.chunks))
+        embeddings.update()
+        self.assertEqual(len(embedder.batches[0]), len(self.chunks))
 
 
 class TestUpdate(EmbedCase):

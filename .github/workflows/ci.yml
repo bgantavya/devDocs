@@ -233,16 +233,21 @@ jobs:
           load: true
           tags: devdocs:ci
       - run: docker run --rm devdocs:ci --version
-      - name: Estimate a mounted project as uid 1001 (read-only root)
+      - name: Init and estimate a mounted project as uid 1001 (read-only root)
         run: |
           project="$RUNNER_TEMP/project"
           mkdir -p "$project"
           printf 'def add(a: int, b: int) -> int:\n    """Return a + b."""\n    return a + b\n' \
             > "$project/app.py"
           sudo chown -R 1001:1001 "$project"
-          docker run --rm --user 1001:1001 --read-only --tmpfs /tmp \
-            --volume "$project:/work" devdocs:ci estimate
-          test "$(stat -c %u "$project/.devdocs/devdocs.db")" = 1001
+          devdocs() {
+            docker run --rm --user 1001:1001 --read-only --tmpfs /tmp \
+              --volume "$project:/work" devdocs:ci "$@"
+          }
+          devdocs init       # writes devdocs.toml
+          devdocs estimate   # reads it; only generate makes .devdocs/
+          test "$(stat -c %u "$project/devdocs.toml")" = 1001
+          test ! -e "$project/.devdocs"
 
   installers:
     name: Installer (${{ matrix.os }})
