@@ -983,6 +983,22 @@ class TestSemanticContext(PipelineCase):
         self.assertEqual(self.embedder.batches, [])
         self.assertTrue(any("semantic context skipped" in m for m in messages))
 
+    def test_a_skipped_embedding_names_the_limit_to_raise(self) -> None:
+        # Regression: it said to raise --max-cost, whichever limit was in the way.
+        for limits, flags in (({"max_cost": 0.00001, "max_requests": 0}, "--max-cost"),
+                              ({"max_cost": 0.0, "max_requests": 1}, "--max-requests"),
+                              ({"max_cost": 0.00001, "max_requests": 1},
+                               "--max-cost and --max-requests")):
+            with self.subTest(flags):
+                messages: list[str] = []
+                pipeline = self.pipeline(context="semantic", log=messages.append,
+                                         **limits)
+                pipeline.run(pipeline.prepare())
+                (skipped,) = [m for m in messages if "skipped" in m]
+                self.assertTrue(skipped.endswith(
+                    f"over half of {flags}; raise that or use --context standard"),
+                    skipped)
+
     def test_embedding_counts_against_the_day(self) -> None:
         # Regression: only completions were recorded in usage_day.
         pipeline = self.pipeline(context="semantic")
