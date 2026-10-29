@@ -129,10 +129,9 @@ class ChunkStore:
             conn.executemany("DELETE FROM chunk WHERE id = ?", [(i,) for i in stale])
             fresh = [c for c in chunks if c.id not in existing]
             conn.executemany(
-                "INSERT OR IGNORE INTO chunk (id, source, symbol, start_line, "
-                "end_line, text) VALUES (?, ?, ?, ?, ?, ?)",
-                [(c.id, c.source, c.symbol, c.start_line, c.end_line, c.text)
-                 for c in fresh],
+                "INSERT OR IGNORE INTO chunk (id, source, start_line) "
+                "VALUES (?, ?, ?)",
+                [(c.id, c.source, c.start_line) for c in fresh],
             )
         return len(fresh), len(stale)
 

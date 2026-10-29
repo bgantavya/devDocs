@@ -21,13 +21,7 @@ from devdocs.errors import StorageError
 from devdocs.index.cache import ResponseCache
 from devdocs.index.chunk import Chunk, ChunkStore
 from devdocs.index.db import Database
-from devdocs.index.ledger import (
-    DailyUsage,
-    ItemStatus,
-    LedgerItem,
-    RunLedger,
-    config_fingerprint,
-)
+from devdocs.index.ledger import DailyUsage, RunLedger, config_fingerprint
 from devdocs.llm import Completion, Finish, Request, Usage
 from devdocs.llm.budget import Router
 from devdocs.llm.catalog import Tier
@@ -126,33 +120,6 @@ class TestUndecodableText(unittest.TestCase):
         assert hit is not None
         self.assertEqual(hit.text, f"see {ODD}")
 
-    def test_ledger_tracks_the_file(self) -> None:
-        ledger = RunLedger(self.db)
-        run, _ = ledger.start("cfg")
-        items = [LedgerItem(ODD, "file", "h1"), LedgerItem("a.py", "file", "h2")]
-        self.assertEqual(ledger.plan(run, items), 2)
-        self.assertEqual({item.source for item in ledger.pending(run)}, {ODD, "a.py"})
-
-        ledger.mark(run, ODD, "file", ItemStatus.FAILED, error=f"cannot read {ODD}")
-        ledger.mark(run, "a.py", "file", ItemStatus.DONE)
-        self.assertEqual([(i.source, i.status) for i in ledger.pending(run)],
-                         [(ODD, ItemStatus.FAILED)])
-        totals = ledger.totals(run)
-        self.assertEqual((totals.done, totals.failed), (1, 1))
-        # planning again finds the same rows instead of adding new ones
-        self.assertEqual(ledger.plan(run, items), 1)
-        row = self.db.query_one("SELECT count(*) FROM run_item")
-        assert row is not None
-        self.assertEqual(row[0], 2)
-
-    def test_valid_text_is_still_stored_as_text(self) -> None:
-        ledger = RunLedger(self.db)
-        run, _ = ledger.start("cfg")
-        ledger.plan(run, [LedgerItem("café.py", "file", "h")])
-        row = self.db.query_one("SELECT typeof(source), source FROM run_item")
-        assert row is not None
-        self.assertEqual((row[0], row[1]), ("text", "café.py"))
-
     def test_fingerprint_accepts_an_undecodable_path(self) -> None:
         self.assertEqual(len(config_fingerprint(f"/home/{ODD}", "gemini")), 16)
 
@@ -175,7 +142,6 @@ class TestFailuresAreStorageErrors(unittest.TestCase):
         self.usage = DailyUsage(self.db)
         self.cache.put("k", answer("m"))
         self.run_id, _ = self.ledger.start("cfg")
-        self.ledger.plan(self.run_id, [LedgerItem("a.py", "file", "h")])
         self.ledger.finish(self.run_id, "interrupted")
         self.usage.record("m")
 
@@ -191,13 +157,7 @@ class TestFailuresAreStorageErrors(unittest.TestCase):
             "ResponseCache.clear": self.cache.clear,
             "RunLedger.start": lambda: self.ledger.start("cfg"),
             "RunLedger.start fresh": lambda: self.ledger.start("cfg", resume=False),
-            "RunLedger.plan": lambda: self.ledger.plan(
-                self.run_id, [LedgerItem("b.py", "file", "h")]),
-            "RunLedger.pending": lambda: self.ledger.pending(self.run_id),
-            "RunLedger.mark": lambda: self.ledger.mark(
-                self.run_id, "a.py", "file", ItemStatus.DONE),
             "RunLedger.finish": lambda: self.ledger.finish(self.run_id),
-            "RunLedger.totals": lambda: self.ledger.totals(self.run_id),
             "DailyUsage.record": lambda: self.usage.record("m"),
             "DailyUsage.requests": lambda: self.usage.requests("m"),
         }
@@ -234,8 +194,7 @@ class TestFailuresAreStorageErrors(unittest.TestCase):
             reads: dict[str, Callable[[], object]] = {
                 "ResponseCache.get": lambda: ResponseCache(db).get("k1"),
                 "ResponseCache.stats": ResponseCache(db).stats,
-                "RunLedger.pending": lambda: RunLedger(db).pending(self.run_id),
-                "RunLedger.totals": lambda: RunLedger(db).totals(self.run_id),
+                "RunLedger.start": lambda: RunLedger(db).start("cfg"),
                 "DailyUsage.requests": lambda: DailyUsage(db).requests("m"),
             }
             for name, read in reads.items():

@@ -16,6 +16,8 @@ from unittest import mock
 
 from devdocs.errors import StorageError
 from devdocs.index import MIGRATIONS, SCHEMA_VERSION, Database
+from devdocs.index.chunk import Chunk, ChunkStore
+from devdocs.index.ledger import RunLedger
 
 _connect: Callable[..., sqlite3.Connection] = sqlite3.connect
 _POSIX_PERMISSIONS = os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0
@@ -108,7 +110,7 @@ class TestMigrations(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
             names = {row[0] for row in rows}
-        self.assertLessEqual({"response_cache", "chunk", "run", "run_item"}, names)
+        self.assertEqual(names, {"response_cache", "chunk", "run", "usage_day"})
 
     def test_migrate_is_idempotent(self) -> None:
         with Database(self.path) as db:
@@ -217,6 +219,107 @@ class TestAtomicMigrations(unittest.TestCase):
         self.assertEqual((row[0], row[1]), ("paid for", "stop"))
 
 
+class TestRebuild(unittest.TestCase):
+    """Migration 4 drops what nothing reads and keeps what a run still uses."""
+
+    VECTOR = b"\x00\x00\x80\x3f\x00\x00\x00\x00"     # [1.0, 0.0], 32-bit floats
+    ODD = b"caf\xed\xb3\xa9.py"                         # as `encode_text` stores it
+
+    def setUp(self) -> None:
+        self.path = scratch(self) / "devdocs.db"
+        build(self.path, 3)
+        conn = _connect(self.path)
+        conn.execute(
+            "INSERT INTO run (id, started_at, finished_at, status, config_hash) "
+            "VALUES ('r', 1.0, 2.0, 'interrupted', 'cfg')"
+        )
+        conn.execute(
+            "INSERT INTO run_item (run_id, source, kind, status, content_hash, error) "
+            "VALUES ('r', 'a.py', 'file', 'failed', 'h1', 'boom')"
+        )
+        conn.executemany(
+            "INSERT INTO chunk (id, source, symbol, start_line, end_line, text, "
+            "embedding, dims, model) "
+            "VALUES (?, ?, 'f', ?, 9, 'def f(): pass', ?, ?, ?)",
+            [("c1", "a.py", 3, self.VECTOR, 2, "embed-1"),
+             ("c2", self.ODD, 4, self.VECTOR, 2, "embed-1"),
+             ("c3", "a.py", 5, None, 0, "")],
+        )
+        conn.commit()
+        conn.close()
+
+    def shape(self, table: str) -> list[tuple[str, int]]:
+        """Each column of `table`, and its place in the primary key."""
+        rows = inspect(self.path, f"PRAGMA table_info({table})")
+        return [(row[1], row[5]) for row in rows]
+
+    def test_the_tables_hold_what_the_code_uses(self) -> None:
+        # Both paths to a database run this migration, so comparing them cannot
+        # tell a wrong one: this states the result.
+        Database(self.path).close()
+        self.assertEqual(self.shape("run"), [("id", 1), ("started_at", 0),
+                                             ("status", 0), ("config_hash", 0)])
+        self.assertEqual(self.shape("chunk"), [("id", 1), ("source", 0),
+                                               ("start_line", 0), ("embedding", 0),
+                                               ("dims", 0), ("model", 0)])
+
+    def test_it_leaves_only_the_tables_and_index_in_use(self) -> None:
+        Database(self.path).close()
+        rows = inspect(self.path, "SELECT type, name FROM sqlite_master "
+                                  "WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+        self.assertEqual(rows, [("table", "chunk"), ("index", "chunk_source"),
+                                ("table", "response_cache"), ("table", "run"),
+                                ("table", "usage_day")])
+
+    def test_every_run_survives(self) -> None:
+        Database(self.path).close()
+        self.assertEqual(inspect(self.path, "SELECT * FROM run"),
+                         [("r", 1.0, "interrupted", "cfg")])
+
+    def test_an_unfinished_run_still_resumes(self) -> None:
+        with Database(self.path) as db:
+            self.assertEqual(RunLedger(db).start("cfg"), ("r", True))
+
+    def test_every_vector_survives(self) -> None:
+        Database(self.path).close()
+        self.assertEqual(
+            inspect(self.path, "SELECT * FROM chunk ORDER BY id"),
+            [("c1", "a.py", 3, self.VECTOR, 2, "embed-1"),
+             ("c2", self.ODD, 4, self.VECTOR, 2, "embed-1"),
+             ("c3", "a.py", 5, None, 0, "")],
+        )
+
+    def test_the_store_finds_the_vectors_paid_for(self) -> None:
+        kept = Chunk("c1", "a.py", "f", 3, 9, "def f(): pass")
+        unpaid = Chunk("c3", "a.py", "g", 5, 9, "def g(): pass")
+        with Database(self.path) as db:
+            store = ChunkStore(db)
+            self.assertEqual(store.missing([kept, unpaid], "embed-1", 2), [unpaid])
+            ids, vectors = store.vectors("embed-1", 2, {"c1", "c2"})
+        self.assertEqual(ids, ["c1", "c2"])
+        self.assertEqual(list(vectors[0]), [1.0, 0.0])
+
+    def test_upgrade_matches_a_fresh_database(self) -> None:
+        Database(self.path).close()
+        fresh = scratch(self) / "devdocs.db"
+        Database(fresh).close()
+        self.assertEqual(schema(self.path), schema(fresh))
+
+    def test_a_failure_leaves_the_rows_and_the_old_version(self) -> None:
+        def adjust(conn: sqlite3.Connection) -> None:
+            conn.set_authorizer(deny_version_bump)
+
+        with connections(adjust), self.assertRaises(StorageError) as caught:
+            Database(self.path)
+        self.assertIn(f"migration to v{SCHEMA_VERSION} failed", str(caught.exception))
+        self.assertEqual(version_of(self.path), 3)
+        self.assertIn("cost_usd", columns(self.path, "run"))
+        self.assertIn("text", columns(self.path, "chunk"))
+        self.assertEqual(len(inspect(self.path, "SELECT * FROM run_item")), 1)
+        with Database(self.path) as db:
+            self.assertEqual(db.version, SCHEMA_VERSION)
+
+
 class TestOpenFailures(unittest.TestCase):
     """Whatever is wrong with the file, opening it raises StorageError."""
 
@@ -302,12 +405,6 @@ class TestBehaviour(unittest.TestCase):
         mode = self.db.connection.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(mode.lower(), "wal")
 
-    def test_foreign_keys_are_enforced(self) -> None:
-        with self.assertRaises(StorageError), self.db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO run_item(run_id, source, kind) VALUES('ghost','a','file')"
-            )
-
     def test_transaction_rolls_back_on_error(self) -> None:
         with self.assertRaises(RuntimeError), self.db.transaction() as conn:
             conn.execute("INSERT INTO run(id, started_at) VALUES('r1', 1.0)")
@@ -333,17 +430,6 @@ class TestBehaviour(unittest.TestCase):
         rows = self.db.query("SELECT id FROM run WHERE started_at = ?", (1.0,))
         self.assertEqual([row["id"] for row in rows], ["r1"])
         self.assertIsNone(self.db.query_one("SELECT id FROM run WHERE id = 'none'"))
-
-    def test_delete_cascades_to_items(self) -> None:
-        with self.db.transaction() as conn:
-            conn.execute("INSERT INTO run(id, started_at) VALUES('r1', 1.0)")
-            conn.execute(
-                "INSERT INTO run_item(run_id, source, kind) VALUES('r1','a.py','file')"
-            )
-        with self.db.transaction() as conn:
-            conn.execute("DELETE FROM run WHERE id='r1'")
-        rows = self.db.connection.execute("SELECT count(*) FROM run_item")
-        self.assertEqual(rows.fetchone()[0], 0)
 
     def test_concurrent_writers_all_commit(self) -> None:
         self.assertEqual(writers(self.db), ([], 160))
