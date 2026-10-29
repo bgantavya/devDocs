@@ -983,7 +983,21 @@ class TestSemanticContext(PipelineCase):
         self.assertEqual(self.embedder.batches, [])
         self.assertTrue(any("semantic context skipped" in m for m in messages))
 
-    def test_a_spent_day_sends_no_embedding(self) -> None:
+    def test_embedding_counts_against_the_day(self) -> None:
+        # Regression: only completions were recorded in usage_day.
+        pipeline = self.pipeline(context="semantic")
+        pipeline.run(pipeline.prepare())
+        model = "gemini-embedding-001"
+        self.assertEqual(DailyUsage(self.db).requests(model), 1)
+        info = find(model)
+        assert info is not None
+        later = self.pipeline(context="semantic")
+        self.client.free_tier = True
+        self.assertEqual(self.client.limiter(info).used_today, 1)
+        self.assertEqual(later.run(later.prepare()).requests, 0)
+        self.assertEqual(DailyUsage(self.db).requests(model), 1)   # nothing was sent
+
+    def test_a_day_spent_by_earlier_runs_sends_no_embedding(self) -> None:
         info = find("gemini-embedding-001")
         assert info is not None and info.free_rpd is not None
         usage = DailyUsage(self.db)
@@ -1089,6 +1103,7 @@ class TestEmbeddingFailure(PipelineCase):
             sum(info.cost(answers) for info in prices if info is not None),
             places=5,
         )
+        self.assertEqual(DailyUsage(self.db).requests("gemini-embedding-001"), 0)
 
     def test_retries_are_reported_like_a_completions(self) -> None:
         self.embedder.during_embed = failing(ProviderError("down", status=503))

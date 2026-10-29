@@ -5,7 +5,7 @@ it, so vectors are stored with their chunk and only chunks without a vector
 from the current model and size are sent. Each batch is reserved against the
 same `Budget`, paced by the same `RateLimiter` and retried by the same
 `RetryPolicy` as generation, so turning semantic retrieval on can never push a
-run past its ceiling.
+run past its ceiling, and each one answered is counted in the same `DailyUsage`.
 
 `Embeddings` works on the chunks it is given, those of the files a run selected,
 whose rows `ChunkStore.replace` must have written before `update`. Quoting and
@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 
 from devdocs.errors import BudgetExceeded, ConfigError, Interrupted
 from devdocs.index.chunk import Chunk, ChunkStore
+from devdocs.index.ledger import DailyUsage
 from devdocs.llm import Embedder
 from devdocs.llm.budget import Budget, RateLimiter, token_ceiling
 from devdocs.llm.catalog import ModelInfo
@@ -70,6 +71,7 @@ class Embeddings:
         stop: threading.Event | None = None,
         retry: RetryPolicy | None = None,
         on_retry: Callable[[int, BaseException, float], None] | None = None,
+        usage: DailyUsage | None = None,
         max_requests: int = 0,
     ) -> None:
         self.store = store
@@ -83,6 +85,7 @@ class Embeddings:
         self.stop = stop
         self.retry = retry or RetryPolicy()
         self.on_retry = on_retry
+        self.usage = usage
         self.max_requests = max_requests
 
     def quote(self) -> EmbeddingQuote:
@@ -124,6 +127,8 @@ class Embeddings:
             self.store.store(
                 [(c.id, v) for c, v in zip(group, vectors, strict=True)], self.model.id
             )
+            if self.usage is not None:
+                self.usage.record(self.model.id, cost=cost)
             done += len(group)
             spent += cost
             if progress is not None:
