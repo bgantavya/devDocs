@@ -473,12 +473,16 @@ class Pipeline:
             retriever.vectors = VectorIndex(ids, vectors)
             retriever.vector_of = dict(zip(ids, vectors, strict=True))
 
-    def _embedding_fits(self, requests: int, cost: float) -> bool:
-        """Whether embedding leaves the documents most of each limit."""
+    def _embedding_over(self, requests: int, cost: float) -> list[str]:
+        """The flags of the limits embedding would take over half of, as the
+        documents get most of each; none if it fits."""
         config = self.config
+        over = []
         if config.max_cost and cost > config.max_cost * _EMBED_SHARE:
-            return False
-        return not config.max_requests or requests <= config.max_requests * _EMBED_SHARE
+            over.append("--max-cost")
+        if config.max_requests and requests > config.max_requests * _EMBED_SHARE:
+            over.append("--max-requests")
+        return over
 
     def _embed(self, prepared: Prepared) -> str:
         """Bring the store up to date with this run's files and embed the
@@ -507,11 +511,13 @@ class Pipeline:
         quote = embeddings.quote()
         if not quote.chunks:
             return ""
-        if not self._embedding_fits(quote.requests, quote.cost):
+        over = " and ".join(self._embedding_over(quote.requests, quote.cost))
+        if over:
             self.log(
-                f"semantic context skipped: embedding {quote.chunks} chunks could "
-                f"cost ${quote.cost:.4f}, over half the limits; raise --max-cost "
-                "or use --context standard"
+                f"semantic context skipped: embedding {quote.chunks} chunks "
+                f"could take {quote.requests} requests and "
+                f"${quote.cost:.4f}, over half of {over}; raise that or use "
+                "--context standard"
             )
             return ""
         failure = ""
@@ -657,7 +663,7 @@ class Pipeline:
         embeddings = self._embeddings(prepared) if embedding else None
         if embeddings is not None:
             need = embeddings.quote()
-            if need.chunks and self._embedding_fits(need.requests, need.cost):
+            if need.chunks and not self._embedding_over(need.requests, need.cost):
                 estimate.items.insert(0, PricedItem(
                     "embed", "", embeddings.model.id, need.tokens, 0, need.cost,
                     False, requests=need.requests,
