@@ -133,6 +133,16 @@ class LLMClient:
         """The cache key of a call whose prompt is identified by `text`."""
         return self._key(self._request(info, system, text, max_output, ""))
 
+    def retried(
+        self, model: str, tag: str
+    ) -> Callable[[int, BaseException, float], None]:
+        """An `on_retry` for `RetryPolicy.run`: each retry, as a "retry" event."""
+
+        def report(attempt: int, err: BaseException, wait: float) -> None:
+            self._emit("retry", model, tag, detail=f"#{attempt} in {wait:.1f}s: {err}")
+
+        return report
+
     def discover(self) -> set[str]:
         """Ask the provider which models this key can use, and route only to those.
 
@@ -371,10 +381,6 @@ class LLMClient:
             token_ceiling(request.system, request.prompt), request.max_output_tokens
         )
 
-        def retried(attempt: int, err: BaseException, wait: float) -> None:
-            detail = f"#{attempt} in {wait:.1f}s: {err}"
-            self._emit("retry", info.id, request.tag, detail=detail)
-
         def attempt() -> Completion:
             # Every attempt is a request: reserved, paced, counted. One that
             # fails keeps its request count but not its money.
@@ -391,7 +397,7 @@ class LLMClient:
                 raise
 
         completion = self.retry.run(
-            attempt, on_retry=retried, stop=self.stop
+            attempt, on_retry=self.retried(info.id, request.tag), stop=self.stop
         )
 
         # A server-side fallback answers under another model's id; never

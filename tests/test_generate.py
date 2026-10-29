@@ -30,20 +30,25 @@ from unittest import mock
 
 from devdocs.config import Config
 from devdocs.errors import (
+    AuthError,
     ConfigError,
     DevDocsError,
+    ModelNotFound,
     ProviderError,
+    QuotaExhausted,
     RateLimited,
 )
 from devdocs.generate import Pipeline, Prepared
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
-from devdocs.index.ledger import DailyUsage
+from devdocs.index.ledger import DailyUsage, quota_day
 from devdocs.llm import Completion, Finish, Request, Usage
 from devdocs.llm.budget import Budget, Router, token_ceiling
-from devdocs.llm.client import LLMClient
-from devdocs.llm.http import RetryPolicy
+from devdocs.llm.catalog import find
+from devdocs.llm.client import CallEvent, LLMClient
+from devdocs.llm.http import HttpResponse, RetryPolicy
+from devdocs.llm.providers import GeminiProvider
 from devdocs.render import Renderer
 from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet
@@ -130,7 +135,8 @@ class PipelineCase(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.model: TaggedModel = TaggedModel()
 
-    def pipeline(self, *, log: Any = None, renderers: Sequence[Renderer] | None = None,
+    def pipeline(self, *, log: Any = None, warn: Any = None,
+                 renderers: Sequence[Renderer] | None = None,
                  **overrides: object) -> Pipeline:
         config = Config(path=self.tmp, **overrides)  # type: ignore[arg-type]
         client = LLMClient(
@@ -143,7 +149,7 @@ class PipelineCase(unittest.TestCase):
             free_tier=False,
         )
         self.client = client
-        return Pipeline(config, client=client, db=self.db, log=log,
+        return Pipeline(config, client=client, db=self.db, log=log, warn=warn,
                         renderers=renderers)
 
     def docs(self) -> dict[str, str]:
@@ -857,9 +863,11 @@ class EmbeddingModel(TaggedModel):
     def __init__(self) -> None:
         super().__init__()
         self.batches: list[list[str]] = []
+        self.attempts = 0
         self.during_embed: Callable[[], None] | None = None
 
     def embed(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
+        self.attempts += 1
         if self.during_embed is not None:
             self.during_embed()
         self.batches.append(list(texts))
@@ -974,6 +982,389 @@ class TestSemanticContext(PipelineCase):
         pipeline.run(pipeline.prepare())
         self.assertEqual(self.embedder.batches, [])
         self.assertTrue(any("semantic context skipped" in m for m in messages))
+
+    def test_a_spent_day_sends_no_embedding(self) -> None:
+        info = find("gemini-embedding-001")
+        assert info is not None and info.free_rpd is not None
+        usage = DailyUsage(self.db)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO usage_day (model, day, requests) VALUES (?, ?, ?)",
+                (info.id, quota_day(), info.free_rpd),
+            )
+        self.assertEqual(usage.requests(info.id), info.free_rpd)
+        messages: list[str] = []
+        pipeline = self.pipeline(context="semantic", log=messages.append)
+        self.client.free_tier = True
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual((self.embedder.attempts, summary.stopped), (0, ""))
+        reached = [m for m in messages if m.startswith("semantic context: reached")]
+        self.assertEqual(len(reached), 1)
+        self.assertGreater(summary.prose, 0)
+
+
+def failing(error: BaseException) -> Callable[[], None]:
+    def fail() -> None:
+        raise error
+
+    return fail
+
+
+class TestEmbeddingFailure(PipelineCase):
+    """An embedding endpoint that stays down costs semantic hits, not the run."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.embedder = EmbeddingModel()
+        self.model = self.embedder
+        self.messages: list[str] = []
+
+    def semantic(self, **overrides: object) -> Pipeline:
+        return self.pipeline(context="semantic", log=self.messages.append, **overrides)
+
+    def warnings(self) -> list[str]:
+        return [m for m in self.messages if m.startswith("warning:")]
+
+    def chunk_a_batch(self) -> None:
+        self.enterContext(mock.patch("devdocs.generate.Embeddings",
+                                     functools.partial(Embeddings, batch=1)))
+
+    def test_no_failure_ends_the_run_or_is_warned_of_twice(self) -> None:
+        # Regression: any of these aborted the run before any prose was bought.
+        lasting = RetryPolicy().attempts
+        for error, attempts in ((RateLimited("slow", retry_after=0, status=429),
+                                 lasting),
+                                (ProviderError("bad gateway", status=502), lasting),
+                                (ProviderError("network error", status=None), lasting),
+                                (ModelNotFound("no such model"), 1),
+                                (ProviderError("bad request", status=400), 1),
+                                (AuthError("this key cannot embed"), 1)):
+            with self.subTest(error.message):
+                self.embedder.during_embed = failing(error)
+                self.embedder.attempts = 0
+                self.messages.clear()
+                pipeline = self.semantic()
+                summary = pipeline.run(pipeline.prepare())
+                self.assertEqual(self.embedder.attempts, attempts)
+                self.assertEqual(summary.semantic_fallback, error.message)
+                self.assertEqual((summary.stopped, summary.failed), ("", []))
+                self.assertEqual(summary.prose, 5)
+                self.assertIn(PROSE, self.docs()["shop/cart.py.md"])
+                (warning,) = self.warnings()
+                self.assertIn(error.message, warning)
+                self.assertIn("standard context", warning)
+
+    def test_a_key_that_is_really_bad_still_ends_the_run_at_its_first_call(
+        self,
+    ) -> None:
+        class BadKey(EmbeddingModel):
+            def generate(self, request: Request) -> Completion:
+                raise AuthError("bad key")
+
+        self.model = self.embedder = BadKey()
+        self.embedder.during_embed = failing(AuthError("bad key"))
+        pipeline = self.semantic()
+        with self.assertRaises(AuthError):
+            pipeline.run(pipeline.prepare())
+        self.assertEqual(len(self.warnings()), 1)
+        self.assertFalse((self.tmp / "docs").exists())
+
+    def test_it_uses_the_clients_policy(self) -> None:
+        self.embedder.during_embed = failing(ProviderError("down", status=503))
+        pipeline = self.semantic()
+        self.client.retry = RetryPolicy(attempts=2, base_delay=0)
+        pipeline.run(pipeline.prepare())
+        self.assertEqual(self.embedder.attempts, 2)
+
+    def test_attempts_count_as_requests_but_cost_nothing(self) -> None:
+        self.embedder.during_embed = failing(ProviderError("down", status=503))
+        pipeline = self.semantic()
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(summary.requests,
+                         len(self.model.calls) + RetryPolicy().attempts)
+        answers = Usage(input_tokens=500, output_tokens=60)
+        prices = [find(request.model) for request in self.model.calls]
+        self.assertAlmostEqual(
+            summary.cost,
+            sum(info.cost(answers) for info in prices if info is not None),
+            places=5,
+        )
+
+    def test_retries_are_reported_like_a_completions(self) -> None:
+        self.embedder.during_embed = failing(ProviderError("down", status=503))
+        events: list[CallEvent] = []
+        pipeline = self.semantic()
+        self.client.on_event = events.append
+        pipeline.run(pipeline.prepare())
+        retries = [e for e in events if e.kind == "retry"]
+        self.assertEqual([(e.model, e.tag) for e in retries],
+                         [("gemini-embedding-001", "embeddings")]
+                         * (RetryPolicy().attempts - 1))
+        self.assertIn("#1 in", retries[0].detail)
+
+    def test_it_recovers_when_a_retry_succeeds(self) -> None:
+        errors = [ProviderError("down", status=503)]
+
+        def once() -> None:
+            if errors:
+                raise errors.pop()
+
+        self.embedder.during_embed = once
+        pipeline = self.semantic()
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual((self.embedder.attempts, len(self.embedder.batches)), (2, 1))
+        self.assertEqual(summary.semantic_fallback, "")
+        self.assertEqual(self.warnings(), [])
+
+    def test_files_without_vectors_get_the_standard_context(self) -> None:
+        self.embedder.during_embed = failing(ProviderError("down", status=503))
+        pipeline = self.semantic()
+        pipeline.run(pipeline.prepare())
+        sent = {request.tag: request.prompt for request in self.model.calls}
+
+        standard = self.pipeline()
+        prepared = standard.prepare()
+        standard.price(prepared)
+        self.assertEqual(sent, {key or kind: prompt.user
+                                for (kind, key), prompt in prepared.prompts.items()})
+
+    def test_the_vectors_bought_before_it_failed_are_used_and_kept(self) -> None:
+        self.chunk_a_batch()
+        sent = []
+
+        def after_the_first() -> None:
+            sent.append(1)
+            if len(sent) > 1:
+                raise ProviderError("bad request", status=400)
+
+        self.embedder.during_embed = after_the_first
+        pipeline = self.semantic()
+        prepared = pipeline.prepare()
+        pipeline.run(prepared)
+        assert prepared.retriever is not None and prepared.retriever.vectors is not None
+        self.assertEqual(len(prepared.retriever.vectors), 1)
+        self.assertEqual(len(self.embedder.batches), 1)
+
+        # The one vector is shop/__init__.py's: the other files' prompts are as
+        # standard context makes them.
+        sent = {request.tag: request.prompt for request in self.model.calls}
+        standard = self.pipeline()
+        plain = standard.prepare()
+        standard.price(plain)
+        for rel in ("shop/cart.py", "shop/cli.py", "shop/money.py"):
+            self.assertEqual(sent[rel], plain.prompts[("file", rel)].user, rel)
+
+    def test_the_next_run_buys_only_what_is_missing(self) -> None:
+        self.chunk_a_batch()
+        sent = []
+
+        def after_the_first() -> None:
+            sent.append(1)
+            if len(sent) > 1:
+                raise ProviderError("bad request", status=400)
+
+        self.embedder.during_embed = after_the_first
+        first = self.semantic()
+        first.run(first.prepare())
+        calls, texts = len(self.model.calls), list(self.embedder.batches)
+
+        self.embedder.during_embed = None
+        again = self.semantic()
+        summary = again.run(again.prepare())
+        self.assertEqual(summary.semantic_fallback, "")
+        self.assertEqual(len(self.model.calls), calls)     # the prose stays bought
+        bought = [text for batch in self.embedder.batches for text in batch]
+        self.assertEqual(len(bought), len(set(bought)))    # each chunk once
+        self.assertEqual(self.embedder.batches[0], texts[0])
+
+    def test_a_stop_while_it_fails_is_a_stop_and_no_failure(self) -> None:
+        pipeline = self.semantic()
+
+        def stopped() -> None:
+            self.client.stop.set()
+            raise ProviderError("down", status=503)
+
+        self.embedder.during_embed = stopped
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(self.embedder.attempts, 1)
+        self.assertEqual(summary.stopped, "interrupted")
+        self.assertEqual(summary.semantic_fallback, "")
+        self.assertEqual((self.warnings(), self.model.calls), ([], []))
+
+    def test_quota_is_no_failure_and_is_not_retried(self) -> None:
+        self.embedder.during_embed = failing(QuotaExhausted("daily quota spent"))
+        pipeline = self.semantic()
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(self.embedder.attempts, 1)
+        self.assertEqual((summary.stopped, summary.semantic_fallback), ("", ""))
+        self.assertEqual(self.warnings(), [])
+        self.assertIn("semantic context: daily quota spent; using the vectors stored",
+                      self.messages)
+        self.assertEqual(summary.prose, 5)
+
+    def test_retries_stay_within_embeddings_share_of_the_requests(self) -> None:
+        # Regression guard: a failure a batch would take twice the requests
+        # quoted, and leave none of the limit for the prose.
+        self.chunk_a_batch()
+        probe = self.pipeline(context="semantic")
+        prepared = probe.prepare()
+        embeddings = probe._embeddings(prepared)
+        assert embeddings is not None
+        batches = embeddings.quote().requests
+        self.assertGreater(batches, 1)
+        tries = []
+
+        def every_other() -> None:
+            tries.append(1)
+            if len(tries) % 2:
+                raise ProviderError("down", status=503)
+
+        self.embedder.during_embed = every_other
+        pipeline = self.semantic(max_requests=2 * batches)
+        summary = pipeline.run(prepared)
+        self.assertEqual(self.embedder.attempts, batches)
+        self.assertEqual(summary.prose, 5)
+        self.assertEqual(summary.stopped, "")
+
+    def test_a_limit_a_cured_failure_used_up_is_no_failure(self) -> None:
+        # Nothing is down, so there is nothing to warn of: the retry only left
+        # the last batch no request.
+        self.chunk_a_batch()
+        probe = self.pipeline(context="semantic")
+        prepared = probe.prepare()
+        embeddings = probe._embeddings(prepared)
+        assert embeddings is not None
+        batches = embeddings.quote().requests
+        errors = [ProviderError("down", status=503)]
+
+        def once() -> None:
+            if errors:
+                raise errors.pop()
+
+        self.embedder.during_embed = once
+        pipeline = self.semantic(max_requests=2 * batches)
+        summary = pipeline.run(prepared)
+        self.assertEqual(self.embedder.attempts, batches)
+        self.assertEqual((summary.semantic_fallback, self.warnings()), ("", []))
+        self.assertIn(f"semantic context: embedding reached its request limit "
+                      f"({batches}); using the vectors stored", self.messages)
+
+    def test_the_warning_goes_where_warnings_go(self) -> None:
+        # Regression: it went to the log alone, which --quiet silences, and the
+        # run exited 0 with nothing to say it had no semantic context.
+        warned: list[str] = []
+        self.embedder.during_embed = failing(ProviderError("down", status=503))
+        pipeline = self.semantic(warn=warned.append)
+        pipeline.run(pipeline.prepare())
+        (warning,) = warned
+        self.assertTrue(warning.startswith("semantic context: embedding failed (down)"),
+                        warning)
+        self.assertFalse([m for m in self.messages if "embedding failed" in m])
+
+    def test_a_tight_request_limit_still_warns_of_what_failed(self) -> None:
+        # Regression: below --max-requests 8, half the limit is under the
+        # policy's attempts, and an outage read as a limit reached: no warning,
+        # and no `semantic_fallback` for --json.
+        self.embedder.during_embed = failing(ProviderError("down", status=503))
+        pipeline = self.semantic(max_requests=6)
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(self.embedder.attempts, 3)
+        self.assertEqual(summary.semantic_fallback, "down")
+        (warning,) = self.warnings()
+        self.assertIn("embedding failed (down)", warning)
+        self.assertFalse([m for m in self.messages if "request limit" in m])
+
+    def test_a_run_with_no_failure_says_nothing_of_one(self) -> None:
+        pipeline = self.semantic()
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual((summary.semantic_fallback, self.warnings()), ("", []))
+
+
+class GeminiWire:
+    """A transport that answers as Gemini's API does, generating as TaggedModel
+    does; `embedding` scripts what each embedding request gets, in turn: a
+    status and body, or an error to raise. Once out of script it answers."""
+
+    def __init__(self, *embedding: tuple[int, Any] | ProviderError) -> None:
+        self.embedding = list(embedding)
+        self.sent = 0
+        self.model = TaggedModel()
+
+    def request(self, method: str, url: str, *, headers: Any = None,
+                body: bytes | None = None) -> HttpResponse:
+        payload = json.loads(body or b"{}")
+        if url.endswith(":batchEmbedContents"):
+            self.sent += 1
+            if self.embedding:
+                outcome = self.embedding.pop(0)
+                if isinstance(outcome, ProviderError):
+                    raise outcome
+                return self.reply(*outcome)
+            return self.reply(200, {"embeddings": [
+                {"values": [1.0] + [0.0] * 7} for _ in payload["requests"]]})
+        text = self.model.generate(Request(
+            model="gemini-2.5-flash-lite",
+            system=payload["systemInstruction"]["parts"][0]["text"],
+            prompt=payload["contents"][0]["parts"][0]["text"],
+        )).text
+        return self.reply(200, {"candidates": [{
+            "content": {"parts": [{"text": text}]}, "finishReason": "STOP",
+        }], "usageMetadata": {"promptTokenCount": 500, "candidatesTokenCount": 60}})
+
+    @staticmethod
+    def reply(status: int, body: Any) -> HttpResponse:
+        return HttpResponse(status, {}, json.dumps(body).encode())
+
+
+class TestEmbeddingFailureOverTheWire(PipelineCase):
+    """The failures named in the reports, as the real provider maps them."""
+
+    LIMITED = (429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0s"},
+    ]}})
+    DOWN = (500, {"error": {"code": 500, "status": "INTERNAL"}})
+    MISSING = (404, {"error": {"code": 404, "status": "NOT_FOUND",
+                               "message": "gemini-embedding-001 is not found"}})
+    NETWORK = ProviderError("network error talking to generativelanguage")
+
+    def run_on(self, *script: Any) -> tuple[GeminiWire, Any, list[str]]:
+        wire = GeminiWire(*script)
+        self.model = GeminiProvider("k", wire, dimensions=8)  # type: ignore[assignment]
+        messages: list[str] = []
+        pipeline = self.pipeline(context="semantic", log=messages.append)
+        return wire, pipeline.run(pipeline.prepare()), messages
+
+    def warnings(self, messages: list[str]) -> list[str]:
+        return [m for m in messages if m.startswith("warning:")]
+
+    def test_a_per_minute_429_is_only_a_delay(self) -> None:
+        # Regression: this one response ended the run, with no page written.
+        wire, summary, messages = self.run_on(self.LIMITED)
+        self.assertEqual(wire.sent, 2)
+        self.assertEqual((summary.semantic_fallback, self.warnings(messages)), ("", []))
+        self.assertEqual(summary.prose, 5)
+
+    def test_what_stays_down_leaves_the_prose_to_be_bought(self) -> None:
+        lasting = RetryPolicy().attempts
+        for script, sent in (([self.LIMITED] * lasting, lasting),
+                             ([self.DOWN] * lasting, lasting),
+                             ([self.NETWORK] * lasting, lasting),
+                             ([self.MISSING], 1)):
+            with self.subTest(script[0]):
+                wire, summary, messages = self.run_on(*script)
+                self.assertEqual(wire.sent, sent)
+                self.assertEqual(summary.prose, 5)
+                self.assertEqual(summary.stopped, "")
+                self.assertEqual(len(self.warnings(messages)), 1)
+                shutil.rmtree(self.tmp / "docs")
+
+    def test_a_days_quota_is_a_stop_as_ever(self) -> None:
+        spent = (429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                                 "message": "limit per day reached"}})
+        wire, summary, messages = self.run_on(spent)
+        self.assertEqual(wire.sent, 1)
+        self.assertEqual((summary.semantic_fallback, self.warnings(messages)), ("", []))
+        self.assertEqual(summary.prose, 5)
 
 
 def dump(db: Database) -> dict[str, list[tuple[Any, ...]]]:
@@ -1119,6 +1510,22 @@ class TestVectorsPaidFor(VectorCase):
         wider = self.semantic()
         summary = wider.run(wider.prepare())
         self.assertEqual((self.embedder.batches, summary.requests), ([], 0))
+
+    def test_a_chunk_left_out_is_not_bought(self) -> None:
+        # Its row may be there with no vector, from a run whose embedding failed.
+        def down() -> None:
+            raise ProviderError("bad request", status=400)
+
+        self.embedder.during_embed = down
+        failed = self.semantic()
+        failed.run(failed.prepare())
+        self.assertEqual(self.vectors(), 0)
+        self.embedder.during_embed = None
+        narrower = self.semantic(exclude=("shop/cli.py",))
+        narrower.run(narrower.prepare())
+        (batch,) = self.embedder.batches
+        self.assertFalse([text for text in batch if text.startswith("shop/cli.py")])
+        self.assertEqual(self.vectors("shop/cli.py"), 0)
 
     def test_retrieval_does_not_see_what_is_left_out(self) -> None:
         self.bought()
