@@ -20,9 +20,11 @@ from devdocs.errors import (
 from devdocs.index.chunk import Chunk, ChunkStore, chunk_file
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
+from devdocs.index.ledger import DailyUsage
 from devdocs.llm import http as http_module
-from devdocs.llm.budget import Budget, RateLimiter, token_ceiling
+from devdocs.llm.budget import Budget, RateLimiter, Router, token_ceiling
 from devdocs.llm.catalog import ModelInfo, find
+from devdocs.llm.client import LLMClient
 from devdocs.llm.http import RetryPolicy
 from devdocs.llm.stop import Interrupted
 from tests.test_http import Watched, stopped_while_waiting
@@ -383,6 +385,41 @@ class TestRetry(EmbedCase):
         down = ProviderError("down", status=503)
         self.assertEqual(self.embeddings(Flaky(down, down, down)).update()[0],
                          len(self.texts))
+
+
+class TestUsage(EmbedCase):
+    """Embedding counts against the day as completions do: per answered call."""
+
+    def test_every_batch_answered_is_recorded(self) -> None:
+        usage = DailyUsage(self.db)
+        embeddings = self.embeddings(usage=usage, batch=2)
+        quote = embeddings.quote()
+        embeddings.update()
+        self.assertEqual(usage.requests(MODEL.id), quote.requests)
+        row = self.db.query_one("SELECT cost_usd FROM usage_day WHERE model = ?",
+                                (MODEL.id,))
+        assert row is not None
+        self.assertAlmostEqual(row["cost_usd"], quote.cost)
+
+    def test_a_failed_attempt_is_not_recorded(self) -> None:
+        usage = DailyUsage(self.db)
+        with self.assertRaises(ProviderError):
+            self.embeddings(Flaky(down_from=0), usage=usage).update()
+        self.assertEqual(usage.requests(MODEL.id), 0)
+
+    def test_a_retried_batch_is_recorded_once(self) -> None:
+        usage = DailyUsage(self.db)
+        self.embeddings(Flaky(ProviderError("down", status=503)), usage=usage).update()
+        self.assertEqual(usage.requests(MODEL.id), 1)
+
+    def test_a_later_process_paces_by_it(self) -> None:
+        # Regression: the count covered this process alone, so a second run the
+        # same day started from zero against the provider's daily limit.
+        usage = DailyUsage(self.db)
+        self.embeddings(usage=usage, batch=1).update()
+        later = LLMClient(Counting(), router=Router("gemini"),  # type: ignore[arg-type]
+                          usage=usage, free_tier=True)
+        self.assertEqual(later.limiter(MODEL).used_today, len(self.texts))
 
 
 class TestStop(EmbedCase):
