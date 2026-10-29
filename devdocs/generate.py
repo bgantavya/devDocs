@@ -16,6 +16,9 @@ useful work. Every paid answer is cached the moment it lands, so an interrupted
 run writes what it has, stubs the rest, and resumes next time without paying
 twice. The run ledger records how each run ended.
 
+Embedding comes first, in semantic mode, and is retried like any call. If it
+still fails the run goes on: a file with no vector gets the standard context.
+
 A stop request (the client's `stop` set, as the CLI does on Ctrl-C or
 SIGTERM) sends nothing more, but the waves still run through: calls already
 sent finish and are kept, and every other prompt gets the answer an earlier
@@ -64,6 +67,7 @@ from devdocs.errors import (
     ConfigError,
     DevDocsError,
     Interrupted,
+    ProviderError,
     QuotaExhausted,
 )
 from devdocs.graph import GraphBuilder, ProjectGraph
@@ -217,6 +221,7 @@ class RunSummary:
     degraded: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     written: WriteReport = field(default_factory=WriteReport)
+    semantic_fallback: str = ""   # why embedding failed, leaving standard context
 
 
 @dataclass
@@ -287,9 +292,11 @@ class Pipeline:
 
     `client` is required for `price`, `estimate` and `run`; `prepare`,
     `check`, `write` and `export` need none. `log` receives one-line progress
-    messages for the CLI. Without `renderers`, there is one per configured
-    format, built now so that a missing PDF engine fails before any call.
-    `warnings` and `failures` describe the last write.
+    messages for the CLI, and `warn` what must be said even with progress
+    silenced; without it, that goes to `log`, marked as a warning. Without
+    `renderers`, there is one per configured format, built now so that a
+    missing PDF engine fails before any call. `warnings` and `failures`
+    describe the last write.
     """
 
     def __init__(
@@ -300,6 +307,7 @@ class Pipeline:
         db: Database | None = None,
         renderers: Sequence[Renderer] | None = None,
         log: Callable[[str], None] | None = None,
+        warn: Callable[[str], None] | None = None,
         project: str = "",
         description: str = "",
     ) -> None:
@@ -315,6 +323,7 @@ class Pipeline:
         self.warnings: list[str] = []
         self.failures: list[tuple[str, DevDocsError]] = []   # (format, error)
         self.log = log or (lambda message: None)
+        self.warn = warn or (lambda message: self.log(f"warning: {message}"))
         self.project = project or project_name(self.root)
         self.description = description
         self.builder = PromptBuilder(project=self.project, description=description)
@@ -447,10 +456,13 @@ class Pipeline:
         if client is not None:
             embeddings.budget = client.budget
             embeddings.stop = client.stop
+            embeddings.retry = client.retry
+            embeddings.max_requests = int(self.config.max_requests * _EMBED_SHARE)
             if isinstance(client.model, Embedder):
                 embeddings.embedder = client.model
                 embeddings.dims = client.model.dimensions
                 embeddings.limiter = client.limiter(info)
+                embeddings.on_retry = client.retried(info.id, "embeddings")
         return embeddings
 
     @staticmethod
@@ -467,9 +479,10 @@ class Pipeline:
             return False
         return not config.max_requests or requests <= config.max_requests * _EMBED_SHARE
 
-    def _embed(self, prepared: Prepared) -> None:
+    def _embed(self, prepared: Prepared) -> str:
         """Bring the store up to date with this run's files and embed the
-        chunks that lack a vector, if that fits the limits.
+        chunks that lack a vector, if that fits the limits. Returns why
+        embedding failed; "" if it did not.
 
         Only the chunks of a file that changed or is gone lose their vectors.
         A file this run merely leaves out or cannot reach keeps them: they stay
@@ -478,31 +491,42 @@ class Pipeline:
         run's chunks, do not see.
 
         A stop on budget or quota costs only semantic hits: the vectors
-        stored so far are used and the run goes on.
+        stored so far are used and the run goes on. So does a stop request,
+        after which the run goes on with what is free. So does a failure the
+        retries did not cure, warned of once: the prompt of a file with no
+        vector then carries standard context, and the next run tries again.
+        It may be a bad key, but the first paid call says so if it is.
         """
         embeddings = self._embeddings(prepared)
         if embeddings is None or prepared.retriever is None:
-            return
+            return ""
         for rel, group in prepared.chunks.items():
             embeddings.store.replace(rel, group)
         embeddings.store.prune(lambda source: _still_there(self.root / source))
         quote = embeddings.quote()
         if not quote.chunks:
-            return
+            return ""
         if not self._embedding_fits(quote.requests, quote.cost):
             self.log(
                 f"semantic context skipped: embedding {quote.chunks} chunks could "
                 f"cost ${quote.cost:.4f}, over half the limits; raise --max-cost "
                 "or use --context standard"
             )
-            return
+            return ""
+        failure = ""
         try:
             done, spent = embeddings.update()
         except (BudgetExceeded, QuotaExhausted, Interrupted) as err:
             self.log(f"semantic context: {err.message}; using the vectors stored")
+        except (ProviderError, AuthError) as err:
+            failure = err.message
+            self.warn(f"semantic context: embedding failed ({failure}); files "
+                      "without vectors get standard context, and the next run tries "
+                      "again")
         else:
             self.log(f"embedded {done} chunks (${spent:.4f})")
         self._attach(prepared.retriever, embeddings)
+        return failure
 
     # -- prompts and prices ------------------------------------------------
 
@@ -688,7 +712,8 @@ class Pipeline:
         "interrupted". A KeyboardInterrupt in a wave, as Python raises on Ctrl-C
         when no handler sets the stop instead, is raised again once the documents
         are written. A format that fails to render is reported in `failed`,
-        the others written.
+        the others written. An embedding endpoint that stays down costs only
+        semantic context, as `semantic_fallback` then says; see `_embed`.
 
         A write that would be refused, see `check`, raises ConfigError
         before anything is bought, and a KeyboardInterrupt while that is
@@ -702,9 +727,9 @@ class Pipeline:
         client = self._client()
         if not checked:
             self.check(prepared, force=force)
-        self._embed(prepared)
+        fallback = self._embed(prepared)
         self.price(prepared, embedding=False)
-        summary = RunSummary()
+        summary = RunSummary(semantic_fallback=fallback)
         ledger = RunLedger(self.db) if self.db is not None else None
         if ledger is not None:
             fingerprint = config_fingerprint(

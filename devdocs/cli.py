@@ -478,7 +478,7 @@ def _generate(
     key = _key(config, args.api_key, out)
     with _state(config) as db:
         client = _client(config, db, out, key=key, stop=interrupts.event)
-        pipeline = Pipeline(config, client=client, db=db, log=out.info,
+        pipeline = Pipeline(config, client=client, db=db, log=out.info, warn=out.warn,
                             project=config.name, description=config.description)
         available = client.discover()
         out.info(f"{config.provider}: {len(available)} models available to this key")
