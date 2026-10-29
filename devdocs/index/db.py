@@ -1,9 +1,9 @@
 """The one SQLite file, its schema, and the migration chain.
 
 Three things need to persist between runs: cached provider responses, embedded
-chunks, and the ledger that lets an interrupted run resume. They live in one
-file so a run has one transaction boundary and one place to migrate, rather
-than three databases that can disagree about what completed.
+chunks, and the ledger that records each run. They live in one file so a run
+has one transaction boundary and one place to migrate, rather than three
+databases that can disagree about what completed.
 
 Migrations are an ordered list applied by `PRAGMA user_version`. They only ever
 move forward; a database from a newer devdocs is refused rather than guessed
@@ -111,6 +111,38 @@ MIGRATIONS: tuple[str, ...] = (
     # needs to tell a stale vector from a current one of the same size
     """
     ALTER TABLE chunk ADD COLUMN model TEXT NOT NULL DEFAULT '';
+    """,
+    # 4 — what nothing reads: the ledger's items, as the cache is what resumes a
+    # run; its cost and request columns, which nothing ever filled; when a run
+    # finished; and each chunk's text, symbol and end line, which a run has from
+    # its scan. Rebuilt, as DROP COLUMN needs SQLite 3.35.
+    """
+    DROP TABLE run_item;
+
+    CREATE TABLE run_v4 (
+        id          TEXT PRIMARY KEY,
+        started_at  REAL NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'running',
+        config_hash TEXT NOT NULL DEFAULT ''
+    );
+    INSERT INTO run_v4 (id, started_at, status, config_hash)
+        SELECT id, started_at, status, config_hash FROM run;
+    DROP TABLE run;
+    ALTER TABLE run_v4 RENAME TO run;
+
+    CREATE TABLE chunk_v4 (
+        id          TEXT PRIMARY KEY,
+        source      TEXT NOT NULL,
+        start_line  INTEGER NOT NULL DEFAULT 0,
+        embedding   BLOB,
+        dims        INTEGER NOT NULL DEFAULT 0,
+        model       TEXT NOT NULL DEFAULT ''
+    );
+    INSERT INTO chunk_v4 (id, source, start_line, embedding, dims, model)
+        SELECT id, source, start_line, embedding, dims, model FROM chunk;
+    DROP TABLE chunk;
+    ALTER TABLE chunk_v4 RENAME TO chunk;
+    CREATE INDEX chunk_source ON chunk(source);
     """,
 )
 
@@ -255,7 +287,6 @@ class Database:
 
         try:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON")
             # WAL lets the pool's threads read the cache while one writes.
             self._enable_wal(conn)
             conn.execute("PRAGMA synchronous = NORMAL")

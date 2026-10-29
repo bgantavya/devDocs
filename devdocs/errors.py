@@ -127,10 +127,11 @@ class ModelNotFound(ProviderError):
 class QuotaExhausted(ProviderError):
     """A daily or plan quota is used up. Waiting minutes will not help.
 
-    Distinct from RateLimited so the run stops cleanly and can resume from the
-    ledger tomorrow, instead of sleeping inside a request until a timeout.
-    The default hint names a command the CLI accepts: `devdocs generate`
-    resumes by default. A 402 is a billing problem, which no wait fixes.
+    Distinct from RateLimited so the run stops cleanly, its answers cached for
+    a later run to buy only the rest, instead of sleeping inside a request
+    until a timeout. The default hint names a command the CLI accepts:
+    `devdocs generate` resumes by default. A 402 is a billing problem, which
+    no wait fixes.
     """
 
     exit_code = 10
@@ -159,8 +160,8 @@ class QuotaExhausted(ProviderError):
 class BudgetExceeded(DevDocsError):
     """The run hit its spend or token ceiling and stopped on purpose.
 
-    Not an error in the usual sense: work completed before the ceiling is kept
-    and the run ledger can resume it later.
+    Not an error in the usual sense: work completed before the ceiling is kept,
+    its answers cached, and running again buys only the rest.
     """
 
     exit_code = 7

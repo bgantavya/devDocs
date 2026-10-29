@@ -12,9 +12,9 @@ changes nothing stored there.
 Calls go out on a thread pool in three waves — files, then modules (which
 read the files' purposes), then the architecture overview (which reads the
 modules') — most valuable first, so a budget or quota stop cuts the least
-useful work. Every paid answer is cached the moment it lands and every item
-is recorded in the run ledger, so an interrupted run writes what it has,
-stubs the rest, and resumes next time without paying twice.
+useful work. Every paid answer is cached the moment it lands, so an interrupted
+run writes what it has, stubs the rest, and resumes next time without paying
+twice. The run ledger records how each run ended.
 
 A stop request (the client's `stop` set, as the CLI does on Ctrl-C or
 SIGTERM) sends nothing more, but the waves still run through: calls already
@@ -71,7 +71,7 @@ from devdocs.history import FileHistory, GitHistory
 from devdocs.index.chunk import Chunk, ChunkStore, chunk_file
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
-from devdocs.index.ledger import ItemStatus, LedgerItem, RunLedger, config_fingerprint
+from devdocs.index.ledger import RunLedger, config_fingerprint
 from devdocs.index.search import LexicalIndex, VectorIndex
 from devdocs.issues import Issue, find_issues
 from devdocs.llm import Completion, Embedder
@@ -683,7 +683,7 @@ class Pipeline:
 
         Documents are written even when the run stops early on budget, quota
         or a stop request: whatever was paid for is kept, the rest is
-        stubbed, and the ledger leaves the run resumable. A stop request,
+        stubbed, and the next run buys only that. A stop request,
         `client.stop` set before the waves end, makes `stopped`
         "interrupted". A KeyboardInterrupt in a wave, as Python raises on Ctrl-C
         when no handler sets the stop instead, is raised again once the documents
@@ -712,10 +712,6 @@ class Pipeline:
                 self.config.include, self.config.exclude,
             )
             summary.run_id, summary.resumed = ledger.start(fingerprint, resume=resume)
-            ledger.plan(summary.run_id, [
-                LedgerItem(key or kind, kind, _sha(p.system + p.cache_text))
-                for (kind, key), p in sorted(prepared.prompts.items())
-            ])
 
         guard = StyleGuard(known=self._known(prepared))
         prose: dict[tuple[str, str], Prose] = {}
@@ -731,7 +727,7 @@ class Pipeline:
 
         client.on_event = count
         try:
-            self._waves(prepared, prose, guard, summary, ledger)
+            self._waves(prepared, prose, guard, summary)
         except KeyboardInterrupt as err:
             summary.stopped = "interrupted"
             interrupted = err
@@ -786,11 +782,10 @@ class Pipeline:
         prose: dict[tuple[str, str], Prose],
         guard: StyleGuard,
         summary: RunSummary,
-        ledger: RunLedger | None,
     ) -> None:
         files = [p for p in self._file_prompts(prepared)
                  if ("file", p.key) in prepared.prompts]
-        self._wave(files, prose, guard, prepared, summary, ledger)
+        self._wave(files, prose, guard, prepared, summary)
 
         summaries = self._docstring_summaries(prepared)
         for (kind, key), result in prose.items():
@@ -798,7 +793,7 @@ class Pipeline:
                 summaries[key] = first_sentence(result.reply.purpose)
         modules = [p for p in self._module_prompts(prepared, summaries)
                    if ("module", p.key) in prepared.prompts]
-        self._wave(modules, prose, guard, prepared, summary, ledger)
+        self._wave(modules, prose, guard, prepared, summary)
 
         module_summaries = {
             key: first_sentence(result.reply.purpose)
@@ -807,7 +802,7 @@ class Pipeline:
         }
         overview = self._architecture_prompt(prepared, module_summaries)
         if overview is not None and ("architecture", "") in prepared.prompts:
-            self._wave([overview], prose, guard, prepared, summary, ledger)
+            self._wave([overview], prose, guard, prepared, summary)
 
     def _wave(
         self,
@@ -816,7 +811,6 @@ class Pipeline:
         guard: StyleGuard,
         prepared: Prepared,
         summary: RunSummary,
-        ledger: RunLedger | None,
     ) -> None:
         """Send one wave of calls, most valuable first, recording each outcome
         as it lands.
@@ -852,7 +846,7 @@ class Pipeline:
                 done, _ = wait(list(futures), timeout=_TICK,
                                return_when=FIRST_COMPLETED)
                 for future in sorted(done, key=lambda f: futures[f].key):
-                    self._settle(future, futures.pop(future), prose, summary, ledger)
+                    self._settle(future, futures.pop(future), prose, summary)
         except KeyboardInterrupt:
             stop.set()
             raise
@@ -866,9 +860,7 @@ class Pipeline:
         prompt: Prompt,
         prose: dict[tuple[str, str], Prose],
         summary: RunSummary,
-        ledger: RunLedger | None,
     ) -> None:
-        source = prompt.key or prompt.kind
         try:
             result = future.result()
         except Interrupted:
@@ -885,21 +877,13 @@ class Pipeline:
             raise
         except DevDocsError as err:
             summary.failed.append((prompt.kind, prompt.key, err.message))
-            if ledger is not None and summary.run_id:
-                ledger.mark(summary.run_id, source, prompt.kind, ItemStatus.FAILED,
-                            error=err.message)
-            self.log(f"failed {prompt.kind} {source}: {err.message}")
+            self.log(f"failed {prompt.kind} {prompt.key or prompt.kind}: {err.message}")
             return
 
         if result is None:
             summary.failed.append((prompt.kind, prompt.key, "no usable reply"))
-            if ledger is not None and summary.run_id:
-                ledger.mark(summary.run_id, source, prompt.kind, ItemStatus.FAILED,
-                            error="no usable reply")
             return
         prose[(prompt.kind, prompt.key)] = result
-        if ledger is not None and summary.run_id:
-            ledger.mark(summary.run_id, source, prompt.kind, ItemStatus.DONE)
 
     def _ask(
         self, prompt: Prompt, guard: StyleGuard, allowed: tuple[str, ...]

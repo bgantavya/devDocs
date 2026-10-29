@@ -19,13 +19,7 @@ from devdocs.errors import (
 )
 from devdocs.index import Database
 from devdocs.index.cache import ResponseCache
-from devdocs.index.ledger import (
-    DailyUsage,
-    ItemStatus,
-    LedgerItem,
-    RunLedger,
-    quota_day,
-)
+from devdocs.index.ledger import DailyUsage, RunLedger, quota_day
 from devdocs.llm import Completion, Finish, Request, Usage
 from devdocs.llm.budget import Budget, Router, token_ceiling
 from devdocs.llm.catalog import Tier, find
@@ -637,15 +631,10 @@ class TestRunLedger(unittest.TestCase):
         self.db = Database(":memory:")
         self.addCleanup(self.db.close)
         self.ledger = RunLedger(self.db)
-        self.items = [
-            LedgerItem("a.py", "file", "h1"),
-            LedgerItem("b.py", "file", "h2"),
-        ]
 
     def test_new_run_then_resume(self) -> None:
         run, resumed = self.ledger.start("cfg")
         self.assertFalse(resumed)
-        self.ledger.plan(run, self.items)
         self.ledger.finish(run, "interrupted")
         again, resumed = self.ledger.start("cfg")
         self.assertEqual((again, resumed), (run, True))
@@ -661,34 +650,6 @@ class TestRunLedger(unittest.TestCase):
         run, _ = self.ledger.start("cfg")
         self.ledger.finish(run)
         self.assertNotEqual(self.ledger.start("cfg")[0], run)
-
-    def test_done_work_is_not_redone(self) -> None:
-        run, _ = self.ledger.start("cfg")
-        self.ledger.plan(run, self.items)
-        self.ledger.mark(run, "a.py", "file", ItemStatus.DONE, cost=0.01)
-        self.assertEqual([i.source for i in self.ledger.pending(run)], ["b.py"])
-        self.assertEqual(self.ledger.plan(run, self.items), 1)
-
-    def test_changed_source_is_redone(self) -> None:
-        run, _ = self.ledger.start("cfg")
-        self.ledger.plan(run, self.items)
-        self.ledger.mark(run, "a.py", "file", ItemStatus.DONE)
-        self.ledger.plan(run, [LedgerItem("a.py", "file", "h1-edited")])
-        self.assertIn("a.py", [i.source for i in self.ledger.pending(run)])
-
-    def test_failed_items_are_retried(self) -> None:
-        run, _ = self.ledger.start("cfg")
-        self.ledger.plan(run, self.items)
-        self.ledger.mark(run, "a.py", "file", ItemStatus.FAILED, error="boom")
-        self.assertIn("a.py", [i.source for i in self.ledger.pending(run)])
-
-    def test_totals(self) -> None:
-        run, _ = self.ledger.start("cfg")
-        self.ledger.plan(run, self.items)
-        self.ledger.mark(run, "a.py", "file", ItemStatus.DONE, cost=0.25)
-        totals = self.ledger.totals(run)
-        self.assertEqual((totals.done, totals.pending), (1, 1))
-        self.assertAlmostEqual(totals.cost_usd, 0.25)
 
 
 class TestDailyUsage(unittest.TestCase):
