@@ -457,6 +457,7 @@ class Pipeline:
             embeddings.budget = client.budget
             embeddings.stop = client.stop
             embeddings.retry = client.retry
+            embeddings.usage = client.usage
             embeddings.max_requests = int(self.config.max_requests * _EMBED_SHARE)
             if isinstance(client.model, Embedder):
                 embeddings.embedder = client.model

@@ -1,4 +1,5 @@
-"""The one door every model call goes through.
+"""The one door every completion goes through; embedding batches keep the same
+rules in `devdocs.index.embed`.
 
 `LLMClient.complete` is where the cost rules compose, in this order:
 

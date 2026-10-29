@@ -147,10 +147,10 @@ class Router:
 class RateLimiter:
     """Sliding-window pacing for one model: requests per minute and per day.
 
-    The per-day count only covers this process, since the provider's own
-    counter cannot be read. It still stops a single long run from ploughing
-    into the daily wall mid-file; the provider's 429 covers the rest. With
-    `day` (the provider's quota day) the count starts again from zero when
+    The daily count starts from `used_today`, what earlier runs recorded, since
+    the provider's own counter cannot be read. It stops a long run from
+    ploughing into the daily wall mid-file; the provider's 429 covers the rest.
+    With `day` (the provider's quota day) the count starts again from zero when
     that day turns, as the provider's does.
     """
 
