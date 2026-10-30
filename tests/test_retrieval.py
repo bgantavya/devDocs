@@ -61,6 +61,23 @@ class TestChunks(unittest.TestCase):
         self.assertEqual(first[1].id, second[1].id)        # Money unchanged
         self.assertNotEqual(first[2].id, second[2].id)     # parse_amount edited
 
+    def test_an_id_stays_the_same_for_valid_text(self) -> None:
+        # A new id would lose the vector paid for under the old one.
+        source = '"""Doc: 日本."""\n\n\ndef f() -> int:\n    return 1\n'
+        chunks = chunk_file("café.py", source, facts("café.py", source))
+        self.assertEqual([c.id for c in chunks], ["745132f0ad747b02f7968cf446fc3e64",
+                                                  "30e82cce0f4afa811906a53131bb3309"])
+
+    def test_a_docstring_may_spell_a_lone_surrogate(self) -> None:
+        # Regression: parsing decodes the escape, and hashing the chunk raised.
+        pair = chr(0xD83D) + chr(0xDE00)
+        for escape, text in (("\\ud83d\\ude00", pair), ("\\udce9", chr(0xDCE9))):
+            with self.subTest(escape):
+                source = f'"""Doc: {escape}."""\n\n\ndef f() -> int:\n    return 1\n'
+                chunks = chunk_file("odd.py", source, facts("odd.py", source))
+                self.assertIn(f"Doc: {text}.", chunks[0].text)
+                self.assertEqual(len({c.id for c in chunks}), 2)
+
     def test_long_classes_split_into_members(self) -> None:
         body = "".join(
             f"    def m{i}(self):\n        return {i}\n\n" for i in range(40)
