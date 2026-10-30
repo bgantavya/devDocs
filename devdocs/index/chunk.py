@@ -11,6 +11,11 @@ embedding already paid for. `ChunkStore` replaces a file's chunks wholesale
 but keeps every row whose id survives, which is what makes re-indexing an
 edited repository cost only the edits. A file left out of one run keeps its
 vectors too, as they stay valid and a later run may select it again.
+
+A chunk's text may hold lone surrogates, as a module docstring that spells one
+as an escape parses to, and its source too, as an undecodable POSIX file name
+reads. So the id hashes them losslessly, and a source is stored through
+`encode_text`; valid text hashes and stores as ever, so existing rows match.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from array import array
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 
-from devdocs.index.db import Database
+from devdocs.index.db import Database, decode_text, encode_text
 from devdocs.parse import FileFacts, Symbol, SymbolKind
 
 __all__ = ["Chunk", "ChunkStore", "chunk_file"]
@@ -44,7 +49,8 @@ def _chunk(source: str, symbol: str, start: int, end: int, body: str) -> Chunk:
     text = f"{label}\n{body}"
     if len(text) > _MAX_CHARS:
         text = text[:_MAX_CHARS].rsplit("\n", 1)[0]
-    digest = hashlib.sha256(f"{source}\0{symbol}\0{text}".encode()).hexdigest()
+    identity = f"{source}\0{symbol}\0{text}".encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()
     return Chunk(digest[:32], source, symbol, start, end, text)
 
 
@@ -122,7 +128,7 @@ class ChunkStore:
         with self.db.transaction() as conn:
             existing = {
                 row["id"] for row in conn.execute(
-                    "SELECT id FROM chunk WHERE source = ?", (source,)
+                    "SELECT id FROM chunk WHERE source = ?", (encode_text(source),)
                 )
             }
             stale = existing - ids
@@ -131,7 +137,7 @@ class ChunkStore:
             conn.executemany(
                 "INSERT OR IGNORE INTO chunk (id, source, start_line) "
                 "VALUES (?, ?, ?)",
-                [(c.id, c.source, c.start_line) for c in fresh],
+                [(c.id, encode_text(c.source), c.start_line) for c in fresh],
             )
         return len(fresh), len(stale)
 
@@ -142,7 +148,7 @@ class ChunkStore:
             gone = [
                 row["source"]
                 for row in conn.execute("SELECT DISTINCT source FROM chunk")
-                if not exists(row["source"])
+                if not exists(decode_text(row["source"]))
             ]
             removed = 0
             for source in gone:
