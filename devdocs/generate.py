@@ -183,7 +183,15 @@ class PricedItem:
 @dataclass
 class Estimate:
     items: list[PricedItem] = field(default_factory=list)
-    demoted: list[tuple[str, str]] = field(default_factory=list)
+    # each item cut to fit, with the limit that cut it; see `fit_to_budget`
+    demoted: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    @property
+    def demoted_by(self) -> list[str]:
+        """The limits that cut the plan, as the config names them: none,
+        either or both."""
+        return [name for name in ("max_cost", "max_requests")
+                if name in self.demoted.values()]
 
     @property
     def requests(self) -> int:
@@ -682,26 +690,43 @@ class Pipeline:
         those answers exist and taken from docstrings where they do not yet;
         the architecture prompt likewise. So an estimate after a run is free
         exactly when the run would be. With `embedding`, the vectors semantic
-        context still needs are quoted too, and their cost held back.
+        context still needs are quoted too, and their cost held back. The cut
+        counts only the calls a run would make: an answer the cache holds is
+        free and never cut, but an overview of an answer the plan buys is
+        asked again, at its price as a call; see `fit_to_budget`. If no model
+        is left to ask it, that ConfigError is raised here, before anything
+        is bought, rather than by the run once it has paid for the rest.
         """
         client = self._client()
         guard = StyleGuard(known=self._known(prepared))
         describe = {p.relpath: p.describe for p in prepared.plan.files}
         estimate = Estimate()
         costs: dict[tuple[str, str], float] = {}
+        again: dict[tuple[str, str], PricedItem] = {}   # cached overviews, as calls
+        unaskable: dict[tuple[str, str], ConfigError] = {}   # no model left for those
+        uncached = LLMClient(client.model, router=client.router)   # quotes a call
 
         def quote(prompt: Prompt) -> Prose | None:
+            item = (prompt.kind, prompt.key)
             result = client.quote(
                 prompt.tier, prompt.system, prompt.user,
                 max_output_tokens=prompt.max_output_tokens,
                 identity=prompt.cache_text,
             )
-            costs[(prompt.kind, prompt.key)] = 0.0 if result.cached else result.cost
-            estimate.items.append(PricedItem(
+            priced = PricedItem(
                 prompt.kind, prompt.key, result.model, result.input_tokens,
                 result.output_tokens, result.cost, result.cached,
-            ))
-            prepared.prompts[(prompt.kind, prompt.key)] = prompt
+            )
+            estimate.items.append(priced)
+            costs[item] = priced.cost
+            if result.cached and prompt.kind != "file":
+                try:
+                    again[item] = self._as_call(uncached, prompt)
+                except ConfigError as err:   # an error only if the plan asks it again
+                    again[item] = replace(priced, cached=False)
+                    unaskable[item] = err
+                costs[item] = again[item].cost
+            prepared.prompts[item] = prompt
             if not result.cached:
                 return None
             allowed = describe.get(prompt.key, ()) if prompt.kind == "file" else ()
@@ -725,22 +750,34 @@ class Pipeline:
         max_cost = self.config.max_cost
         if max_cost:
             max_cost = max(max_cost - held_cost, 1e-9)
-        cached = sum(1 for item in estimate.items if item.cached)
         limit = 0
         if self.config.max_requests:
-            limit = max(self.config.max_requests - held_requests, 1) + cached
-        estimate.demoted = fit_to_budget(
-            prepared.plan, costs, max_cost=max_cost, max_requests=limit
+            limit = max(self.config.max_requests - held_requests, 1)
+        fit = fit_to_budget(
+            prepared.plan, costs, max_cost=max_cost, max_requests=limit,
+            cached={(i.kind, i.key) for i in estimate.items if i.cached},
         )
-        if estimate.demoted:
-            dropped = set(estimate.demoted)
-            estimate.items = [
-                i for i in estimate.items if (i.kind, i.key) not in dropped
-            ]
-            for kind_key in dropped:
-                prepared.prompts.pop(kind_key, None)
-            prepared.cut += estimate.demoted
+        for item in sorted(fit.rebuilt & unaskable.keys()):
+            raise unaskable[item]
+        estimate.demoted = fit.cut
+        estimate.items = [
+            again[(i.kind, i.key)] if (i.kind, i.key) in fit.rebuilt else i
+            for i in estimate.items if (i.kind, i.key) not in fit.cut
+        ]
+        prepared.cut += fit.cut
+        for item in fit.cut:
+            prepared.prompts.pop(item, None)
         return estimate
+
+    @staticmethod
+    def _as_call(uncached: LLMClient, prompt: Prompt) -> PricedItem:
+        """A cached overview priced as the call the run makes to ask `prompt`
+        again. ConfigError if no model is left to ask it: `price` raises that
+        only once the plan would ask, so before anything is bought."""
+        quote = uncached.quote(prompt.tier, prompt.system, prompt.user,
+                               max_output_tokens=prompt.max_output_tokens)
+        return PricedItem(prompt.kind, prompt.key, quote.model, quote.input_tokens,
+                          quote.output_tokens, quote.cost, cached=False)
 
     def estimate(self, prepared: Prepared) -> Estimate:
         return self.price(prepared)

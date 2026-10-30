@@ -578,8 +578,10 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
             lines.append(f"free tier: about {days} days of daily quota; "
                          "runs resume where they stop")
     if estimate.demoted:
+        flags = {"max_cost": f"--max-cost ${config.max_cost:g}",
+                 "max_requests": f"--max-requests {config.max_requests}"}
         lines.append(f"{len(estimate.demoted)} items left as stubs to fit "
-                     f"--max-cost ${config.max_cost:g}")
+                     + " and ".join(flags[name] for name in estimate.demoted_by))
     if args.explain:
         lines.append("")
         for entry in plan.files:
@@ -594,6 +596,7 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
         "output_tokens": estimate.output_tokens,
         "max_cost_usd": round(estimate.cost, 6),
         "demoted": [list(item) for item in estimate.demoted],
+        "demoted_by": estimate.demoted_by,
         "items": [asdict(item) for item in estimate.items],
     })
     return 0

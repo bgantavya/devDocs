@@ -40,7 +40,7 @@ from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet
 from devdocs.render.pdf import external
 from devdocs.render.pdf.check import PdfFile, check
-from tests.test_generate import PROJECT, PROSE, TaggedModel
+from tests.test_generate import MORE, PROJECT, PROSE, TaggedModel
 
 _KEYS = ("DEVDOCS_", "GEMINI_", "GOOGLE_", "ANTHROPIC_")
 
@@ -340,6 +340,78 @@ class TestEstimate(CliCase):
         self.assertEqual(code, 0, err)
         self.assertIn("\n0 model calls (none), 5 already cached\n", out)
 
+    def priced(self, *argv: str) -> tuple[str, dict[str, Any]]:
+        """`estimate`'s result lines, and its JSON for the same command."""
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet", *argv)
+        self.assertEqual(code, 0, err)
+        code, data, err = self.run_cli("estimate", str(self.root), "--quiet", "--json",
+                                       *argv)
+        self.assertEqual(code, 0, err)
+        return out, json.loads(data)
+
+    def costs(self) -> tuple[float, list[float]]:
+        """With no limit: the module's worst case, then its files', as they are
+        walked after it. The module costs the most: the tests below need that."""
+        _, data = self.priced("--max-cost", "0")
+        module = next(i["cost"] for i in data["items"] if i["kind"] == "module")
+        files = [i["cost"] for i in data["items"] if i["kind"] == "file"]
+        self.assertGreater(module, sum(files))
+        return module, files
+
+    def cut(self, *argv: str) -> tuple[str, list[str]]:
+        """The line on what `argv` left as stubs, and which limits --json names."""
+        out, data = self.priced(*argv)
+        (line,) = [line for line in out.splitlines() if "to fit" in line]
+        return line, data["demoted_by"]
+
+    def test_the_limit_that_made_the_cut_is_named(self) -> None:
+        # Regression: it was always --max-cost, also with the requests to blame.
+        module, files = self.costs()
+        room = 0.00001
+        spare = module + files[0] + room       # holds the first two items, no more
+        for argv, line, named in (
+            (["--max-requests", "2"],          # beside the default cost limit
+             "3 items left as stubs to fit --max-requests 2", ["max_requests"]),
+            (["--max-requests", "2", "--max-cost", "0"],
+             "3 items left as stubs to fit --max-requests 2", ["max_requests"]),
+            (["--max-requests", "1", "--max-cost", f"{spare}"],
+             "4 items left as stubs to fit --max-requests 1", ["max_requests"]),
+            (["--max-cost", "0.0000001"],
+             "5 items left as stubs to fit --max-cost $1e-07", ["max_cost"]),
+            (["--max-cost", "0.0000001", "--max-requests", "2"],
+             "5 items left as stubs to fit --max-cost $1e-07", ["max_cost"]),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.cut(*argv), (line, named))
+
+    def test_what_cost_cut_before_the_requests_ran_out_is_named_too(self) -> None:
+        # The module is over the cost limit, then two files spend the requests.
+        _, files = self.costs()
+        limit = f"{files[0] + files[1] + 0.00001:.8f}"
+        line, named = self.cut("--max-cost", limit, "--max-requests", "2")
+        self.assertEqual(line, "3 items left as stubs to fit "
+                               f"--max-cost ${float(limit):g} and --max-requests 2")
+        self.assertEqual(named, ["max_cost", "max_requests"])
+
+    def test_a_request_limit_nothing_passed_is_not_named(self) -> None:
+        _, files = self.costs()
+        # All it cut is the module, before the fourth file spent the requests.
+        limit = f"{sum(files) + 0.00001:.8f}"
+        line, named = self.cut("--max-cost", limit, "--max-requests", "4")
+        self.assertEqual(line, "1 items left as stubs to fit "
+                               f"--max-cost ${float(limit):g}")
+        self.assertEqual(named, ["max_cost"])
+        # Past the last file kept, too, the cost made the cut: requests are left.
+        limit = f"{files[0] + 0.00001:.8f}"
+        line, named = self.cut("--max-cost", limit, "--max-requests", "5")
+        self.assertIn(f"to fit --max-cost ${float(limit):g}", line)
+        self.assertEqual(named, ["max_cost"])
+
+    def test_nothing_cut_names_nothing(self) -> None:
+        out, data = self.priced("--max-requests", "50")
+        self.assertNotIn("to fit", out)
+        self.assertEqual((data["demoted"], data["demoted_by"]), ([], []))
+
     def test_semantic_estimate_quotes_the_embeddings_first(self) -> None:
         code, out, _ = self.run_cli("estimate", str(self.root), "--context",
                                     "semantic", "--json")
@@ -366,6 +438,130 @@ class TestEstimate(CliCase):
         self.assertIn("shop/cart.py", out)
         self.assertNotIn("shop/cli.py", out)
         self.assertNotIn("shop/money.py", out)
+
+
+class TestLimitsCountCalls(CliCase):
+    """A limit counts the calls a run makes, never an answer the cache holds:
+    a shop of six files, run once, then two of its files changed.
+    Regression: each cached answer took a request, so `estimate --max-requests
+    1` planned 4 calls and cut 3 cached pages, and `generate` stopped on the
+    budget (exit 7) after its one call."""
+
+    BASE = ("--context", "off", "--paid")
+    CACHED = ("shop/__init__.py", "shop/money.py", "shop/orders.py", "shop/tax.py")
+
+    def setUp(self) -> None:
+        super().setUp()
+        for relpath, text in MORE.items():
+            (self.root / relpath).write_text(text, "utf-8")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", *self.BASE)
+        self.assertEqual(code, 0, err)
+        for relpath in ("shop/cart.py", "shop/cli.py"):
+            path = self.root / relpath
+            path.write_text(path.read_text("utf-8") + "\n# changed\n", "utf-8")
+        self.model.calls.clear()
+
+    def test_estimate_cuts_calls_alone(self) -> None:
+        calls = [["module", "shop"], ["file", "shop/cart.py"], ["file", "shop/cli.py"]]
+        for limit, cut in (("1", calls), ("2", calls[1:])):
+            with self.subTest(max_requests=limit):
+                argv = ("estimate", str(self.root), "--quiet", *self.BASE,
+                        "--max-requests", limit)
+                code, out, err = self.run_cli(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"{len(cut)} items left as stubs to fit --max-requests "
+                              f"{limit}\n", out)
+                code, data, err = self.run_cli(*argv, "--json")
+                self.assertEqual(code, 0, err)
+                priced = json.loads(data)
+                self.assertEqual((priced["demoted"], priced["demoted_by"]),
+                                 (cut, ["max_requests"]))
+                self.assertEqual((priced["requests"], priced["cached"]),
+                                 (int(limit), 4))
+                self.assertEqual(tuple(sorted(item["key"] for item in priced["items"]
+                                              if item["cached"])), self.CACHED)
+
+    def test_both_limits_cut_calls_alone(self) -> None:
+        # The overview is over the cost; the module spends the one request.
+        argv = ("estimate", str(self.root), "--quiet", "--json", *self.BASE)
+        code, data, err = self.run_cli(*argv, "--max-cost", "0")
+        self.assertEqual(code, 0, err)
+        cost = {item["kind"]: item["cost"] for item in json.loads(data)["items"]
+                if item["kind"] != "file"}
+        self.assertGreater(cost["architecture"], cost["module"])
+        limit = f"{(cost['architecture'] + cost['module']) / 2:.8f}"
+        code, data, err = self.run_cli(*argv, "--max-cost", limit, "--max-requests",
+                                       "1")
+        self.assertEqual(code, 0, err)
+        priced = json.loads(data)
+        self.assertEqual((priced["demoted"], priced["demoted_by"]), (
+            [["architecture", ""], ["file", "shop/cart.py"], ["file", "shop/cli.py"]],
+            ["max_cost", "max_requests"]))
+        self.assertEqual((priced["requests"], priced["cached"]), (1, 4))
+
+    def test_generate_on_the_limit_writes_every_cached_page(self) -> None:
+        code, out, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      *self.BASE, "--max-requests", "1")
+        self.assertEqual(code, 0, err)   # as any run that its plan fits ends
+        self.assertEqual([request.tag for request in self.model.calls],
+                         ["architecture"])
+        self.assertIn("\n1 model call", out)
+        self.assertIn(", 4 cache hits, ", out)
+        self.assertNotIn("stopped early", out)
+        for relpath in self.CACHED:
+            page = self.root / "docs" / f"{relpath}.md"
+            self.assertIn(PROSE, page.read_text("utf-8"), relpath)
+
+
+class TestEstimateAndGenerateAgree(CliCase):
+    """`generate` makes the calls `estimate` plans, also where a cached
+    overview sums up an answer the run buys: the run rebuilds its prompt, so
+    it is a call. Regression: it was planned free; `generate` bought the file,
+    was refused the module's call and stopped (exit 7), the page a stub."""
+
+    BASE = ("--context", "off", "--paid")
+
+    def planned(self, *limits: str) -> list[str]:
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet", "--json",
+                                      *self.BASE, *limits)
+        self.assertEqual(code, 0, err)
+        return [item["key"] or item["kind"] for item in json.loads(out)["items"]
+                if not item["cached"]]
+
+    def bought(self, *limits: str) -> list[str]:
+        """The calls of `generate`, which ends as a run its plan fits ends."""
+        self.model.calls.clear()
+        code, out, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      *self.BASE, *limits)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("stopped early", out)
+        return [request.tag for request in self.model.calls]
+
+    def test_a_cached_module_whose_file_is_bought_is_a_call(self) -> None:
+        self.assertEqual(self.bought("--max-requests", "1"), ["shop"])
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet",
+                                      *self.BASE, "--max-requests", "1")
+        self.assertEqual(code, 0, err)
+        # Each file would take the module along, past the one request.
+        self.assertIn("0 model calls (none), 1 already cached\n", out)
+        self.assertIn("4 items left as stubs to fit --max-requests 1\n", out)
+        for limit, calls in (("1", []), ("2", ["shop/cart.py", "shop"])):
+            with self.subTest(max_requests=limit):
+                self.assertEqual(self.planned("--max-requests", limit), calls)
+                self.assertEqual(self.bought("--max-requests", limit), calls)
+                page = self.root / "docs" / "shop" / "index.md"
+                self.assertIn("Holds the cart", page.read_text("utf-8"))
+
+    def test_runs_resumed_under_one_request_end_as_planned(self) -> None:
+        for relpath, text in MORE.items():
+            (self.root / relpath).write_text(text, "utf-8")
+        for number, call in enumerate(("architecture", "shop/cart.py")):
+            with self.subTest(run=number + 1):
+                self.assertEqual(self.planned("--max-requests", "1"), [call])
+                self.assertEqual(self.bought("--max-requests", "1"), [call])
+        overview = self.root / "docs" / "architecture.md"
+        self.assertIn("A small shop", overview.read_text("utf-8"))
 
 
 class TestInitAndCache(CliCase):

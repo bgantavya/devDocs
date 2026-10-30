@@ -158,7 +158,7 @@ class QuotaExhausted(ProviderError):
 
 
 class BudgetExceeded(DevDocsError):
-    """The run hit its spend or token ceiling and stopped on purpose.
+    """The run hit its spend or request ceiling and stopped on purpose.
 
     Not an error in the usual sense: work completed before the ceiling is kept,
     its answers cached, and running again buys only the rest.
