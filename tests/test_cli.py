@@ -295,11 +295,12 @@ class TestGenerate(CliCase):
                                         "chrome", "--json", "--quiet")
         self.assertEqual(code, 4)
         summary = json.loads(out)
-        self.assertEqual(summary["failed"], [[
-            "format", "pdf", "chrome could not print the book (exit status 1)\n"
-            "  hint: run chrome by hand to see why; `devdocs export --format pdf` "
-            "makes it from the manifest, with no key",
-        ]])
+        ((kind, item, error),) = summary["failed"]
+        self.assertEqual((kind, item), ("format", "pdf"))
+        self.assertIn("chrome could not print the book (exit status 1)\n"
+                      "  hint: run chrome by hand to see why; `devdocs export ", error)
+        self.assertIn(" --format pdf --pdf-engine chrome` makes it from the manifest, "
+                      "with no key", error)
         docs = self.root / "docs"
         listed = json.loads((docs / "index.json").read_bytes())["files"]
         self.assertIn("README.md", listed)
