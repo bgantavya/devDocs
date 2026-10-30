@@ -1398,6 +1398,42 @@ class TestEmbeddingFailureOverTheWire(PipelineCase):
         self.assertEqual(summary.prose, 5)
 
 
+class TestALoneSurrogate(PipelineCase):
+    """A module docstring may spell one as an escape, which parsing decodes to
+    text no strict encoder takes. Regression: one such file, on any OS, ended
+    `estimate` and `generate` with an internal error and no pages."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.tmp / "shop" / "emoji.py").write_text(
+            '"""Smiles: \\ud83d\\ude00."""\n\n\ndef smile() -> str:\n    return "x"\n',
+            encoding="utf-8",
+        )
+
+    def test_standard_context_documents_it(self) -> None:
+        pipeline = self.pipeline()
+        prepared = pipeline.prepare()
+        self.assertGreater(pipeline.estimate(prepared).requests, 0)
+        self.assertEqual(pipeline.run(prepared).failed, [])
+        self.assertIn(PROSE, self.docs()["shop/emoji.py.md"])
+
+    def test_semantic_context_buys_its_vectors_once(self) -> None:
+        # Over the wire, as what is sent must encode too.
+        wire = GeminiWire()
+        self.model = GeminiProvider("k", wire, dimensions=8)  # type: ignore[assignment]
+        first = self.pipeline(context="semantic")
+        prepared = first.prepare()
+        self.assertEqual(first.estimate(prepared).items[0].kind, "embed")
+        summary = first.run(prepared)
+        self.assertEqual((summary.semantic_fallback, summary.failed), ("", []))
+        self.assertIn(PROSE, self.docs()["shop/emoji.py.md"])
+        self.assertEqual(wire.sent, 1)
+
+        again = self.pipeline(context="semantic")
+        self.assertEqual(again.run(again.prepare()).requests, 0)
+        self.assertEqual(wire.sent, 1)
+
+
 def dump(db: Database) -> dict[str, list[tuple[Any, ...]]]:
     """Every row of every table."""
     tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table'")

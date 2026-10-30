@@ -120,6 +120,39 @@ class TestUndecodableText(unittest.TestCase):
         assert hit is not None
         self.assertEqual(hit.text, f"see {ODD}")
 
+    def test_chunks_track_the_file(self) -> None:
+        # Regression: replace raised StorageError for such a name.
+        store = ChunkStore(self.db)
+        chunk = Chunk("c1", ODD, "", 1, 1, f"{ODD}\nx = 1")
+        self.assertEqual(store.replace(ODD, [chunk]), (1, 0))
+        self.assertEqual(store.replace(ODD, [chunk]), (0, 0))   # found, not added again
+        store.store([("c1", [0.5])], "embed-1")
+        self.assertEqual(store.missing([chunk], "embed-1", 1), [])
+
+        moved = Chunk("c2", ODD, "", 1, 1, f"{ODD}\nx = 2")
+        self.assertEqual(store.replace(ODD, [moved]), (1, 1))
+        self.assertEqual(store.vectors("embed-1", 1, {"c1"}), ([], []))
+
+    def test_pruning_asks_about_the_file_by_its_name(self) -> None:
+        store = ChunkStore(self.db)
+        store.replace(ODD, [Chunk("c1", ODD, "", 1, 1, "x = 1")])
+        asked: list[str] = []
+
+        def there(source: str) -> bool:
+            asked.append(source)
+            return True
+
+        self.assertEqual(store.prune(there), 0)
+        self.assertEqual(asked, [ODD])
+        self.assertEqual(store.prune(lambda source: False), 1)
+        self.assertIsNone(self.db.query_one("SELECT id FROM chunk"))
+
+    def test_valid_text_is_still_stored_as_text(self) -> None:
+        ChunkStore(self.db).replace("café.py", [Chunk("c1", "café.py", "", 1, 1, "x")])
+        row = self.db.query_one("SELECT typeof(source), source FROM chunk")
+        assert row is not None
+        self.assertEqual((row[0], row[1]), ("text", "café.py"))
+
     def test_fingerprint_accepts_an_undecodable_path(self) -> None:
         self.assertEqual(len(config_fingerprint(f"/home/{ODD}", "gemini")), 16)
 
