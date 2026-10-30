@@ -48,6 +48,7 @@ import hashlib
 import json
 import os
 import posixpath
+import shlex
 import sys
 import time
 import tomllib
@@ -164,6 +165,7 @@ class Prepared:
     prompts: dict[tuple[str, str], Prompt] = field(default_factory=dict)
     chunks: dict[str, list[Chunk]] = field(default_factory=dict)   # by file
     retriever: Retriever | None = None
+    cut: list[tuple[str, str]] = field(default_factory=list)   # by `price`, to fit
 
 
 @dataclass(frozen=True)
@@ -279,12 +281,50 @@ def _still_there(path: Path) -> bool:
     return True
 
 
-def _retry(fmt: str, err: DevDocsError) -> str:
+def _retry(fmt: str, err: DevDocsError, config: Config) -> str:
     """A failed format's error, as a run reports it: with how to make that
-    format later without a key, from the manifest the run still wrote."""
-    retry = f"`devdocs export --format {fmt}` makes it from the manifest, with no key"
+    format later without a key, from the manifest the run still wrote. The
+    command names the project, the out dir and a PDF's options as this run's
+    did, when only its command line gave them; the file and the environment
+    tell `export` as they told this run."""
+    project = (f" {shlex.quote(str(config.path))}"
+               if config.origin_of("path") == "flag" else "")
+    flags = (f" --out {shlex.quote(str(config.out))}"
+             if config.origin_of("out") == "flag" else "")
+    if fmt == "pdf":
+        given = {"pdf_engine": f" --pdf-engine {config.pdf_engine}",
+                 "page_size": f" --page-size {config.page_size}",
+                 "pdf_split": " --split" if config.pdf_split else " --no-split"}
+        flags += "".join(flag for name, flag in given.items()
+                         if config.origin_of(name) == "flag")
+    retry = (f"`devdocs export{project} --format {fmt}{flags}` makes it from the "
+             "manifest, with no key")
     hint = f"{err.hint}; {retry}" if err.hint else retry
     return f"{err.message}\n  hint: {hint}"
+
+
+def _again(summary: RunSummary, cut: int, answers: int, vectors: int) -> str:
+    """What running again costs, said when a run's write is refused, which
+    leaves its summary unshown: nothing once every item is answered and every
+    chunk embedded, else the rest; and why that is left. `cut` items were over
+    budget, which the answers now cached make room for. `answers` is how many
+    the run holds, bought now or earlier: with none, none are cached to speak
+    of. `vectors` is how many chunks the next run would embed."""
+    failed = len(summary.failed)
+    why = (f"stopped early ({summary.stopped})" if summary.stopped
+           else f"{failed} item{'' if failed == 1 else 's'} failed" if failed
+           else f"{cut} item{'' if cut == 1 else 's'} over budget" if cut
+           else "")
+    if not why:
+        held = "the answers are cached" if answers else "no answers were needed"
+        if vectors:
+            chunks = f"{vectors} chunk{'' if vectors == 1 else 's'}"
+            return f"{held}, so running again pays only to embed {chunks}"
+        return f"{held}, so running again costs nothing"
+    if not answers:
+        return f"{why} and no answer was bought, so running again has them all to buy"
+    return (f"{why}: the answers bought are cached, so running again pays only "
+            "for the rest")
 
 
 class Pipeline:
@@ -484,6 +524,15 @@ class Pipeline:
             over.append("--max-requests")
         return over
 
+    def _vectors_to_buy(self, prepared: Prepared) -> int:
+        """How many chunks the next run would embed: those still without a
+        vector, unless they are over the limits, when it would skip them too."""
+        embeddings = self._embeddings(prepared)
+        if embeddings is None:
+            return 0
+        quote = embeddings.quote()
+        return 0 if self._embedding_over(quote.requests, quote.cost) else quote.chunks
+
     def _embed(self, prepared: Prepared) -> str:
         """Bring the store up to date with this run's files and embed the
         chunks that lack a vector, if that fits the limits. Returns why
@@ -608,7 +657,7 @@ class Pipeline:
         cache key holds it, so they cost little."""
         plan = replace(prepared.plan, files=[*prepared.plan.files],
                        modules=[*prepared.plan.modules])
-        fitted = replace(prepared, plan=plan, prompts={})
+        fitted = replace(prepared, plan=plan, prompts={}, cut=[])
         if self.client is not None:
             self.price(fitted, embedding=False)
         guard = StyleGuard(known=self._known(prepared))
@@ -690,6 +739,7 @@ class Pipeline:
             ]
             for kind_key in dropped:
                 prepared.prompts.pop(kind_key, None)
+            prepared.cut += estimate.demoted
         return estimate
 
     def estimate(self, prepared: Prepared) -> Estimate:
@@ -728,8 +778,8 @@ class Pipeline:
         caller has made that check itself: the CLI does, outside the part of
         the run a Ctrl-C stops gracefully. A write refused later all the
         same, as for a file that appeared meanwhile, raises ConfigError once
-        the answers bought are cached, its hint saying that running again
-        costs nothing.
+        the answers bought are cached, its hint saying what running again
+        costs.
         """
         client = self._client()
         if not checked:
@@ -781,11 +831,14 @@ class Pipeline:
         )
         try:
             summary.written = self.write(docset, force=force)
-        except ConfigError as err:   # refused before anything was written
-            cached = "the answers are cached, so running again costs nothing"
-            hint = f"{err.hint}; {cached}" if err.hint else cached
+        except ConfigError as err:   # so the summary goes unshown
+            if client.cache is None:
+                raise   # nothing bought is kept, so no cost to speak of
+            again = _again(summary, len(prepared.cut), len(prose),
+                           self._vectors_to_buy(prepared))
+            hint = f"{err.hint}; {again}" if err.hint else again
             raise ConfigError(err.message, hint=hint) from err
-        summary.failed += [("format", fmt, _retry(fmt, err))
+        summary.failed += [("format", fmt, _retry(fmt, err, self.config))
                            for fmt, err in self.failures]
         summary.warnings = list(self.warnings)
         summary.documents = len(docset.documents)
