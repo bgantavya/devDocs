@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -38,7 +39,7 @@ from devdocs.errors import (
     QuotaExhausted,
     RateLimited,
 )
-from devdocs.generate import Pipeline, Prepared
+from devdocs.generate import Pipeline, Prepared, _retry
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
@@ -399,6 +400,19 @@ class NoFiles(TaggedModel):
         return super().generate(request)
 
 
+class Quota(TaggedModel):
+    """Answers `answers` calls, then finds every model's daily quota spent."""
+
+    def __init__(self, answers: int) -> None:
+        super().__init__()
+        self.answers = answers
+
+    def generate(self, request: Request) -> Completion:
+        if len(self.calls) >= self.answers:
+            raise QuotaExhausted("daily quota spent", status=429, provider="gemini")
+        return super().generate(request)
+
+
 class Attentive(TaggedModel):
     """Sums a module up by what its prompt says of the files, as a model
     does: their prose, once bought, changes its answer."""
@@ -596,8 +610,8 @@ class TestCheckedFirst(PipelineCase):
                 self.assertGreater(calls, 0)
                 pipeline.check(prepared)
                 self.assertEqual(
-                    (prepared.plan.calls(), prepared.prompts),
-                    (calls, {}))
+                    (prepared.plan.calls(), prepared.prompts, prepared.cut),
+                    (calls, {}, []))
 
     def test_a_page_summing_up_prose_to_buy_is_a_replaced_page(self) -> None:
         # Regression: the module's answer, cached from a run that had only
@@ -616,6 +630,225 @@ class TestCheckedFirst(PipelineCase):
         self.assertEqual(error.message, (
             f"refusing to replace 1 file in {pipeline.out} that devdocs has no "
             "record of writing: architecture.md"))
+
+    def refused_late(self, pipeline: Pipeline, prepared: Prepared | None = None) -> str:
+        """The hint of the run's refusal of a page that appeared after the
+        check, once its first call was answered, as another process might
+        put it there."""
+        def plant(event: CallEvent) -> None:
+            if not (self.tmp / "docs" / "README.md").exists():
+                self.plant("README.md")
+
+        self.client.on_event = plant
+        with self.assertRaises(ConfigError) as caught:
+            pipeline.run(prepared or pipeline.prepare())
+        self.assertGreater(len(self.model.calls), 0)
+        return caught.exception.hint
+
+    def test_a_write_refused_once_all_is_bought_costs_nothing_again(self) -> None:
+        hint = self.refused_late(self.pipeline())
+        self.assertEqual(hint, "move it away or choose another --out; --force "
+                               "replaces it; the answers are cached, so running "
+                               "again costs nothing")
+        calls = len(self.model.calls)
+        again = self.pipeline()
+        self.assertEqual(again.run(again.prepare(), force=True).prose, 5)
+        self.assertEqual(len(self.model.calls), calls)
+
+    def test_a_write_refused_after_a_stop_says_the_rest_is_to_pay(self) -> None:
+        # Regression: it said running again cost nothing, and not why the run
+        # had stopped, its summary unshown.
+        self.model = Quota(2)
+        hint = self.refused_late(self.pipeline())
+        self.assertEqual(hint, "move it away or choose another --out; --force "
+                               "replaces it; stopped early (quota): the answers "
+                               "bought are cached, so running again pays only for "
+                               "the rest")
+        bought = {request.tag for request in self.model.calls}
+        self.model = TaggedModel()
+        again = self.pipeline()
+        again.run(again.prepare(), force=True)
+        paid = {request.tag for request in self.model.calls}
+        self.assertEqual((len(bought), len(paid), bought & paid), (2, 3, set()))
+
+    def test_a_write_refused_after_a_budget_cut_says_the_rest_is_to_pay(self) -> None:
+        # Regression: it said running again cost nothing, but the answers now
+        # cached leave the limit room for what it cut.
+        hint = self.refused_late(self.pipeline(max_requests=2))
+        self.assertEqual(hint, "move it away or choose another --out; --force "
+                               "replaces it; 3 items over budget: the answers "
+                               "bought are cached, so running again pays only for "
+                               "the rest")
+        calls = len(self.model.calls)
+        again = self.pipeline(max_requests=2)
+        again.run(again.prepare(), force=True)
+        self.assertGreater(len(self.model.calls), calls)
+
+    def test_a_cut_an_estimate_made_is_told_of_too(self) -> None:
+        pipeline = self.pipeline(max_requests=2)
+        prepared = pipeline.prepare()
+        self.assertEqual(len(pipeline.estimate(prepared).demoted), 3)
+        self.assertIn("; 3 items over budget: ", self.refused_late(pipeline, prepared))
+
+    def test_a_write_refused_after_failures_says_the_rest_is_to_pay(self) -> None:
+        self.model = NoFiles()
+        hint = self.refused_late(self.pipeline())
+        self.assertTrue(hint.endswith(
+            "; 4 items failed: the answers bought are cached, so running again "
+            "pays only for the rest"), hint)
+
+    def refused_at_the_write(self, pipeline: Pipeline) -> str:
+        """The hint of the run's refusal of a page that appeared once the check
+        had passed, whether or not anything was bought. Its renderer plants
+        the page at its second render, the write's."""
+        renders: list[int] = []
+        plant = self.plant
+
+        class Planting(MarkdownRenderer):
+            def render(self, docset: DocSet) -> dict[str, bytes]:
+                renders.append(1)
+                if len(renders) == 2:
+                    plant("README.md")
+                return super().render(docset)
+
+        pipeline.renderers = [Planting()]
+        with self.assertRaises(ConfigError) as caught:
+            pipeline.run(pipeline.prepare())
+        return caught.exception.hint or ""
+
+    # The writer's own hint, which every refusal below begins with.
+    WRITER = "move it away or choose another --out; --force replaces it; "
+
+    def test_a_refusal_with_all_over_budget_does_not_say_answers_are_cached(
+        self,
+    ) -> None:
+        # Regression: it told of answers bought, and none had been.
+        hint = self.refused_at_the_write(self.pipeline(max_cost=NO_CALL_FITS))
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(hint, f"{self.WRITER}5 items over budget and no answer was "
+                               "bought, so running again has them all to buy")
+
+    def test_a_refusal_after_a_stop_before_any_answer_says_so(self) -> None:
+        self.model = Quota(0)
+        hint = self.refused_at_the_write(self.pipeline())
+        self.assertEqual(hint, f"{self.WRITER}stopped early (quota) and no answer was "
+                               "bought, so running again has them all to buy")
+
+    def test_a_refusal_with_every_item_failed_says_so(self) -> None:
+        class Refusing(TaggedModel):
+            def generate(self, request: Request) -> Completion:
+                raise ProviderError("refused", status=400)
+
+        self.model = Refusing()
+        hint = self.refused_at_the_write(self.pipeline())
+        self.assertEqual(hint, f"{self.WRITER}5 items failed and no answer was bought, "
+                               "so running again has them all to buy")
+
+    def test_a_refusal_with_nothing_to_buy_does_not_say_answers_are_cached(
+        self,
+    ) -> None:
+        # Regression: it told of answers cached, in a run planned to need none.
+        for rel in ("shop", "tests"):
+            shutil.rmtree(self.tmp / rel)
+        pipeline = self.pipeline()
+        self.assertEqual(pipeline.prepare().plan.calls(), 0)
+        hint = self.refused_at_the_write(pipeline)
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(hint, f"{self.WRITER}no answers were needed, so running again "
+                               "costs nothing")
+
+    def test_a_refusal_with_the_answers_from_an_earlier_run_costs_nothing_again(
+        self,
+    ) -> None:
+        first = self.pipeline()
+        first.run(first.prepare())
+        calls = len(self.model.calls)
+        shutil.rmtree(self.tmp / "docs")
+        hint = self.refused_at_the_write(self.pipeline())
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertEqual(hint, f"{self.WRITER}the answers are cached, so running again "
+                               "costs nothing")
+
+    def embedding(self, failure: DevDocsError) -> EmbeddingModel:
+        """The model, once embedding always ends in `failure`."""
+        model = EmbeddingModel()
+        model.during_embed = failing(failure)
+        self.model = model
+        return model
+
+    def test_a_refusal_with_vectors_to_buy_says_they_are_not_free(self) -> None:
+        # Regression: it said running again cost nothing, and that run bought them.
+        for failure in (ProviderError("endpoint down", status=503),
+                        QuotaExhausted("embedding quota spent")):
+            with self.subTest(failure.message):
+                model = self.embedding(failure)
+                bought = self.pipeline(context="semantic")
+                bought.run(bought.prepare())
+                shutil.rmtree(self.tmp / "docs")
+                hint = self.refused_at_the_write(self.pipeline(context="semantic"))
+                self.assertEqual(hint, f"{self.WRITER}the answers are cached, so "
+                                       "running again pays only to embed 7 chunks")
+
+                model.during_embed = None
+                (self.tmp / "docs" / "README.md").unlink()
+                again = self.pipeline(context="semantic")
+                summary = again.run(again.prepare())
+                self.assertEqual((sum(map(len, model.batches)), summary.requests),
+                                 (7, 1))
+                with self.db.transaction() as conn:
+                    conn.execute("UPDATE chunk SET embedding = NULL")
+                shutil.rmtree(self.tmp / "docs")
+
+    def test_a_refusal_with_only_a_vector_to_buy_says_no_answers_were_needed(
+        self,
+    ) -> None:
+        # One file its docstring documents in full: no prose to buy, but a chunk.
+        for rel in ("shop/cart.py", "shop/cli.py", "shop/money.py",
+                    "tests/test_cart.py"):
+            (self.tmp / rel).unlink()
+        (self.tmp / "shop" / "__init__.py").write_text(
+            f'"""{"The shop package, which has all the parts of the shop. " * 2}"""\n',
+            encoding="utf-8",
+        )
+        self.embedding(ProviderError("endpoint down", status=503))
+        pipeline = self.pipeline(context="semantic")
+        prepared = pipeline.prepare()
+        self.assertEqual(prepared.plan.calls(), 0)
+        embeddings = pipeline._embeddings(prepared)
+        assert embeddings is not None
+        self.assertEqual(embeddings.quote().chunks, 1)
+        hint = self.refused_at_the_write(pipeline)
+        self.assertEqual(hint, f"{self.WRITER}no answers were needed, so running again "
+                               "pays only to embed 1 chunk")
+
+    def test_a_refusal_with_vectors_the_next_run_would_skip_costs_nothing_again(
+        self,
+    ) -> None:
+        self.embedding(ProviderError("endpoint down", status=503))
+        first = self.pipeline(context="semantic")
+        first.run(first.prepare())
+        calls = len(self.model.calls)
+        shutil.rmtree(self.tmp / "docs")
+        # Its limits then take embedding off the run, so nothing is left to pay.
+        over = self.pipeline(context="semantic", max_requests=1)
+        hint = self.refused_at_the_write(over)
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertTrue(hint.endswith("so running again costs nothing"), hint)
+
+    def test_a_refusal_with_items_and_vectors_to_buy_says_the_rest(self) -> None:
+        # "The rest" takes in the vectors, so there is nothing to add.
+        self.embedding(ProviderError("endpoint down", status=503))
+        hint = self.refused_at_the_write(self.pipeline(context="semantic",
+                                                       max_requests=8))
+        self.assertTrue(hint.endswith("over budget: the answers bought are cached, so "
+                                      "running again pays only for the rest"), hint)
+
+    def test_a_client_that_keeps_nothing_promises_nothing(self) -> None:
+        pipeline = self.pipeline()
+        self.client.cache = None
+        hint = self.refused_at_the_write(pipeline)
+        self.assertGreater(len(self.model.calls), 0)
+        self.assertEqual(hint, self.WRITER.removesuffix("; "))
 
     def test_a_stop_while_the_output_is_checked_sends_nothing(self) -> None:
         # A stop request while `run` checks is one like any other: the pages
@@ -783,6 +1016,59 @@ class TestFormats(PipelineCase):
         again = self.pipeline(formats=("markdown", "pdf"))
         self.assertEqual(again.run(again.prepare()).failed, [])
         self.assertFalse((docs / "shop" / "cli.py.md").exists())
+
+    def test_the_way_to_make_a_failed_format_names_an_out_given_as_a_flag(self) -> None:
+        # Regression: without it, the command looked in docs/, and found nothing.
+        failing = self.pipeline(renderers=[MarkdownRenderer(), Failing()],
+                                out=Path("my site"), sources={"out": "flag"})
+        summary = failing.run(failing.prepare())
+        self.assertIn("`devdocs export --format pdf --out 'my site'` makes it",
+                      summary.failed[0][2])
+
+    def test_the_way_to_make_a_failed_format_names_a_project_given_on_the_line(
+        self,
+    ) -> None:
+        # Regression: from elsewhere, the command looked for the project here.
+        failing = self.pipeline(renderers=[MarkdownRenderer(), Failing()],
+                                sources={"path": "flag"})
+        summary = failing.run(failing.prepare())
+        self.assertIn(f"`devdocs export {shlex.quote(str(self.tmp))} --format pdf` "
+                      "makes it", summary.failed[0][2])
+
+    def test_a_project_and_an_out_dir_with_spaces_are_named_so_a_shell_reads_them(
+        self,
+    ) -> None:
+        config = Config(path=Path("my shop"), out=Path("my site"),
+                        sources={"path": "flag", "out": "flag"})
+        self.assertIn("`devdocs export 'my shop' --format pdf --out 'my site'` makes",
+                      _retry("pdf", DevDocsError("failed"), config))
+
+    def test_the_way_to_make_a_failed_format_leaves_out_what_the_config_says(
+        self,
+    ) -> None:
+        for origin in ("file", "env"):
+            with self.subTest(origin):
+                failing = self.pipeline(renderers=[MarkdownRenderer(), Failing()],
+                                        out=Path("site"),
+                                        sources={"path": origin, "out": origin})
+                summary = failing.run(failing.prepare())
+                self.assertIn("`devdocs export --format pdf` makes it",
+                              summary.failed[0][2])
+
+    def test_the_way_to_make_a_failed_pdf_names_the_pdf_options_given_as_flags(
+        self,
+    ) -> None:
+        # Regression: it named none, so export printed with the configured engine.
+        typed = {"pdf_engine": "flag", "page_size": "flag"}
+        config = Config(pdf_engine="weasyprint", page_size="Letter", sources=typed)
+        failed = DevDocsError("failed")
+        self.assertIn("`devdocs export --format pdf --pdf-engine weasyprint "
+                      "--page-size Letter` makes", _retry("pdf", failed, config))
+        self.assertIn("`devdocs export --format html` makes",
+                      _retry("html", failed, config))
+        split = Config(pdf_split=True, sources={"pdf_split": "flag"})
+        self.assertIn("`devdocs export --format pdf --split` makes",
+                      _retry("pdf", failed, split))
 
     def test_hand_written_code_beside_the_pages_is_still_documented(self) -> None:
         first = self.pipeline()
