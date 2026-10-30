@@ -316,7 +316,7 @@ class TestEstimate(CliCase):
         self.assertEqual(code, 0)
         data = json.loads(out)
         self.assertGreater(data["requests"], 0)
-        self.assertGreater(data["max_cost_usd"], 0)
+        self.assertGreater(data["worst_case_cost_usd"], 0)
         self.assertEqual(self.model.calls, [])
 
     def test_a_first_estimate_makes_no_state(self) -> None:
@@ -348,6 +348,31 @@ class TestEstimate(CliCase):
                                        *argv)
         self.assertEqual(code, 0, err)
         return out, json.loads(data)
+
+    def test_the_json_keeps_each_cost_under_its_own_name(self) -> None:
+        # Regression: max_cost_usd held the plan's worst case, not the ceiling.
+        for argv, cost, requests in (([], 0.5, None),
+                                     (["--max-cost", "7"], 7.0, None),
+                                     (["--max-cost", "0"], None, None),
+                                     (["--max-requests", "2"], 0.5, 2),
+                                     (["--max-cost", "0", "--max-requests", "0"],
+                                      None, None)):
+            with self.subTest(argv=argv):
+                _, data = self.priced(*argv)
+                self.assertEqual((data["cost_limit_usd"], data["request_limit"]),
+                                 (cost, requests))
+                self.assertNotIn("max_cost_usd", data)
+                self.assertEqual(data["worst_case_cost_usd"], round(
+                    sum(i["cost"] for i in data["items"] if not i["cached"]), 6))
+
+    def test_the_json_keeps_every_other_key(self) -> None:
+        _, data = self.priced("--max-requests", "2")
+        self.assertLessEqual({"files", "prose_files", "requests", "cached",
+                              "input_tokens", "output_tokens", "demoted",
+                              "demoted_by", "items"},
+                             set(data))
+        self.assertEqual(data["files"], 4)
+        self.assertEqual(len(data["demoted"]), 3)
 
     def costs(self) -> tuple[float, list[float]]:
         """With no limit: the module's worst case, then its files', as they are
