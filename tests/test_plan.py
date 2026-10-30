@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import posixpath
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 
 from devdocs.graph import FileNode, ModuleNode, ProjectGraph
@@ -17,6 +18,7 @@ from devdocs.history import FileHistory
 from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind
 from devdocs.plan import (
     FilePlan,
+    Fit,
     ModulePlan,
     Plan,
     Planner,
@@ -971,21 +973,29 @@ ORDERED_COSTS = {
 }
 
 
+COST, REQUESTS = "max_cost", "max_requests"   # the limits, as the record names them
+
+
+def cuts(cut: Mapping[tuple[str, str], str]) -> list[tuple[str, str, str]]:
+    """What `fit_to_budget` cut, in walk order, each with the limit that cut it."""
+    return [(kind, key, limit) for (kind, key), limit in cut.items()]
+
+
 class TestFitToBudget(unittest.TestCase):
     def test_within_limits_nothing_is_cut(self) -> None:
         # the prose items sum to 0.18; d.py costs 9.99 but is a stub, never walked
         for cost, requests in ((0.0, 0), (0.18, 0), (0.0, 6), (0.18, 6)):
             with self.subTest(max_cost=cost, max_requests=requests):
                 plan = priced()
-                cut = fit_to_budget(plan, COSTS, max_cost=cost, max_requests=requests)
-                self.assertEqual(cut, [])
+                fit = fit_to_budget(plan, COSTS, max_cost=cost, max_requests=requests)
+                self.assertEqual((fit.cut, fit.rebuilt), ({}, frozenset()))
                 self.assertEqual(plan, priced())
 
     def test_cost_cap_skips_what_overflows_and_keeps_walking(self) -> None:
         plan = priced()
         # 0.05 + 0.03 + 0.03 = 0.11: a and b overflow 0.12, c lands on it exactly
-        cut = fit_to_budget(plan, COSTS, max_cost=0.12)
-        self.assertEqual(cut, [("file", "a.py"), ("file", "b.py")])
+        cut = fit_to_budget(plan, COSTS, max_cost=0.12).cut
+        self.assertEqual(cuts(cut), [("file", "a.py", COST), ("file", "b.py", COST)])
         self.assertEqual(
             [(p.relpath, p.mode, p.reason) for p in plan.files],
             [
@@ -999,14 +1009,14 @@ class TestFitToBudget(unittest.TestCase):
 
     def test_a_cut_overview_leaves_room_for_the_rest(self) -> None:
         plan = priced()
-        cut = fit_to_budget(plan, COSTS, max_cost=0.04)
+        cut = fit_to_budget(plan, COSTS, max_cost=0.04).cut
         self.assertEqual(
-            cut,
+            cuts(cut),
             [
-                ("architecture", ""),
-                ("module", "util"),
-                ("file", "a.py"),
-                ("file", "b.py"),
+                ("architecture", "", COST),
+                ("module", "util", COST),
+                ("file", "a.py", COST),
+                ("file", "b.py", COST),
             ],
         )
         self.assertEqual(
@@ -1017,10 +1027,10 @@ class TestFitToBudget(unittest.TestCase):
 
     def test_exact_fit_survives_float_noise(self) -> None:
         costs = {("file", "a.py"): 0.1, ("file", "b.py"): 0.2}
-        cases: list[tuple[float, list[tuple[str, str]]]] = [
+        cases: list[tuple[float, list[tuple[str, str, str]]]] = [
             (0.3, []),  # 0.1 + 0.2 is 0.30000000000000004
-            (0.3 - 1e-10, [("file", "b.py")]),  # noise is forgiven, overspend not
-            (0.29, [("file", "b.py")]),
+            (0.3 - 1e-10, [("file", "b.py", COST)]),  # noise is forgiven, overspend not
+            (0.29, [("file", "b.py", COST)]),
         ]
         for limit, expected in cases:
             plan = Plan(
@@ -1030,12 +1040,17 @@ class TestFitToBudget(unittest.TestCase):
                 ]
             )
             with self.subTest(max_cost=limit):
-                self.assertEqual(fit_to_budget(plan, costs, max_cost=limit), expected)
+                cut = fit_to_budget(plan, costs, max_cost=limit).cut
+                self.assertEqual(cuts(cut), expected)
 
     def test_request_cap(self) -> None:
         plan = priced()
-        cut = fit_to_budget(plan, COSTS, max_requests=3)
-        self.assertEqual(cut, [("file", "a.py"), ("file", "b.py"), ("file", "c.py")])
+        cut = fit_to_budget(plan, COSTS, max_requests=3).cut
+        self.assertEqual(
+            cuts(cut),
+            [("file", "a.py", REQUESTS), ("file", "b.py", REQUESTS),
+             ("file", "c.py", REQUESTS)],
+        )
         self.assertEqual(plan.calls(), 3)
 
     def test_overviews_are_kept_before_files(self) -> None:
@@ -1047,61 +1062,255 @@ class TestFitToBudget(unittest.TestCase):
         for requests, expected in cases:
             plan = priced()
             with self.subTest(max_requests=requests):
-                cut = fit_to_budget(plan, COSTS, max_requests=requests)
-                self.assertEqual(cut, expected)
+                cut = fit_to_budget(plan, COSTS, max_requests=requests).cut
+                self.assertEqual(cuts(cut), [(*item, REQUESTS) for item in expected])
                 self.assertIs(plan.architecture, Mode.PROSE)
 
     def test_both_limits_apply(self) -> None:
         plan = priced()
         costs = {key: value for key, value in COSTS.items() if key != ("file", "c.py")}
         # util overflows 0.10; a lands on it as request 3; b overflows both
-        # limits; c is free but would be request 4
-        cut = fit_to_budget(plan, costs, max_cost=0.10, max_requests=3)
-        self.assertEqual(cut, [("module", "util"), ("file", "b.py"), ("file", "c.py")])
+        # limits, and is the requests' to cut, as Budget checks them first; c
+        # is free but would be request 4
+        cut = fit_to_budget(plan, costs, max_cost=0.10, max_requests=3).cut
+        self.assertEqual(
+            cuts(cut),
+            [("module", "util", COST), ("file", "b.py", REQUESTS),
+             ("file", "c.py", REQUESTS)],
+        )
 
     def test_missing_costs_are_free_but_still_requests(self) -> None:
         plan = priced()
         costs = {("architecture", ""): 0.05}
-        cut = fit_to_budget(plan, costs, max_cost=0.05, max_requests=4)
-        self.assertEqual(cut, [("file", "b.py"), ("file", "c.py")])
+        cut = fit_to_budget(plan, costs, max_cost=0.05, max_requests=4).cut
+        self.assertEqual(
+            cuts(cut), [("file", "b.py", REQUESTS), ("file", "c.py", REQUESTS)]
+        )
 
     def test_the_walk_follows_plan_order(self) -> None:
         later = [("file", "api/routes.py"), ("file", "web/forms.py")]
-        cases: list[tuple[float, int, list[tuple[str, str]]]] = [
+        cases: list[tuple[float, int, list[tuple[str, str]], str]] = [
             # web before api as ranked, not by name; priced stubs are not walked
-            (0.0, 1, [("module", "api"), ("file", "web/views.py"), *later]),
+            (0.0, 1, [("module", "api"), ("file", "web/views.py"), *later], REQUESTS),
             # files by value: views before routes, despite routes' higher score
-            (0.0, 3, later),
-            (0.08, 0, later),  # 0.03 + 0.03 + 0.02
+            (0.0, 3, later, REQUESTS),
+            (0.08, 0, later, COST),  # 0.03 + 0.03 + 0.02
         ]
-        for max_cost, max_requests, expected in cases:
+        for max_cost, max_requests, expected, limit in cases:
             plan = ordered()
             with self.subTest(max_cost=max_cost, max_requests=max_requests):
                 cut = fit_to_budget(
                     plan, ORDERED_COSTS, max_cost=max_cost, max_requests=max_requests
-                )
-                self.assertEqual(cut, expected)
+                ).cut
+                self.assertEqual(cuts(cut), [(*item, limit) for item in expected])
                 self.assertEqual(plan.architecture_reason, "disabled")
                 self.assertEqual(plan.modules[1], ordered().modules[1])
                 self.assertEqual(plan.files[3:], ordered().files[3:])
 
     def test_everything_cut_in_walk_order(self) -> None:
         plan = priced()
-        cut = fit_to_budget(plan, COSTS, max_cost=0.001)
+        cut = fit_to_budget(plan, COSTS, max_cost=0.001).cut
         self.assertEqual(
-            cut,
+            cuts(cut),
             [
-                ("architecture", ""),
-                ("module", "core"),
-                ("module", "util"),
-                ("file", "a.py"),
-                ("file", "b.py"),
-                ("file", "c.py"),
+                ("architecture", "", COST),
+                ("module", "core", COST),
+                ("module", "util", COST),
+                ("file", "a.py", COST),
+                ("file", "b.py", COST),
+                ("file", "c.py", COST),
             ],
         )
         self.assertEqual(plan.calls(), 0)
         self.assertEqual({m.reason for m in plan.modules}, {"over budget"})
         self.assertEqual(plan.files[3].reason, "fully documented in source")
+
+
+def shop_walk() -> Plan:
+    """The plan of a shop: an overview, the shop module, then its six files
+    by value, all with prose."""
+    names = ("cart", "cli", "money", "orders", "tax", "__init__")
+    files = [
+        FilePlan(f"shop/{name}.py", 6.0 - index, 1.0, Mode.PROSE,
+                 f"ranked {index + 1} of 6")
+        for index, name in enumerate(names)
+    ]
+    shop = ModulePlan("shop", tuple(f.relpath for f in files), 9.0, Mode.PROSE,
+                      "ranked 1 of 1")
+    return Plan(files, [shop], Mode.PROSE, "project overview")
+
+
+def kept(plan: Plan) -> list[str]:
+    """What still has prose, in walk order: the overview, modules, files."""
+    names = ["architecture"] * (plan.architecture is Mode.PROSE)
+    names += [module.path for module in plan.prose_modules()]
+    return names + [item.relpath for item in plan.prose_files()]
+
+
+OVERVIEW, CORE, UTIL = ("architecture", ""), ("module", "core"), ("module", "util")
+A, B, C = ("file", "a.py"), ("file", "b.py"), ("file", "c.py")
+
+
+class TestCachedItemsAreFree(unittest.TestCase):
+    """An item the cache answers makes no call: no limit counts it or cuts it.
+    Regression: the walk counted each as a request, against a limit raised by
+    their number, so calls walked first took their share and the free pages
+    were cut to stubs."""
+
+    # cart.py and cli.py changed since the last run; the other four are cached
+    CACHED = frozenset({("file", "shop/money.py"), ("file", "shop/orders.py"),
+                        ("file", "shop/tax.py"), ("file", "shop/__init__.py")})
+
+    def test_after_two_files_change_every_cached_page_is_kept(self) -> None:
+        calls = [("module", "shop"), ("file", "shop/cart.py"), ("file", "shop/cli.py")]
+        for requests, bought, expected in (
+            (1, ["architecture"], calls),
+            (2, ["architecture", "shop"], calls[1:]),
+            (4, ["architecture", "shop", "shop/cart.py", "shop/cli.py"], []),
+        ):
+            plan = shop_walk()
+            with self.subTest(max_requests=requests):
+                cut = fit_to_budget(plan, {}, max_requests=requests,
+                                    cached=self.CACHED).cut
+                self.assertEqual(cuts(cut), [(*item, REQUESTS) for item in expected])
+                prose = {("file", p.relpath) for p in plan.prose_files()}
+                self.assertLessEqual(self.CACHED, prose)
+                self.assertEqual([name for name in kept(plan)
+                                  if ("file", name) not in self.CACHED], bought)
+
+    def test_a_cached_item_anywhere_in_the_walk_takes_no_request(self) -> None:
+        for where, cached, requests, expected in (
+            # a.py is the one call: core or util would rebuild the overview too
+            ("start", OVERVIEW, 1, [CORE, UTIL, B, C]),
+            ("middle", UTIL, 2, [A, B, C]),               # overview and core
+            ("middle", B, 4, [C]),                        # overview, modules, a
+            ("end", C, 1, [CORE, UTIL, A, B]),            # the overview
+        ):
+            plan = priced()
+            with self.subTest(where, cached=cached):
+                fit = fit_to_budget(plan, COSTS, max_requests=requests,
+                                    cached={cached})
+                self.assertEqual(cuts(fit.cut),
+                                 [(*item, REQUESTS) for item in expected])
+                self.assertEqual(plan.calls() - 1, requests)   # all but it are calls
+                self.assertEqual(fit.rebuilt, frozenset())
+
+    def test_a_cached_item_costs_nothing_whatever_its_quote(self) -> None:
+        # a.py's call would be 0.02, but the cache answers it: 0.06 holds the
+        # overview and c.py, which fits only while a.py comes free.
+        plan = priced()
+        cut = fit_to_budget(plan, COSTS, max_cost=0.06, cached={A}).cut
+        self.assertEqual(kept(plan), ["architecture", "a.py", "c.py"])
+        self.assertEqual(cuts(cut), [(*CORE, COST), (*UTIL, COST), (*B, COST)])
+
+    def test_both_limits_cut_around_a_cached_item(self) -> None:
+        # core overflows the cost; util and a spend the requests with the
+        # overview; b is cached and kept; c finds no request left.
+        costs = {("architecture", ""): 0.01, ("module", "core"): 0.50,
+                 ("module", "util"): 0.01, ("file", "a.py"): 0.01,
+                 ("file", "b.py"): 0.01, ("file", "c.py"): 0.01}
+        plan = priced()
+        cut = fit_to_budget(plan, costs, max_cost=0.10, max_requests=3,
+                            cached={("file", "b.py")}).cut
+        self.assertEqual(
+            cuts(cut), [("module", "core", COST), ("file", "c.py", REQUESTS)]
+        )
+        self.assertEqual([p.relpath for p in plan.prose_files()], ["a.py", "b.py"])
+        self.assertEqual([m.path for m in plan.prose_modules()], ["util"])
+
+
+class TestOverviewsOfWhatIsBought(unittest.TestCase):
+    """A cached overview is free only while the run sends its prompt as the
+    cache holds it. A module's prompt carries its files' purposes and the
+    architecture's its modules', so buying one rebuilds the overview: it is
+    then a call at its quote, and what rebuilds it is kept only if both fit.
+    Regression: it stayed free, the run asked it again, the budget refused,
+    and the run stopped (exit 7) with that page, which had prose, a stub."""
+
+    def fitted(self, cached: set[tuple[str, str]], *, max_cost: float = 0.0,
+               max_requests: int = 0) -> tuple[Plan, Fit]:
+        plan = priced()
+        return plan, fit_to_budget(plan, COSTS, max_cost=max_cost,
+                                   max_requests=max_requests, cached=cached)
+
+    def test_a_module_whose_file_is_bought_is_a_call(self) -> None:
+        # a.py rebuilds core: two requests, then b.py one, so c.py is left out
+        plan, fit = self.fitted({CORE}, max_requests=5)
+        self.assertEqual(kept(plan), ["architecture", "core", "util", "a.py", "b.py"])
+        self.assertEqual((cuts(fit.cut), fit.rebuilt), ([(*C, REQUESTS)], {CORE}))
+
+    def test_what_fits_alone_but_not_with_its_overview_is_cut(self) -> None:
+        # a.py and b.py would each take core along: past the three requests
+        plan, fit = self.fitted({CORE}, max_requests=3)
+        self.assertEqual(kept(plan), ["architecture", "core", "util", "c.py"])
+        self.assertEqual((cuts(fit.cut), fit.rebuilt),
+                         ([(*A, REQUESTS), (*B, REQUESTS)], frozenset()))
+
+    def test_a_rebuilt_overview_costs_its_quote(self) -> None:
+        # 0.05 + 0.03 spent; a.py with core, 0.05, and b.py with it, 0.07,
+        # pass 0.12; c.py fits
+        plan, fit = self.fitted({CORE}, max_cost=0.12)
+        self.assertEqual(kept(plan), ["architecture", "core", "util", "c.py"])
+        self.assertEqual((cuts(fit.cut), fit.rebuilt),
+                         ([(*A, COST), (*B, COST)], frozenset()))
+
+    def test_a_module_over_files_cached_or_cut_stays_free(self) -> None:
+        for files, limit, expected in (
+            ({A, B}, 3, ["architecture", "core", "util", "a.py", "b.py", "c.py"]),
+            (set(), 2, ["architecture", "core", "util"]),   # its files cut
+        ):
+            with self.subTest(cached=sorted(files)):
+                plan, fit = self.fitted({CORE, *files}, max_requests=limit)
+                self.assertEqual(kept(plan), expected)
+                self.assertEqual(fit.rebuilt, frozenset())
+
+    def test_the_architecture_over_a_bought_module_is_a_call(self) -> None:
+        # core takes the overview along; util and a.py do not again
+        plan, fit = self.fitted({OVERVIEW}, max_requests=4)
+        self.assertEqual(kept(plan), ["architecture", "core", "util", "a.py"])
+        self.assertEqual((cuts(fit.cut), fit.rebuilt),
+                         ([(*B, REQUESTS), (*C, REQUESTS)], {OVERVIEW}))
+
+    def test_the_architecture_over_modules_cached_or_cut_stays_free(self) -> None:
+        everything = {OVERVIEW, CORE, UTIL, A, B, C}
+        for cached, limit, expected in (
+            (everything, 1, ["architecture", "core", "util", "a.py", "b.py", "c.py"]),
+            ({OVERVIEW}, 1, ["architecture", "a.py"]),   # each module cut
+        ):
+            with self.subTest(cached=sorted(cached)):
+                plan, fit = self.fitted(cached, max_requests=limit)
+                self.assertEqual(kept(plan), expected)
+                self.assertEqual(fit.rebuilt, frozenset())
+
+    def test_a_file_bought_rebuilds_its_module_and_the_architecture(self) -> None:
+        # a.py takes core and the overview along: three requests
+        plan, fit = self.fitted({OVERVIEW, CORE, UTIL}, max_requests=3)
+        self.assertEqual(kept(plan), ["architecture", "core", "util", "a.py"])
+        self.assertEqual((cuts(fit.cut), fit.rebuilt),
+                         ([(*B, REQUESTS), (*C, REQUESTS)], {OVERVIEW, CORE}))
+        plan, fit = self.fitted({OVERVIEW, CORE, UTIL}, max_requests=2)
+        self.assertEqual(kept(plan), ["architecture", "core", "util"])
+        self.assertEqual(fit.rebuilt, frozenset())
+
+    def test_each_rebuild_is_spent_once_and_counted_against_the_cost(self) -> None:
+        # a.py takes core and the overview along, 0.10; b.py then fits, 0.14;
+        # c.py with util, 0.04 more, would pass the limit
+        plan, fit = self.fitted({OVERVIEW, CORE, UTIL}, max_cost=0.14)
+        self.assertEqual(kept(plan), ["architecture", "core", "util", "a.py", "b.py"])
+        self.assertEqual((cuts(fit.cut), fit.rebuilt), ([(*C, COST)], {OVERVIEW, CORE}))
+
+    def test_a_file_no_overview_sums_up_rebuilds_nothing(self) -> None:
+        # The tool's directory is a single file, so it has no module prose.
+        tool = FilePlan("extra/tool.py", 1.0, 1.0, Mode.PROSE, "ranked 7 of 7")
+        lone = ModulePlan("extra", ("extra/tool.py",), 1.0, Mode.STUB, "single file")
+        plan = shop_walk()
+        plan.files.append(tool)
+        plan.modules.append(lone)
+        cached = {("architecture", ""), ("module", "shop")} | {
+            ("file", item.relpath) for item in plan.files[:-1]}
+        fit = fit_to_budget(plan, {}, max_requests=1, cached=cached)
+        self.assertEqual(kept(plan)[-1], "extra/tool.py")
+        self.assertEqual((fit.cut, fit.rebuilt), ({}, frozenset()))
 
 
 class TestPlan(unittest.TestCase):

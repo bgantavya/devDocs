@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -39,7 +40,7 @@ from devdocs.errors import (
     QuotaExhausted,
     RateLimited,
 )
-from devdocs.generate import Pipeline, Prepared, _retry
+from devdocs.generate import Estimate, Pipeline, Prepared, _retry
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
 from devdocs.index.embed import Embeddings
@@ -556,6 +557,33 @@ class TestCheckedFirst(PipelineCase):
         summary = again.run(again.prepare())
         self.assertEqual((summary.prose, self.model.calls), (0, []))
         self.assertEqual(summary.written.unchanged[:1], ["README.md"])
+
+    def test_only_what_the_budget_lets_in_is_a_replaced_page(self) -> None:
+        # The module's answer cached, the limit lets in one file and the module
+        # it rebuilds: these four pages change, as the write would say, and
+        # the other files stay stubs.
+        first = self.pipeline(max_requests=1)
+        first.run(first.prepare())
+        self.assertEqual([request.tag for request in self.model.calls], ["shop"])
+        (self.tmp / "docs" / "index.json").unlink()
+        pipeline = self.pipeline(max_requests=2)
+        error = self.refused(pipeline)
+        self.assertEqual(error.message, (
+            f"refusing to replace 4 files in {pipeline.out} that devdocs has no "
+            "record of writing: README.md, architecture.md, shop/cart.py.md, "
+            "shop/index.md"))
+
+    def test_a_module_the_budget_cannot_rebuild_is_no_replaced_page(self) -> None:
+        # Each file would take the cached module along, past the one request:
+        # none is bought, so no page changes and only the manifest is written.
+        first = self.pipeline(max_requests=1)
+        first.run(first.prepare())
+        (self.tmp / "docs" / "index.json").unlink()
+        self.model.calls.clear()
+        pipeline = self.pipeline(max_requests=1)
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual((self.model.calls, summary.stopped), ([], ""))
+        self.assertEqual(summary.written.written, ["index.json"])
 
     def at_the_edge(self, page: str) -> Pipeline:
         """A run whose budget fits shop/cart.py's prompt only without the
@@ -1139,6 +1167,309 @@ class TestEstimate(PipelineCase):
         estimate = again.estimate(again.prepare())
         self.assertEqual(estimate.requests, 0)
         self.assertEqual(estimate.cost, 0.0)
+
+
+# Two more files: six are enough for an overview.
+MORE = {
+    "shop/orders.py": (
+        "from shop.cart import Cart\nfrom shop.money import Money\n\n\n"
+        "class Order:\n"
+        "    def __init__(self, cart: Cart) -> None:\n"
+        "        self.cart = cart\n\n"
+        "    def due(self) -> Money:\n"
+        "        return self.cart.total()\n"
+    ),
+    "shop/tax.py": (
+        "from shop.money import Money\n\n\n"
+        "def vat(amount: Money, rate: float = 0.2) -> Money:\n"
+        "    return Money(round(amount * rate))\n"
+    ),
+}
+CACHED = {("file", f"shop/{name}.py")
+          for name in ("money", "orders", "tax", "__init__")}
+
+
+class TestCachedAnswersAreFree(PipelineCase):
+    """A limit counts only the calls a run makes, never an answer the cache
+    holds. Regression: each such answer took a request, so the calls walked
+    before it spent its share, its page was cut to a stub, and the run,
+    planned more calls than its limit allows, stopped on the budget after the
+    first."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.model = EmbeddingModel()
+        for relpath, text in MORE.items():
+            (self.tmp / relpath).write_text(text, encoding="utf-8")
+        first = self.pipeline()
+        first.run(first.prepare())
+        # The first two files the walk reaches change; the other four stay cached.
+        for relpath in ("shop/cart.py", "shop/cli.py"):
+            path = self.tmp / relpath
+            path.write_text(path.read_text("utf-8") + "\n# changed\n", "utf-8")
+        self.model.calls.clear()
+
+    def priced(self, **overrides: object) -> Estimate:
+        pipeline = self.pipeline(**overrides)
+        return pipeline.estimate(pipeline.prepare())
+
+    def test_a_request_limit_cuts_calls_alone(self) -> None:
+        calls = [("module", "shop"), ("file", "shop/cart.py"), ("file", "shop/cli.py")]
+        for requests, cut in ((1, calls), (2, calls[1:]), (4, [])):
+            with self.subTest(max_requests=requests):
+                estimate = self.priced(max_requests=requests)
+                self.assertEqual(estimate.demoted, dict.fromkeys(cut, "max_requests"))
+                self.assertEqual(estimate.requests, requests)
+                self.assertEqual({(i.kind, i.key) for i in estimate.items if i.cached},
+                                 CACHED)
+
+    def test_a_run_on_the_limit_makes_its_call_and_writes_every_cached_page(
+        self,
+    ) -> None:
+        pipeline = self.pipeline(max_requests=1)
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual([request.tag for request in self.model.calls],
+                         ["architecture"])
+        self.assertEqual((summary.stopped, summary.failed), ("", []))
+        self.assertEqual((summary.requests, summary.cache_hits), (1, 4))
+        docs = self.docs()
+        for _, relpath in sorted(CACHED):
+            self.assertIn(PROSE, docs[f"{relpath}.md"])
+        for relpath in ("shop/cart.py", "shop/cli.py"):
+            self.assertNotIn(PROSE, docs[f"{relpath}.md"])
+        self.assertEqual(self.last_run(), "finished")
+
+    def test_a_cost_limit_never_cuts_a_cached_page(self) -> None:
+        estimate = self.priced(max_cost=NO_CALL_FITS)
+        self.assertEqual(estimate.demoted, dict.fromkeys(
+            [("architecture", ""), ("module", "shop"), ("file", "shop/cart.py"),
+             ("file", "shop/cli.py")], "max_cost"))
+        self.assertEqual((estimate.requests, estimate.cached), (0, 4))
+
+    def test_embeddings_share_is_held_back_as_before(self) -> None:
+        # Of 3 requests the batch takes 1; the overview and the module the rest.
+        estimate = self.priced(context="semantic", max_requests=3)
+        self.assertEqual((estimate.items[0].kind, estimate.items[0].requests),
+                         ("embed", 1))
+        self.assertEqual(list(estimate.demoted),
+                         [("file", "shop/cart.py"), ("file", "shop/cli.py")])
+        self.assertEqual((estimate.requests, estimate.cached), (3, 4))
+
+        pipeline = self.pipeline(context="semantic", max_requests=3)
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(len(self.model.batches), 1)
+        # The module's new answer is the one the cached overview read, so the
+        # overview is a cache hit again: the run spends less than its quote.
+        self.assertEqual([request.tag for request in self.model.calls], ["shop"])
+        self.assertEqual((summary.stopped, summary.requests), ("", 2))
+        self.assertIn("A small shop", self.docs()["architecture.md"])
+
+    def test_embeddings_cost_is_held_back_as_before(self) -> None:
+        # Room for the overview, the module and cart.py, less half the vectors'
+        # quote: the run, pricing again once they are paid for, holds back
+        # what they cost, as the estimate held their quote, and cuts cart.py.
+        quotes = {(i.kind, i.key): i.cost
+                  for i in self.priced(context="semantic", max_cost=0).items}
+        limit = (quotes[("architecture", "")] + quotes[("module", "shop")]
+                 + quotes[("file", "shop/cart.py")] + quotes[("embed", "")] / 2)
+        estimate = self.priced(context="semantic", max_cost=limit)
+        self.assertEqual(list(estimate.demoted),
+                         [("file", "shop/cart.py"), ("file", "shop/cli.py")])
+
+        pipeline = self.pipeline(context="semantic", max_cost=limit)
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual(len(self.model.batches), 1)
+        self.assertEqual([request.tag for request in self.model.calls], ["shop"])
+        self.assertEqual(summary.stopped, "")
+
+    def test_cached_overviews_walked_first_take_no_request(self) -> None:
+        # Two packages of one file each, which no overview sums up: once both
+        # change, the overview and the module stay cached and the one request
+        # buys a file. Regression: each cached answer took a request.
+        for relpath, name in (("extra/tool.py", "tool"), ("spare/part.py", "part")):
+            path = self.tmp / relpath
+            path.parent.mkdir()
+            path.write_text(f"def {name}(x: int) -> int:\n    return x * 2\n", "utf-8")
+        full = self.pipeline()
+        full.run(full.prepare())
+        for relpath in ("extra/tool.py", "spare/part.py"):
+            path = self.tmp / relpath
+            path.write_text(path.read_text("utf-8") + "\n# changed\n", "utf-8")
+        self.model.calls.clear()
+
+        estimate = self.priced(max_requests=1)
+        self.assertEqual((estimate.requests, estimate.cached), (1, 8))
+        pipeline = self.pipeline(max_requests=1)
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual([request.tag for request in self.model.calls],
+                         [item.key for item in estimate.items if not item.cached])
+        self.assertEqual((summary.stopped, summary.cache_hits), ("", 8))
+        docs = self.docs()
+        self.assertIn("A small shop", docs["architecture.md"])
+        self.assertIn("Holds the cart", docs["shop/index.md"])
+
+
+class TestOverviewsOfWhatIsBought(PipelineCase):
+    """A cached overview is free only while the run sends its prompt as the
+    cache holds it. A module's prompt carries its files' purposes and the
+    architecture's its modules', so a plan that buys one rebuilds the
+    overview: it is a call, and the run makes only the calls its estimate
+    counted. Regression: it was counted free, the run asked it again past the
+    limit, stopped on the budget (exit 7), and its page lost its prose."""
+
+    def made(self) -> list[str]:
+        """The requests the model has had since the last look, by tag."""
+        tags = [request.tag for request in self.model.calls]
+        self.model.calls.clear()
+        return tags
+
+    def planned(self, **limits: object) -> Estimate:
+        pipeline = self.pipeline(**limits)
+        return pipeline.estimate(pipeline.prepare())
+
+    def as_planned(self, **limits: object) -> list[str]:
+        """The calls of a run with `limits`, checked against its estimate: it
+        makes none the estimate did not count, and ends as a run that fits."""
+        planned = Counter(item.key or item.kind for item in self.planned(**limits).items
+                          if not item.cached)
+        pipeline = self.pipeline(**limits)
+        summary = pipeline.run(pipeline.prepare())
+        made = self.made()
+        self.assertLessEqual(Counter(made), planned)
+        self.assertEqual((summary.stopped, summary.failed), ("", []))
+        self.assertEqual(self.last_run(), "finished")
+        return made
+
+    def module_first(self) -> None:
+        """A first run under one request: it buys the module, from docstrings."""
+        first = self.pipeline(max_requests=1)
+        first.run(first.prepare())
+        self.assertEqual(self.made(), ["shop"])
+
+    def test_a_module_the_limit_cannot_rebuild_keeps_its_prose(self) -> None:
+        self.module_first()
+        estimate = self.planned(max_requests=1)
+        # Each file would take the module along: two requests, over the one.
+        self.assertEqual((estimate.requests, estimate.cached), (0, 1))
+        self.assertEqual(len(estimate.demoted), 4)
+        self.assertEqual(estimate.demoted_by, ["max_requests"])
+        self.assertEqual(self.as_planned(max_requests=1), [])
+        self.assertIn("Holds the cart", self.docs()["shop/index.md"])
+
+    def test_a_file_bought_takes_its_cached_module_along(self) -> None:
+        self.module_first()
+        estimate = self.planned(max_requests=2)
+        self.assertEqual([(i.key, i.cached) for i in estimate.items],
+                         [("shop/cart.py", False), ("shop", False)])
+        self.assertEqual(self.as_planned(max_requests=2), ["shop/cart.py", "shop"])
+        docs = self.docs()
+        self.assertIn(PROSE, docs["shop/cart.py.md"])
+        self.assertIn("Holds the cart", docs["shop/index.md"])
+
+    def test_a_rebuilt_module_is_priced_against_the_cost_limit(self) -> None:
+        quotes = {(i.kind, i.key): i.cost for i in self.planned(max_cost=0).items}
+        self.module_first()
+        # cart.py fits alone, but not with the module it rebuilds; nor does any
+        # other file.
+        limit = quotes[("file", "shop/cart.py")] + quotes[("module", "shop")] / 2
+        self.assertGreater(min(cost for (kind, _), cost in quotes.items()
+                               if kind == "file") + quotes[("module", "shop")], limit)
+        estimate = self.planned(max_cost=limit)
+        self.assertEqual((estimate.requests, estimate.demoted_by), (0, ["max_cost"]))
+        self.assertEqual(self.as_planned(max_cost=limit), [])
+        self.assertIn("Holds the cart", self.docs()["shop/index.md"])
+
+    def test_resuming_under_one_request_loses_no_prose(self) -> None:
+        # With an overview: the first run buys it, and each next run a file,
+        # as the module would take the overview along.
+        for relpath, text in MORE.items():
+            (self.tmp / relpath).write_text(text, encoding="utf-8")
+        had: set[str] = set()
+        for number, bought in enumerate(("architecture", "shop/cart.py",
+                                         "shop/cli.py")):
+            with self.subTest(run=number + 1):
+                self.assertEqual(self.as_planned(max_requests=1), [bought])
+                prose = {page for page, text in self.docs().items()
+                         if 'mode: "prose"' in text}
+                self.assertLessEqual(had, prose)
+                had = prose
+        self.assertIn("A small shop", self.docs()["architecture.md"])
+
+    def overview_and_module_first(self) -> None:
+        """The larger shop, after a first run under two requests: it buys the
+        overview and the module, both from docstrings."""
+        for relpath, text in MORE.items():
+            (self.tmp / relpath).write_text(text, encoding="utf-8")
+        first = self.pipeline(max_requests=2)
+        first.run(first.prepare())
+        self.assertEqual(sorted(self.made()), ["architecture", "shop"])
+
+    def test_a_rebuilt_architecture_is_priced_against_the_cost_limit(self) -> None:
+        self.overview_and_module_first()
+        quotes = {(i.kind, i.key): i for i in self.planned(max_cost=0).items}
+        cheapest = min(i.cost for (kind, _), i in quotes.items() if kind == "file")
+        # The cheapest file fits with its module, but not with the architecture.
+        limit = (cheapest + quotes[("module", "shop")].cost
+                 + quotes[("architecture", "")].cost / 2)
+        estimate = self.planned(max_cost=limit)
+        self.assertEqual((estimate.requests, estimate.demoted_by), (0, ["max_cost"]))
+        self.assertEqual(self.as_planned(max_cost=limit), [])
+
+    def test_a_rebuilt_overview_is_quoted_as_the_call_the_run_makes(self) -> None:
+        self.overview_and_module_first()
+        for quality in ("cheap", "high"):
+            with self.subTest(quality=quality):
+                pipeline = self.pipeline(max_requests=3, context="standard")
+                self.client.router.quality = quality
+                prepared = pipeline.prepare()
+                estimate = pipeline.estimate(prepared)
+                self.assertEqual(estimate.requests, 3)
+                rebuilt = sorted((i for i in estimate.items if i.kind != "file"),
+                                 key=lambda i: i.kind)
+                self.assertEqual([(i.kind, i.cached, i.requests) for i in rebuilt],
+                                 [("architecture", False, 1), ("module", False, 1)])
+                fresh = LLMClient(self.model, router=self.client.router)
+                for item in rebuilt:
+                    prompt = prepared.prompts[(item.kind, item.key)]
+                    quote = fresh.quote(prompt.tier, prompt.system, prompt.user,
+                                        max_output_tokens=prompt.max_output_tokens)
+                    self.assertEqual(
+                        (item.model, item.input_tokens, item.output_tokens, item.cost),
+                        (quote.model, quote.input_tokens, quote.output_tokens,
+                         quote.cost))
+
+    def test_an_overview_no_model_can_ask_again_is_refused_before_paying(self) -> None:
+        # The key reaches no architecture model now, and every file to buy would
+        # have the run ask the overview again. Before, the run paid for the
+        # files and the module, and only then, once their answers changed the
+        # overview's prompt, found no model to ask it.
+        self.overview_and_module_first()
+        for step in ("estimate", "run"):
+            with self.subTest(step=step):
+                pipeline = self.pipeline()
+                self.client.router.available = {"gemini-2.5-flash-lite",
+                                                "gemini-2.5-flash"}
+                with self.assertRaisesRegex(ConfigError, "architecture"):
+                    getattr(pipeline, step)(pipeline.prepare())
+                self.assertEqual(self.made(), [])
+
+    def test_an_overview_no_model_can_ask_again_is_still_read_free(self) -> None:
+        # The key reaches no architecture model now, which only a rebuilt
+        # overview would need: nothing changed, so the run needs none.
+        for relpath, text in MORE.items():
+            (self.tmp / relpath).write_text(text, encoding="utf-8")
+        full = self.pipeline()
+        full.run(full.prepare())
+        self.made()
+        pipeline = self.pipeline()
+        self.client.router.available = {"gemini-2.5-flash-lite", "gemini-2.5-flash"}
+        estimate = pipeline.estimate(pipeline.prepare())
+        self.assertEqual((estimate.requests, estimate.cached), (0, 8))
+        pipeline = self.pipeline()
+        self.client.router.available = {"gemini-2.5-flash-lite", "gemini-2.5-flash"}
+        summary = pipeline.run(pipeline.prepare())
+        self.assertEqual((self.made(), summary.stopped, summary.cache_hits),
+                         ([], "", 8))
 
 
 class EmbeddingModel(TaggedModel):
