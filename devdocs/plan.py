@@ -13,7 +13,9 @@ Prose goes to the files with the highest `score * need` up to a coverage
 cut, to the busiest modules and to the architecture overview. When a budget
 cannot pay for all of it, the overview is kept first, then modules, then
 files by value: each overview frames many files, so the least valuable file
-prose is the first to go. This is where most of a run's savings come from:
+prose is the first to go. Buying what a cached overview sums up asks that
+overview again, so under a tight request limit a module can be cut while
+files below it are bought. This is where most of a run's savings come from:
 measured on a 579-file corpus, planning cut cost by 95% against documenting
 every file.
 """
@@ -23,7 +25,7 @@ from __future__ import annotations
 import heapq
 import math
 import posixpath
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from devdocs.graph import FileNode, ModuleNode, ProjectGraph
@@ -34,6 +36,7 @@ from devdocs.scan import Role, SourceFile
 
 __all__ = [
     "FilePlan",
+    "Fit",
     "ModulePlan",
     "Plan",
     "Planner",
@@ -380,42 +383,82 @@ class Planner:
         return Mode.STUB, "project too small"
 
 
+@dataclass(frozen=True)
+class Fit:
+    """What `fit_to_budget` did to a plan."""
+
+    cut: dict[tuple[str, str], str]           # in walk order: the limit that cut it
+    rebuilt: frozenset[tuple[str, str]]       # cached overviews the run asks again
+
+
 def fit_to_budget(
     plan: Plan,
     costs: Mapping[tuple[str, str], float],
     *,
     max_cost: float = 0.0,
     max_requests: int = 0,
-) -> list[tuple[str, str]]:
-    """Demote PROSE items until the plan fits the limits; return what was cut.
+    cached: Collection[tuple[str, str]] = frozenset(),
+) -> Fit:
+    """Demote PROSE items until the plan fits the limits.
 
     `costs` maps (kind, key) — ("file", relpath), ("module", dir) or
     ("architecture", "") — to the estimated USD of that item's call. A limit
     of 0 is no limit. Items are kept greedily in priority order: the
-    architecture overview, then modules by score, then files by value.
-    An item missing from `costs` is free but still counts as a request, and a
-    cut item does not stop the walk: a later, cheaper one may still fit.
+    architecture overview, then modules by score, then files by value. An
+    item missing from `costs` is free but still counts as a request, and a cut
+    item does not stop the walk: a later, cheaper one may still fit. Each cut
+    is named by the limit its calls would pass, "max_requests" if both, as
+    `Budget` checks that first.
+
+    A `cached` item makes no call, so it is free and never cut. But an
+    overview's prompt carries the purposes it sums up, a module's of its files
+    and the architecture's of its modules: buying one rebuilds the overview,
+    which the run then asks again. So an item is kept only if its call fits
+    with those of the cached overviews it rebuilds, which become calls at
+    their `costs`; else it is cut and they stay free: an overview is walked
+    before what it sums up, and is never cut for it. Every file of a module
+    and every module count as summed up, which may over-count but never
+    under-counts. So a module under a cached architecture takes two requests
+    and a file under a cut module one: with one request, no module is bought
+    once the architecture is cached.
     """
     walk: list[tuple[str, str]] = []
+    above: dict[tuple[str, str], tuple[str, str]] = {}   # the overview summing it up
+    overview = ("architecture", "")
     if plan.architecture is Mode.PROSE:
-        walk.append(("architecture", ""))
-    walk.extend(("module", module.path) for module in plan.prose_modules())
+        walk.append(overview)
+    for module in plan.prose_modules():
+        node = ("module", module.path)
+        walk.append(node)
+        if plan.architecture is Mode.PROSE:
+            above[node] = overview
+        for path in module.files:
+            above[("file", path)] = node
     walk.extend(("file", item.relpath) for item in plan.prose_files())
 
     spent = 0.0
     requests = 0
-    cut: list[tuple[str, str]] = []
+    cut: dict[tuple[str, str], str] = {}
+    rebuilt: set[tuple[str, str]] = set()
     for item in walk:
-        cost = costs.get(item, 0.0)
-        fits_cost = not max_cost or spent + cost <= max_cost + _BUDGET_SLACK
-        fits_requests = not max_requests or requests < max_requests
-        if fits_cost and fits_requests:
-            spent += cost
-            requests += 1
+        if item in cached:
+            continue
+        calls = [item]
+        upper = above.get(item)
+        while upper is not None and upper in cached and upper not in rebuilt:
+            calls.append(upper)
+            upper = above.get(upper)
+        cost = sum(costs.get(call, 0.0) for call in calls)
+        if max_requests and requests + len(calls) > max_requests:
+            cut[item] = "max_requests"
+        elif max_cost and spent + cost > max_cost + _BUDGET_SLACK:
+            cut[item] = "max_cost"
         else:
-            cut.append(item)
+            spent += cost
+            requests += len(calls)
+            rebuilt.update(calls[1:])
     _demote_all(plan, cut, "over budget")
-    return cut
+    return Fit(cut, frozenset(rebuilt))
 
 
 def _round(value: float) -> float:
@@ -502,7 +545,7 @@ def _module_score(
     return _round(sum(best) + 1.0 * used_by)
 
 
-def _demote_all(plan: Plan, items: Sequence[tuple[str, str]], reason: str) -> None:
+def _demote_all(plan: Plan, items: Iterable[tuple[str, str]], reason: str) -> None:
     """`Plan.demote` for many items in one pass over each list.
 
     Demoting one at a time rescans the plan per item, which turns cutting a
