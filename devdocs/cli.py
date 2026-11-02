@@ -15,8 +15,8 @@ stderr and results to stdout; `--json` makes stdout machine-readable.
 A v3-style invocation is translated by `devdocs.legacy`, with one notice; a
 command line that starts with a v4 command never is. Either way an argument
 error masks an API key that the line names, however it is spelled, as the
-notice's command does; and a key that `--` would make the project's path is
-refused, masked, for later errors would name that path.
+notice does; and a key that `--` would make the project's path is refused,
+masked, for later errors would name that path.
 
 Ctrl-C and SIGTERM stop a paid run gracefully, and a second one at once; see
 `_Interrupts`. Anything else they end at once, saying what that leaves behind.
