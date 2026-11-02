@@ -3,6 +3,7 @@ provider factory is replaced by the scripted model the pipeline tests use."""
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -119,6 +120,10 @@ class TestArgumentErrors(unittest.TestCase):
             (["generate", ".", "--", "--a", key], "unrecognized arguments: --a ***\n"),
             (["export", ".", "--api-key", key],
              "unrecognized arguments: --api-key ***\n"),
+            (["estimate", ".", "--api-key", key],      # it sends nothing
+             "unrecognized arguments: --api-key ***\n"),
+            (["estimate", ".", f"--api-key={key}"],
+             "unrecognized arguments: --api-key=***\n"),
             ([f"--api-key={key}", "generate", "."],
              "unrecognized arguments: --api-key=***\n"),
             (["--api-key", key, "generate", "."],
@@ -239,6 +244,17 @@ class TestGenerate(CliCase):
         self.assertEqual(code, 0)
         self.assertIn("deprecated", err)
         self.assertTrue((self.root / "manual" / "shop" / "cart.md").is_file())
+
+    def test_a_v3_key_reaches_the_provider(self) -> None:
+        err = io.StringIO()
+        with contextlib.chdir(self.root), clean_env(), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err), \
+                mock.patch.object(cli, "make_provider",
+                                  return_value=self.model) as made:
+            code = cli.main(["-p", ".", "--api-key", "AIza-SECRET"])
+        self.assertEqual(code, 0, err.getvalue())
+        made.assert_called_once_with("gemini", "AIza-SECRET")
 
     def test_the_v3_notice_masks_the_key(self) -> None:
         for spelling in (["--api-key", "AIza-SECRET"], ["--api-key=AIza-SECRET"],
@@ -473,7 +489,159 @@ class TestFatalErrors(CliCase):
         self.assertEqual(err, "devdocs: internal error: ValueError: oops\n")
 
 
+class TestHelp(unittest.TestCase):
+    """What `--help` says, and that it says something for every option."""
+
+    def setUp(self) -> None:
+        (commands,) = [action.choices for action in cli.build_parser()._actions
+                       if isinstance(action, argparse._SubParsersAction)]
+        self.commands: dict[str, argparse.ArgumentParser] = dict(commands)
+
+    def option(self, command: str, flag: str) -> argparse.Action:
+        return self.commands[command]._option_string_actions[flag]
+
+    def test_every_argument_of_every_command_has_help(self) -> None:
+        # Regression: --max-requests and --concurrency had none, among others.
+        for name, parser in self.commands.items():
+            for action in parser._actions:
+                with self.subTest(command=name, argument=action.dest):
+                    self.assertTrue(action.help)
+            self.assertIn("devdocs", parser.format_help())   # no stray % in a help
+
+    def test_the_run_limits_say_what_they_limit(self) -> None:
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                requests = self.option(command, "--max-requests").help or ""
+                self.assertIn("retries included", requests)
+                self.assertIn("no limit", requests)
+                self.assertIn("default: 4", self.option(command, "--concurrency").help)
+
+    def test_include_is_no_pattern_and_says_so(self) -> None:
+        # Regression: PATTERN promised globs; it matches literal text.
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                option = self.option(command, "--include")
+                self.assertEqual(option.metavar, "PATH")
+                said = " ".join((option.help or "").split())
+                for words in ("not a glob", "path from the project root",
+                              "name at any depth", "end of a path"):
+                    self.assertIn(words, said)
+
+    def test_include_says_what_it_cannot_take_in(self) -> None:
+        # Regression: "force paths in, despite ignores" promised any path; see
+        # TestEstimate.test_include_takes_in_source_alone.
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                said = " ".join((self.option(command, "--include").help or "").split())
+                self.assertIn("take in source files that ignores, --exclude or the "
+                              "size limit leave out", said)
+                self.assertIn("tests, vendored and generated code and files that "
+                              "are not source stay out", said)
+        self.assertIn("# take source in despite ignores", cli._TEMPLATE)
+
+    def test_exclude_says_it_reads_gitignore_lines(self) -> None:
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                option = self.option(command, "--exclude")
+                self.assertEqual(option.metavar, "PATTERN")
+                self.assertIn(".gitignore", option.help or "")
+                self.assertIn("globs", option.help or "")
+
+    def test_only_what_can_send_takes_a_key(self) -> None:
+        # Regression: estimate took --api-key and ignored it.
+        self.assertEqual(
+            {name for name, parser in self.commands.items()
+             if "--api-key" in parser._option_string_actions},
+            {"generate", "doctor", "models"},
+        )
+
+    def test_the_path_says_where_it_comes_from_when_left_out(self) -> None:
+        # Regression: "default: current directory", which comes last.
+        given = {name: action.help for name, parser in self.commands.items()
+                 for action in parser._actions if action.dest == "path"}
+        self.assertEqual(given.pop("init"),
+                         "project root (default: current directory)")
+        self.assertEqual(given, dict.fromkeys(
+            ("generate", "estimate", "export", "doctor", "cache"),
+            "project root; else $DEVDOCS_PATH, the path in devdocs.toml, or the "
+            "current directory"))
+
+
 class TestEstimate(CliCase):
+    def explained(self, *argv: str) -> str:
+        """The files `estimate --explain` lists, ignoring shop/money.py."""
+        (self.root / ".gitignore").write_text("shop/money.py\n", "utf-8")
+        code, out, err = self.run_cli("estimate", str(self.root), "--explain", *argv)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_include_matches_as_its_help_says(self) -> None:
+        self.assertNotIn("shop/money.py", self.explained())
+        for literal in ("shop/money.py", "./shop/money.py", "SHOP/MONEY.PY",   # a path
+                        "money.py", "shop",                  # a name, at any depth
+                        ".py", "oney.py"):                   # the end of a path
+            with self.subTest(literal):
+                self.assertIn("shop/money.py", self.explained("--include", literal))
+        for glob in ("*.py", "shop/*", "mon*", "?oney.py", "**/money.py"):
+            with self.subTest(glob):
+                self.assertNotIn("shop/money.py", self.explained("--include", glob))
+
+    def test_include_reaches_inside_an_excluded_directory_by_path_alone(self) -> None:
+        out = self.explained("--exclude", "shop/", "--include", "shop/cart.py")
+        self.assertIn("shop/cart.py", out)
+        self.assertNotIn("shop/cli.py", out)
+        out = self.explained("--exclude", "shop/", "--include", "cart.py")
+        self.assertNotIn("shop/cart.py", out)
+
+    def test_include_takes_in_source_alone(self) -> None:
+        # What --help says. The scanner lets any named file through; the plan
+        # keeps only source.
+        for relpath in ("data.xyz", "NOTES.md", "settings.toml", "tests/test_x.py",
+                        "vendor/w.py", "x_pb2.py", "stamped.py"):
+            path = self.root / relpath
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("# @generated\ndef f():\n    return 1\n", "utf-8")
+        for named in ("data.xyz", ".xyz", "NOTES.md", "settings.toml",
+                      "tests/test_x.py", "tests", "vendor/w.py", "vendor", "x_pb2.py",
+                      "stamped.py"):
+            with self.subTest(named):
+                out = self.explained("--include", named)
+                for relpath in ("data.xyz", "NOTES.md", "settings.toml", "test_x.py",
+                                "w.py", "x_pb2.py", "stamped.py"):
+                    self.assertNotIn(relpath, out)
+
+        big = self.root / "big.py"                                # over the size limit
+        big.write_text(f"# {'x' * 1_000_001}\ndef f():\n    return 1\n", "utf-8")
+        self.assertNotIn("big.py", self.explained())
+        self.assertIn("big.py", self.explained("--include", "big.py"))
+        built = self.root / "build" / "made.py"           # in a default-ignored folder
+        built.parent.mkdir()
+        built.write_text("def f():\n    return 1\n", "utf-8")
+        self.assertNotIn("build/made.py", self.explained())
+        self.assertIn("build/made.py", self.explained("--include", "build/made.py"))
+        query = self.root / "q.sql"                                 # the help's example
+        query.write_text("SELECT 1;\n", "utf-8")
+        (self.root / ".gitignore").write_text("*.sql\n", "utf-8")
+        code, out, err = self.run_cli("estimate", str(self.root), "--explain")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("q.sql", out)
+        code, out, err = self.run_cli("estimate", str(self.root), "--explain",
+                                      "--include", ".sql")
+        self.assertEqual(code, 0, err)
+        self.assertIn("q.sql", out)
+
+    def test_exclude_matches_as_its_help_says(self) -> None:
+        for pattern, gone, kept in (("shop/c*.py", "cart.py", "__init__.py"),   # glob
+                                    ("c?rt.py", "cart.py", "cli.py"),      # any depth
+                                    ("/cart.py", "", "cart.py"),      # at the root only
+                                    ("cart.py/", "", "cart.py"),   # directories only
+                                    ("**/cli.py", "cli.py", "cart.py")):
+            with self.subTest(pattern):
+                out = self.explained("--exclude", pattern)
+                if gone:
+                    self.assertNotIn(f"shop/{gone}", out)
+                self.assertIn(f"shop/{kept}", out)
+
     def test_estimate_needs_no_key_and_sends_nothing(self) -> None:
         code, out, _ = self.run_cli("estimate", str(self.root), "--json")
         self.assertEqual(code, 0)
