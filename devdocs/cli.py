@@ -273,14 +273,21 @@ class _Interrupts:
 # -- arguments -------------------------------------------------------------------
 
 
+_PATH_HELP = ("project root; else $DEVDOCS_PATH, the path in "
+              f"{CONFIG_FILENAME}, or the current directory")
+_JSON_HELP = "JSON on stdout"
+_KEY_HELP = "API key; else $GEMINI_API_KEY etc., or the config file"
+_PROVIDER_HELP = ("whose models write the prose; anthropic-sdk needs the anthropic "
+                  f"extra (default: {Config.provider})")
+
+
 def _csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def _output_options(parser: argparse.ArgumentParser) -> None:
     """The project, where its documents go, and in which formats."""
-    parser.add_argument("path", nargs="?", default=None,
-                        help="project root (default: current directory)")
+    parser.add_argument("path", nargs="?", default=None, help=_PATH_HELP)
     parser.add_argument("--out", help="output directory, relative to the project")
     parser.add_argument("--format", action="append", type=_csv, default=None,
                         dest="formats", metavar="FORMAT",
@@ -302,30 +309,53 @@ def _force_option(parser: argparse.ArgumentParser) -> None:
                              "devdocs has no record of writing")
 
 
+def _quiet_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="no progress lines on stderr")
+
+
 def _run_options(parser: argparse.ArgumentParser) -> None:
+    """What a run does, whether it sends it (generate) or prices it (estimate)."""
     _output_options(parser)
-    parser.add_argument("--provider", choices=PROVIDERS)
+    parser.add_argument("--provider", choices=PROVIDERS, help=_PROVIDER_HELP)
     parser.add_argument("--model", help="use this one model for every call")
-    parser.add_argument("--quality", choices=("cheap", "balanced", "high"))
+    parser.add_argument("--quality", choices=("cheap", "balanced", "high"),
+                        help="how much prose, from how strong a model "
+                             f"(default: {Config.quality})")
     parser.add_argument("--context", choices=("off", "standard", "semantic"),
                         help="retrieved cross-file context (default: standard, free)")
     parser.add_argument("--max-cost", type=float, metavar="USD",
-                        help="stop before spending more than this (0: no limit)")
-    parser.add_argument("--max-requests", type=int, metavar="N")
-    parser.add_argument("--concurrency", type=int, metavar="N")
+                        help="stop before spending more than this "
+                             f"(0: no limit; default: {Config.max_cost:g})")
+    parser.add_argument("--max-requests", type=int, metavar="N",
+                        help="stop before sending more than this many requests to "
+                             "a model, retries included (0, the default: no limit)")
+    parser.add_argument("--concurrency", type=int, metavar="N",
+                        help="requests to a model at one time "
+                             f"(default: {Config.concurrency})")
     parser.add_argument("--include", action="append", type=_csv, default=None,
-                        metavar="PATTERN", help="force paths in, despite ignores")
+                        metavar="PATH",
+                        help="take in source files that ignores, --exclude or the "
+                             "size limit leave out; tests, vendored and generated "
+                             "code and files that are not source stay out. Literal "
+                             "text in any case, not a glob: a path from the project "
+                             "root, which also reaches inside an ignored directory; "
+                             "a file or directory name at any depth; or the end of "
+                             "a path, such as .sql. Repeat or comma-separate")
     parser.add_argument("--exclude", action="append", type=_csv, default=None,
-                        metavar="PATTERN", help="extra gitignore-style excludes")
+                        metavar="PATTERN",
+                        help="leave these out, each read as a line of a .gitignore: "
+                             "globs (* ? [...] **), a trailing / for directories "
+                             "only, any other / to anchor it at the project root. "
+                             "Repeat or comma-separate. What --include takes in stays")
     parser.add_argument("--per-file", action="store_true", default=None,
                         help="v3 layout: docs/<dir>/<name>.md")
     parser.add_argument("--paid", action="store_true",
                         help="pace to paid-tier rate limits instead of free-tier")
-    parser.add_argument("--api-key", default="", help="else $GEMINI_API_KEY etc.")
     parser.add_argument("--name", help="project name for the docs")
     parser.add_argument("--description", help="one-line project description")
-    parser.add_argument("--json", action="store_true", help="JSON on stdout")
-    parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("--json", action="store_true", help=_JSON_HELP)
+    _quiet_option(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -338,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     generate = commands.add_parser("generate", help="write docs for a project")
     _run_options(generate)
+    generate.add_argument("--api-key", default="", help=_KEY_HELP)
     _force_option(generate)
     generate.add_argument("--no-resume", action="store_true",
                           help="start a fresh run instead of resuming")
@@ -352,31 +383,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _output_options(export)
     _force_option(export)
-    export.add_argument("--json", action="store_true", help="JSON on stdout")
-    export.add_argument("-q", "--quiet", action="store_true")
+    export.add_argument("--json", action="store_true", help=_JSON_HELP)
+    _quiet_option(export)
 
     doctor = commands.add_parser("doctor", help="check that a run can work")
-    doctor.add_argument("path", nargs="?", default=None)
-    doctor.add_argument("--provider", choices=PROVIDERS)
-    doctor.add_argument("--api-key", default="")
+    doctor.add_argument("path", nargs="?", default=None, help=_PATH_HELP)
+    doctor.add_argument("--provider", choices=PROVIDERS, help=_PROVIDER_HELP)
+    doctor.add_argument("--api-key", default="", help=_KEY_HELP)
     doctor.add_argument("--offline", action="store_true",
                         help="skip the provider check")
-    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--json", action="store_true", help=_JSON_HELP)
 
     init = commands.add_parser("init", help=f"write a starter {CONFIG_FILENAME}")
-    init.add_argument("path", nargs="?", default=".")
-    init.add_argument("--provider", choices=PROVIDERS, default="gemini")
+    init.add_argument("path", nargs="?", default=".",
+                      help="project root (default: current directory)")
+    init.add_argument("--provider", choices=PROVIDERS, default=Config.provider,
+                      help=_PROVIDER_HELP)
     init.add_argument("--force", action="store_true", help="overwrite an existing file")
 
     models = commands.add_parser("models", help="models your key can use")
-    models.add_argument("--provider", choices=PROVIDERS)
-    models.add_argument("--api-key", default="")
-    models.add_argument("--json", action="store_true")
+    models.add_argument("--provider", choices=PROVIDERS, help=_PROVIDER_HELP)
+    models.add_argument("--api-key", default="", help=_KEY_HELP)
+    models.add_argument("--json", action="store_true", help=_JSON_HELP)
 
     cache = commands.add_parser("cache", help="inspect or clear the response cache")
-    cache.add_argument("action", choices=("stats", "clear"))
-    cache.add_argument("path", nargs="?", default=None)
-    cache.add_argument("--json", action="store_true")
+    cache.add_argument("action", choices=("stats", "clear"),
+                       help="what it holds and cost, or empty it")
+    cache.add_argument("path", nargs="?", default=None, help=_PATH_HELP)
+    cache.add_argument("--json", action="store_true", help=_JSON_HELP)
     return parser
 
 
@@ -704,7 +738,7 @@ out = "docs"
 # pdf_split = false          # one PDF per document instead of one book
 # page_size = "A4"           # A4 | Letter
 # model = ""                 # pin one model for every call
-# include = ["scripts"]      # force paths in despite ignores
+# include = ["scripts"]      # take source in despite ignores
 # exclude = ["examples/"]    # extra gitignore-style excludes
 # free_tier = true           # pace requests to free-tier limits
 """
