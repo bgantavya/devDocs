@@ -164,11 +164,111 @@ class TestNotice(InTempDir):
     def test_it_hides_the_api_key_however_spelled(self) -> None:
         for argv in (["--api-key", "SECRET"], ["--api-key=SECRET"], ["--api", "SECRET"],
                      ["--api-k=SECRET"], ["-p", ".", "--", "--api-key", "SECRET"],
-                     ["-p", ".", "--", "--a=SECRET"]):
+                     ["-p", ".", "--", "--a=SECRET"],
+                     ["-p", ".", "--api_key", "SECRET"], ["-p", ".", "--apikey=SECRET"],
+                     ["-p", ".", "-api-key", "SECRET"], ["-p", ".", "--API-KEY=SECRET"],
+                     ["-p", ".", "--gemini-api-key", "SECRET"],
+                     ["-p", ".", "--token=SECRET"],
+                     ["-p", ".", "--api_key", "--", "SECRET"],
+                     ["-p", ".", "--", "--apikey", "SECRET"],
+                     ["-p", ".", "GEMINI_API_KEY=SECRET"]):
             with self.subTest(argv=argv):
                 text = legacy.notice(argv)
                 self.assertNotIn("SECRET", text)
                 self.assertIn("***", text)
+
+
+class TestKeyMaskingParser(unittest.TestCase):
+    """The one parser class v3 and v4 share, so no error shows a key."""
+
+    def refused(self, parser: argparse.ArgumentParser, *argv: str) -> str:
+        """The error `parser` prints for `argv`, exiting 2."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            parser.parse_args(list(argv))
+        self.assertEqual(caught.exception.code, 2)
+        return err.getvalue().splitlines()[-1]
+
+    def parsers(self) -> list[argparse.ArgumentParser]:
+        """v3's parser, v4's and each of its commands'."""
+        v4 = cli.build_parser()
+        (commands,) = [action.choices for action in v4._actions
+                       if isinstance(action, argparse._SubParsersAction)]
+        return [legacy._v3_parser(), v4, *commands.values()]
+
+    def test_both_parsers_and_every_subparser_are_one(self) -> None:
+        for parser in self.parsers():
+            self.assertIsInstance(parser, legacy.KeyMaskingParser)
+
+    def test_what_names_a_key(self) -> None:
+        for arg in ("--api-key", "--a", "--ap", "--api", "--api-", "--api-k", "-ap",
+                    "-api-key", "---api-key", "--api_key", "-api_key", "--apikey",
+                    "--API-KEY", "--ApiKey", "--api.key", "--api-keys", "--apikeys",
+                    "--gemini-api-key", "--GEMINI_API_KEY", "--geminiApiKey", "--key",
+                    "--token", "--api-token", "--secret", "--client_secret"):
+            with self.subTest(arg=arg):
+                self.assertTrue(legacy._names_key(arg))
+        for arg in ("", "-", "--", "---", "-a", "-k", "--k", "--au", "--authors",
+                    "--keywords", "--token-limit", "api-key", "api_key", "apikey",
+                    "key", "token", "docs/key"):
+            with self.subTest(arg=arg):
+                self.assertFalse(legacy._names_key(arg))
+
+    def test_an_assignment_keeps_its_value_unless_it_names_a_key(self) -> None:
+        self.assertEqual(legacy._hidden("GEMINI_API_KEY=k"), "GEMINI_API_KEY=***")
+        self.assertEqual(legacy._hidden("--api_key=k"), "--api_key=***")
+        self.assertEqual(legacy._hidden("-api-key=k=k"), "-api-key=***")
+        for arg in ("out=docs", "--out=docs", "--name=key", "=k", "docs", "a=b",
+                    "api=v2"):
+            with self.subTest(arg=arg):
+                self.assertEqual(legacy._hidden(arg), arg)
+
+    def test_a_project_path_that_holds_a_key(self) -> None:
+        for path in ("--api-key=k", "--a=k", "--api_key=k/x", "GEMINI_API_KEY=k",
+                     "token=k"):
+            with self.subTest(path=path):
+                self.assertTrue(legacy.holds_key(path))
+        for path in ("", ".", "app", "a=b", "api=v2", "--api-key", "./key=1",
+                     "src/token=2", "--out=docs"):
+            with self.subTest(path=path):
+                self.assertFalse(legacy.holds_key(path))
+        with tempfile.TemporaryDirectory() as here, contextlib.chdir(here):
+            os.mkdir("key=1")
+            self.assertFalse(legacy.holds_key("key=1"))
+
+    def test_no_other_flag_of_theirs_hides_its_value(self) -> None:
+        for parser in self.parsers():
+            for action in parser._actions:
+                for flag in action.option_strings:
+                    with self.subTest(flag=flag):
+                        self.assertEqual(legacy._names_key(flag), flag == "--api-key")
+
+    def test_any_key_is_masked_however_odd(self) -> None:
+        parser = legacy.KeyMaskingParser(prog="p")
+        parser.add_argument("--api-key")
+        parser.add_argument("mode", choices=("a", "b"))
+        for key in ("two words", "it's", r"back\slash", "a+b(c)?", "$[x]*"):
+            with self.subTest(key=key):
+                self.assertEqual(self.refused(parser, "a", "--", "--api-key", key),
+                                 "p: error: unrecognized arguments: --api-key ***")
+                self.assertEqual(self.refused(parser, "a", "--", f"--api-k={key}"),
+                                 "p: error: unrecognized arguments: --api-k=***")
+        top = legacy.KeyMaskingParser(prog="p")
+        top.add_argument("mode", choices=("a", "b"))
+        for key in ("it's", r"back\slash", "two words"):
+            with self.subTest(key=key):
+                text = self.refused(top, "--api-key", key, "a")
+                # how the choices print varies: 3.12 leaves their quotes off
+                self.assertTrue(text.startswith(
+                    "p: error: argument mode: invalid choice: '***' (choose from "),
+                    text)
+                self.assertNotIn(key, text)
+
+    def test_a_short_key_masks_no_word_it_is_part_of(self) -> None:
+        parser = legacy.KeyMaskingParser(prog="p")
+        parser.add_argument("--api-key")
+        self.assertEqual(self.refused(parser, "--api-key", "k", "keep", "kk"),
+                         "p: error: unrecognized arguments: keep kk")
 
 
 class TestMain(InTempDir):
