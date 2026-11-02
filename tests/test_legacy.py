@@ -171,7 +171,9 @@ class TestNotice(InTempDir):
                      ["-p", ".", "--token=SECRET"],
                      ["-p", ".", "--api_key", "--", "SECRET"],
                      ["-p", ".", "--", "--apikey", "SECRET"],
-                     ["-p", ".", "GEMINI_API_KEY=SECRET"]):
+                     ["-p", ".", "GEMINI_API_KEY=SECRET"],
+                     ["-p", "GEMINI_API_KEY=SECRET"],
+                     ["-p", "app", "--output", "GEMINI_API_KEY=SECRET"]):
             with self.subTest(argv=argv):
                 text = legacy.notice(argv)
                 self.assertNotIn("SECRET", text)
