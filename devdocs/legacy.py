@@ -32,10 +32,10 @@ A `~` in `-p` or `--output` means what it means to config, where no shell
 expanded it, as none does in `--path=~/app`.
 
 An API key that a flag names on the command line, however it is spelled, or
-that an assignment names as a shell would, is masked in the command the notice
-shows and in every argparse error, v3's and v4's alike, both parsers being
-a `KeyMaskingParser`. A key nothing names looks like any other argument, and
-is shown like one.
+that an assignment names as a shell would, is masked in the notice and in
+every argparse error, v3's and v4's alike, both parsers being a
+`KeyMaskingParser`. A key nothing names looks like any other argument, and is
+shown like one.
 """
 
 from __future__ import annotations
@@ -243,7 +243,7 @@ def notice(argv: Sequence[str]) -> str:
     it runs, API key masked, and what becomes of pages already there."""
     args, _ = _read(argv)
     command = shlex.join(_masked(translate(argv)))
-    docs = os.path.join(args.output, _place(args.path), "")
+    docs = _hidden(os.path.join(args.output, _place(args.path), ""))  # may hold a key
     dropped = "--overwrite no longer applies; " if args.overwrite else ""
     return (
         f"devdocs: v3-style flags are deprecated; running `devdocs {command}`\n"
