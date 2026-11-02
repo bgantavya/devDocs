@@ -29,9 +29,13 @@ from devdocs.capabilities import Capability, Report
 from devdocs.config import load_config
 from devdocs.errors import (
     AuthError,
+    ConfigError,
     DevDocsError,
+    ModelNotFound,
     ProviderError,
+    QuotaExhausted,
     RateLimited,
+    StorageError,
 )
 from devdocs.index.db import Database
 from devdocs.llm import Completion, Request
@@ -308,6 +312,51 @@ class TestGenerate(CliCase):
         code, _, err = self.run_cli("export", str(self.root), "--format", "pdf")
         self.assertEqual(code, 0, err)
         self.assertEqual(check((docs / "shop.pdf").read_bytes()), [])
+
+
+class TestFatalErrors(CliCase):
+    """A failure that ends a command says `error:`, in argparse's form."""
+
+    def failing(self, failure: Exception) -> tuple[int, str]:
+        """The exit code and stderr of a generate whose model raises `failure`."""
+        class Failing(TaggedModel):
+            def list_models(self) -> list[str]:
+                raise failure
+
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", model=Failing())
+        return code, err
+
+    def test_every_typed_failure_says_error(self) -> None:
+        # Regression: a rejected key said "warning:", and the others neither.
+        for failure, code in ((AuthError("rejected"), 3),
+                              (ConfigError("refused"), 2),
+                              (ProviderError("down"), 4),
+                              (RateLimited("slow down"), 5),
+                              (ModelNotFound("gone"), 6),
+                              (QuotaExhausted("spent"), 10),
+                              (StorageError("damaged"), 9),
+                              (DevDocsError("failed"), 1)):
+            with self.subTest(type(failure).__name__):
+                exit_code, err = self.failing(failure)
+                self.assertEqual(exit_code, code)
+                self.assertIn(f"devdocs: error: {failure.message}", err)
+                self.assertNotIn("warning:", err)
+
+    def test_the_hint_follows_the_error(self) -> None:
+        code, err = self.failing(AuthError("rejected", hint="check the key"))
+        self.assertEqual(code, 3)
+        self.assertEqual(err, "devdocs: error: rejected\n  hint: check the key\n")
+
+    def test_a_config_error_from_the_command_itself_says_error(self) -> None:
+        code, _, err = self.run_cli("generate", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("devdocs: error: no API key for provider 'gemini'\n", err)
+
+    def test_a_bug_says_so(self) -> None:
+        code, err = self.failing(ValueError("oops"))
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "devdocs: internal error: ValueError: oops\n")
 
 
 class TestEstimate(CliCase):
