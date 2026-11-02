@@ -91,6 +91,120 @@ class TestBasics(CliCase):
         self.assertIn(__version__, out.getvalue())
 
 
+class TestArgumentErrors(unittest.TestCase):
+    """No argument error shows an API key, however the line spells it."""
+
+    KEY = "AIza-SECRET-0123"
+
+    def refused(self, *argv: str) -> str:
+        """The stderr of a command line argparse refuses, exiting 2."""
+        err = io.StringIO()
+        with clean_env(), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as caught:
+            cli.main(list(argv))
+        self.assertEqual(caught.exception.code, 2)
+        return err.getvalue()
+
+    def test_the_key_is_masked_however_it_is_spelled(self) -> None:
+        # Regression: argparse echoed the arguments it did not take, and a
+        # value it refused, as typed.
+        key = self.KEY
+        for argv, shown in (
+            (["generate", ".", "--", "--api-key", key],
+             "unrecognized arguments: --api-key ***\n"),
+            (["generate", ".", "--", f"--api-key={key}"],
+             "unrecognized arguments: --api-key=***\n"),
+            (["generate", ".", "--", f"--api={key}"],
+             "unrecognized arguments: --api=***\n"),
+            (["generate", ".", "--", "--a", key], "unrecognized arguments: --a ***\n"),
+            (["export", ".", "--api-key", key],
+             "unrecognized arguments: --api-key ***\n"),
+            ([f"--api-key={key}", "generate", "."],
+             "unrecognized arguments: --api-key=***\n"),
+            (["--api-key", key, "generate", "."],
+             "argument command: invalid choice: '***'"),
+            (["--ap", key, "generate", "."], "argument command: invalid choice: '***'"),
+            (["cache", "--api-key", key, "stats"],
+             "devdocs cache: error: argument action: invalid choice: '***'"),
+            (["-p", ".", "--", "--api-key", key],                # v3, then v4
+             "unrecognized arguments: -- --api-key ***\n"),
+            (["-p", ".", "--", f"--api-key={key}"],
+             "unrecognized arguments: -- --api-key=***\n"),
+        ):
+            with self.subTest(argv=argv):
+                err = self.refused(*argv)
+                self.assertNotIn(key, err)
+                self.assertIn(shown, err)
+        # 3.11 takes `--` itself for the command; later versions what follows
+        self.assertNotIn(key, self.refused("--", f"--api-key={key}"))
+
+    def test_the_key_is_masked_behind_a_flag_argparse_does_not_know(self) -> None:
+        # Regression: only what argparse takes for --api-key was masked, so a
+        # key after a mistyped flag was shown whole, on a v3 line twice.
+        key = self.KEY
+        for flag in ("-api-key", "--api_key", "-api_key", "--apikey", "--API-KEY",
+                     "---api-key", "--api.key", "--api-keys", "--gemini-api-key",
+                     "--GEMINI_API_KEY", "--token", "--secret"):
+            for line in (["generate", "."], ["-p", "."]):
+                with self.subTest(flag=flag, line=line):
+                    err = self.refused(*line, flag, key)
+                    self.assertNotIn(key, err)
+                    self.assertIn(f"unrecognized arguments: {flag} ***\n", err)
+                    err = self.refused(*line, f"{flag}={key}")
+                    self.assertNotIn(key, err)
+                    self.assertIn(f"unrecognized arguments: {flag}=***\n", err)
+        err = self.refused("generate", ".", "--key", key)   # in v3, --keywords
+        self.assertNotIn(key, err)
+        self.assertIn("unrecognized arguments: --key ***\n", err)
+        for line in (["generate", "."], ["-p", "."]):
+            with self.subTest(line=line):
+                err = self.refused(*line, f"GEMINI_API_KEY={key}")   # as in a shell
+                self.assertNotIn(key, err)
+                self.assertIn("unrecognized arguments: GEMINI_API_KEY=***\n", err)
+
+    def test_a_double_dash_does_not_part_the_key_from_its_flag(self) -> None:
+        # Regression: the `--` was masked in the key's place, and the key shown.
+        key = self.KEY
+        for argv, shown in (
+            (["export", ".", "--api-key", "--", key], "--api-key -- ***"),
+            (["generate", ".", "--apikey", "--", key], "--apikey -- ***"),
+            (["generate", ".", "--", "--api-key", "--", key], "--api-key -- ***"),
+            (["-p", ".", "--api_key", "--", key], "--api_key -- ***"),
+        ):
+            with self.subTest(argv=argv):
+                err = self.refused(*argv)
+                self.assertNotIn(key, err)
+                self.assertIn(f"unrecognized arguments: {shown}\n", err)
+
+    def test_a_key_read_as_the_project_is_refused(self) -> None:
+        # Regression: `--` made it the project's path, which the refusal named,
+        # `doctor` on stdout.
+        key = self.KEY
+        for line in (["generate"], ["estimate"], ["export"], ["doctor"], ["init"],
+                     ["cache", "stats"]):
+            for flag in ("--api-key", "--api_key"):
+                with self.subTest(line=line, flag=flag):
+                    err = self.refused(*line, "--", f"{flag}={key}")
+                    self.assertNotIn(key, err)
+                    self.assertIn("argument path: expected a directory, got "
+                                  f"{flag}=***\n", err)
+        err = self.refused("generate", f"GEMINI_API_KEY={key}")   # as in a shell
+        self.assertNotIn(key, err)
+        self.assertIn("got GEMINI_API_KEY=***\n", err)
+
+    def test_a_path_with_an_equals_sign_is_still_a_path(self) -> None:
+        for path in ("a=b", "api=v2", "./key=1", "--out=docs"):
+            with self.subTest(path=path):
+                err = io.StringIO()
+                with clean_env(), contextlib.redirect_stderr(err):
+                    self.assertEqual(cli.main(["generate", "--", path]), 2)
+                self.assertIn(f"{Path(path).name} does not exist", err.getvalue())
+
+    def test_the_rest_of_the_message_stays_as_it_was(self) -> None:
+        err = self.refused("generate", ".", "--api-key", "k", "--bogus", "keep")
+        self.assertIn("devdocs: error: unrecognized arguments: --bogus keep\n", err)
+
+
 class TestGenerate(CliCase):
     def test_generate_writes_docs_and_reports_json(self) -> None:
         code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",

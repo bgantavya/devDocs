@@ -13,7 +13,10 @@ a bad key (3) from a budget stop (7) from a spent daily quota (10). One that
 ends a command says `devdocs: error:`, as argparse's own do. Progress goes to
 stderr and results to stdout; `--json` makes stdout machine-readable.
 A v3-style invocation is translated by `devdocs.legacy`, with one notice; a
-command line that starts with a v4 command never is.
+command line that starts with a v4 command never is. Either way an argument
+error masks an API key that the line names, however it is spelled, as the
+notice's command does; and a key that `--` would make the project's path is
+refused, masked, for later errors would name that path.
 
 Ctrl-C and SIGTERM stop a paid run gracefully, and a second one at once; see
 `_Interrupts`. Anything else they end at once, saying what that leaves behind.
@@ -51,6 +54,13 @@ from devdocs.errors import ConfigError, DevDocsError, exit_code_for
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
 from devdocs.index.ledger import DailyUsage
+from devdocs.legacy import (
+    KeyMaskingParser,
+    holds_key,
+    is_v3_invocation,
+    notice,
+    translate,
+)
 from devdocs.llm.budget import Budget, Router
 from devdocs.llm.catalog import CATALOG, PRICES_CHECKED, Tier, catalogued
 from devdocs.llm.client import CallEvent, LLMClient
@@ -319,7 +329,7 @@ def _run_options(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = KeyMaskingParser(
         prog="devdocs",
         description="Documentation from source code: exact facts, cheap prose.",
     )
@@ -807,14 +817,14 @@ def _left_by_a_stop(args: argparse.Namespace, interrupts: _Interrupts) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the `devdocs` script. Returns the process exit code."""
     arguments = list(sys.argv[1:] if argv is None else argv)
-    from devdocs.legacy import is_v3_invocation, notice, translate
-
     if is_v3_invocation(arguments):
         print(notice(arguments), file=sys.stderr)
         arguments = translate(arguments)
 
     parser = build_parser()
     args = parser.parse_args(arguments)
+    if holds_key(getattr(args, "path", None) or ""):   # later refusals would show it
+        parser.error(f"argument path: expected a directory, got {args.path}")
     if args.command is None:
         parser.print_help()
         return 0
