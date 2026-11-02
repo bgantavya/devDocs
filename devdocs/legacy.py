@@ -30,25 +30,42 @@ config refuses such an out.
 
 A `~` in `-p` or `--output` means what it means to config, where no shell
 expanded it, as none does in `--path=~/app`.
+
+An API key that a flag names on the command line, however it is spelled, or
+that an assignment names as a shell would, is masked in the command the notice
+shows and in every argparse error, v3's and v4's alike, both parsers being
+a `KeyMaskingParser`. A key nothing names looks like any other argument, and
+is shown like one.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import sys
-from collections.abc import Sequence
-from itertools import pairwise
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
-__all__ = ["V3_ONLY_FLAGS", "is_v3_invocation", "main", "notice", "translate"]
+__all__ = [
+    "V3_ONLY_FLAGS",
+    "KeyMaskingParser",
+    "holds_key",
+    "is_v3_invocation",
+    "main",
+    "notice",
+    "translate",
+]
 
 # Flags only v3 had: their presence identifies a v3 command line.
 V3_ONLY_FLAGS = frozenset({
     "-p", "--path", "--output", "--overwrite", "--authors", "--keywords",
 })
+
+# How a flag meant for a key ends, its dashes and case aside; see `_names_key`.
+_KEY_FLAGS = ("key", "keys", "token", "tokens", "secret", "secrets")
 
 
 def _directory(value: str) -> str:
@@ -59,15 +76,30 @@ def _directory(value: str) -> str:
     return value
 
 
-class _V3Parser(argparse.ArgumentParser):
+class KeyMaskingParser(argparse.ArgumentParser):
+    """An argparse parser whose errors show no API key the line names. Each
+    key `_masked` finds in the arguments it parsed is masked where a message has
+    it: in the unrecognised arguments it lists, an ambiguous `--a=KEY`
+    (--authors or --api-key in v3) it names, or a value it refuses, as
+    `devdocs --api-key KEY generate` makes KEY the command. Its subparsers
+    are of this class too."""
+
+    _arguments: Sequence[str] = ()
+
+    def parse_known_args(
+        self, args: Iterable[str] | None = None, namespace: Any = None
+    ) -> tuple[Any, list[str]]:
+        """Parse as argparse does, keeping the arguments for `error`."""
+        self._arguments = list(sys.argv[1:] if args is None else args)
+        return super().parse_known_args(self._arguments, namespace)
+
     def error(self, message: str) -> NoReturn:
-        """Exit 2 as argparse does, any key in `message` masked: an ambiguous
-        `--a=KEY` (--authors or --api-key) comes back whole."""
-        super().error(" ".join(map(_hidden, message.split(" "))))
+        """Exit 2 as argparse does, every key in `message` masked."""
+        super().error(_conceal(message, self._arguments))
 
 
 def _v3_parser() -> argparse.ArgumentParser:
-    parser = _V3Parser(prog="devdocs", add_help=False)  # -h is v4's
+    parser = KeyMaskingParser(prog="devdocs", add_help=False)  # -h is v4's
     parser.add_argument("-p", "--path", default=".", type=_directory)
     parser.add_argument("--name")
     parser.add_argument("--description")
@@ -145,21 +177,65 @@ def translate(argv: Sequence[str]) -> list[str]:
     return [*translated, *rest]
 
 
+def _flat(arg: str) -> str:
+    """`arg` in lower case, its letters and digits alone."""
+    return "".join(filter(str.isalnum, arg)).lower()
+
+
 def _names_key(arg: str) -> bool:
-    """True for `--api-key`, in full or abbreviated as argparse accepts it."""
-    return len(arg) > 2 and "--api-key".startswith(arg)
+    """True for a flag a key may follow: `--api-key`, in full or abbreviated
+    as argparse accepts it, and as it is mistyped or misremembered, in any
+    case, with any dashes, `_` or `.`: `-api_key`, `--GEMINI_API_KEY`,
+    `--token`. Masking one more value in a message costs nothing."""
+    flat = _flat(arg)
+    return (arg.startswith("-") and len(arg) > 2 and bool(flat)
+            and ("apikey".startswith(flat) or flat.endswith(_KEY_FLAGS)))
 
 
 def _hidden(arg: str) -> str:
-    """`arg`, its key masked if it is `--api-key=KEY` in any spelling."""
-    flag, equals, _ = arg.partition("=")
-    return f"{flag}=***" if equals and _names_key(flag) else arg
+    """`arg`, its key masked if it is `--api-key=KEY` in any spelling, or
+    `GEMINI_API_KEY=KEY`, as a line meant for a shell has it."""
+    name, equals, _ = arg.partition("=")
+    named = _names_key(name) or _flat(name).endswith(_KEY_FLAGS)
+    return f"{name}=***" if equals and named else arg
+
+
+def holds_key(path: str) -> bool:
+    """True for a project path that can only be a key gone astray, as `--`
+    makes `--api-key=KEY` one, and a line meant for a shell `GEMINI_API_KEY=KEY`.
+    `./key=1` is a path, as is a directory named `key=1`."""
+    name = path.partition("=")[0]
+    return (_hidden(path) != path and Path(name).name == name
+            and not os.path.isdir(path))
 
 
 def _masked(arguments: Sequence[str]) -> list[str]:
-    """`arguments` with every API key as ***, given apart or after '='."""
-    return ["***" if _names_key(before) else _hidden(arg)
-            for before, arg in pairwise(["", *arguments])]
+    """`arguments` with every API key as ***: after '=', or apart from its
+    flag, even by a `--`, which argparse would refuse but still list."""
+    masked: list[str] = []
+    key_next = False
+    for arg in arguments:
+        if key_next and arg == "--":
+            masked.append(arg)
+            continue
+        masked.append("***" if key_next else _hidden(arg))
+        key_next = _names_key(arg)
+    return masked
+
+
+def _conceal(message: str, arguments: Sequence[str]) -> str:
+    """`message`, an argparse error, with each argument that `_masked` masks
+    in `arguments` masked here too: quoted, as argparse quotes a value it
+    refuses, or whole between spaces, as it lists unrecognised arguments."""
+    pairs = zip(arguments, _masked(arguments), strict=True)
+    hidden = {arg: shown for arg, shown in pairs if arg and arg != shown}
+    if not hidden:
+        return message
+    for arg, shown in hidden.items():
+        message = message.replace(repr(arg), repr(shown))
+    words = "|".join(map(re.escape, sorted(hidden, key=len, reverse=True)))
+    return re.sub(rf"(?<!\S)(?:{words})(?!\S)",
+                  lambda match: hidden[match.group()], message)
 
 
 def notice(argv: Sequence[str]) -> str:
