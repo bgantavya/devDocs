@@ -9,8 +9,9 @@
     devdocs cache stats|clear the local response cache
 
 Every failure maps to a stable exit code from `devdocs.errors`, so CI can tell
-a bad key (3) from a budget stop (7) from a spent daily quota (10). Progress
-goes to stderr and results to stdout; `--json` makes stdout machine-readable.
+a bad key (3) from a budget stop (7) from a spent daily quota (10). One that
+ends a command says `devdocs: error:`, as argparse's own do. Progress goes to
+stderr and results to stdout; `--json` makes stdout machine-readable.
 A v3-style invocation is translated by `devdocs.legacy`, with one notice; a
 command line that starts with a v4 command never is.
 
@@ -46,7 +47,7 @@ from devdocs.config import (
     project_root,
     resolve_api_key,
 )
-from devdocs.errors import AuthError, ConfigError, DevDocsError, exit_code_for
+from devdocs.errors import ConfigError, DevDocsError, exit_code_for
 from devdocs.index.cache import ResponseCache
 from devdocs.index.db import Database
 from devdocs.index.ledger import DailyUsage
@@ -106,6 +107,10 @@ class _Output:
 
     def warn(self, message: str) -> None:
         _write(self.stderr, f"warning: {message}")
+
+    def error(self, message: str) -> None:
+        """A failure that ends the command, in the form argparse gives its own."""
+        _write(self.stderr, f"devdocs: error: {message}")
 
     def result(self, text: str, data: dict[str, Any]) -> None:
         if self.as_json:
@@ -827,11 +832,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (KeyboardInterrupt, Interrupted):
             out.warn(f"interrupted; {_left_by_a_stop(args, interrupts)}")
             return interrupts.code
-        except AuthError as err:
-            out.warn(str(err))
-            return err.exit_code
         except DevDocsError as err:
-            _write(out.stderr, f"devdocs: {err}")
+            out.error(str(err))
             return err.exit_code
         except Exception as err:   # a bug: say so plainly, never as a clean stop
             _write(out.stderr, f"devdocs: internal error: {type(err).__name__}: {err}")

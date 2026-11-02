@@ -778,7 +778,7 @@ class TestFailures(WriterCase):
             code = cli.main(["export", str(root), "--format", "markdown"])
         self.assertEqual(code, 2)
         self.assertNotIn("internal error", stderr.getvalue())
-        self.assertIn(f"devdocs: cannot write {ODD}.py.md in ", stderr.getvalue())
+        self.assertIn(f"cannot write {ODD}.py.md in ", stderr.getvalue())
         self.assertIn(": the file system cannot name it (", stderr.getvalue())
         self.assertEqual(sorted(path.name for path in docs.iterdir()), [MANIFEST])
         self.assertEqual((docs / MANIFEST).read_bytes(), before)
