@@ -468,6 +468,7 @@ class TestConfigSearch(unittest.TestCase):
         self.assertEqual(project_root(config.path), self.base / "variable")
 
     def test_the_search_starts_where_the_flag_or_variable_says(self) -> None:
+        # Where `devdocs init` writes, too: it reads no file.
         variable = {"DEVDOCS_PATH": str(self.base / "variable")}
         self.assertEqual(search_start(str(self.base / "flagged"), variable),
                          self.base / "flagged")

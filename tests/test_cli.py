@@ -9,6 +9,7 @@ import io
 import json
 import os
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -556,11 +557,12 @@ class TestHelp(unittest.TestCase):
         )
 
     def test_the_path_says_where_it_comes_from_when_left_out(self) -> None:
-        # Regression: "default: current directory", which comes last.
+        # Regression: "default: current directory", which comes last. Init
+        # reads no devdocs.toml, so its help names none.
         given = {name: action.help for name, parser in self.commands.items()
                  for action in parser._actions if action.dest == "path"}
         self.assertEqual(given.pop("init"),
-                         "project root (default: current directory)")
+                         "project root; else $DEVDOCS_PATH or the current directory")
         self.assertEqual(given, dict.fromkeys(
             ("generate", "estimate", "export", "doctor", "cache"),
             "project root; else $DEVDOCS_PATH, the path in devdocs.toml, or the "
@@ -949,6 +951,113 @@ class TestInitAndCache(CliCase):
                 self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
         self.assertFalse((self.root / "no").exists())
 
+    def elsewhere(self) -> Path:
+        """A new current directory apart from the project, until the test ends."""
+        here = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(contextlib.chdir(here))
+        return here
+
+    def test_init_writes_in_the_project_devdocs_path_names(self) -> None:
+        # Regression: it wrote in the current directory, where the commands
+        # that read the variable never look.
+        here = self.elsewhere()
+        variable = {"DEVDOCS_PATH": str(self.root)}
+        code, _, err = self.run_cli("init", "--provider", "anthropic", env=variable)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(list(here.iterdir()), [])
+        with clean_env(**variable):
+            self.assertEqual(load_config().provider, "anthropic")   # as they read it
+        (self.root / "devdocs.toml").write_text(f"path = {str(here)!r}\n", "utf-8")
+        code, _, err = self.run_cli("init", "--force", env=variable)   # replaced there
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", (self.root / "devdocs.toml").read_text("utf-8"))
+        self.assertEqual(list(here.iterdir()), [])
+
+    def test_init_reads_no_path_from_the_file_it_replaces(self) -> None:
+        # The file in the current directory names another project. Above, the
+        # variable would win over its path anyway; here nothing else does.
+        here = self.elsewhere()
+        (here / "devdocs.toml").write_text(f"path = {str(self.root)!r}\n", "utf-8")
+        (self.root / "devdocs.toml").write_text("max_cost = 9\n", "utf-8")
+        code, _, err = self.run_cli("init", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", (here / "devdocs.toml").read_text("utf-8"))
+        self.assertEqual((self.root / "devdocs.toml").read_text("utf-8"),
+                         "max_cost = 9\n")
+
+    def test_the_flag_comes_first_and_a_blank_variable_is_unset(self) -> None:
+        here = self.elsewhere()
+        code, out, err = self.run_cli("init", str(self.root),
+                                      env={"DEVDOCS_PATH": str(here / "typo")})
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.root / "devdocs.toml").is_file())
+        *_, named = shlex.split(out.removeprefix("next: "))   # on the next line too
+        self.assertEqual(Path(named), self.root)
+        for blank in ("", "  "):
+            with self.subTest(blank=blank):
+                code, _, err = self.run_cli("init", "--force",
+                                            env={"DEVDOCS_PATH": blank})
+                self.assertEqual(code, 0, err)
+                self.assertTrue((here / "devdocs.toml").is_file())
+
+    def test_a_root_the_variable_names_is_refused_as_a_flags_is(self) -> None:
+        # Missing, or holding a devdocs.toml already: exit 2, nothing written.
+        here = self.elsewhere()
+        root = self.root.resolve()
+        code, _, err = self.run_cli("init", env={"DEVDOCS_PATH": str(root / "typo")})
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: project root {root / 'typo'} does not exist\n",
+                      err)
+        (root / "devdocs.toml").write_text("max_cost = 9\n", "utf-8")
+        code, _, err = self.run_cli("init", env={"DEVDOCS_PATH": str(root)})
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: {root / 'devdocs.toml'} already exists\n", err)
+        self.assertEqual((root / "devdocs.toml").read_text("utf-8"), "max_cost = 9\n")
+        self.assertEqual(list(here.iterdir()), [])
+
+    def test_the_next_line_can_be_pasted_into_a_shell(self) -> None:
+        # Regression: the path was printed as typed, so a space or a shell
+        # character split or changed it, and a leading dash made it an option.
+        for name, shown in (("my project", "'my project'"),
+                            ("it's $HOME; `x`", "'it'\"'\"'s $HOME; `x`'"),
+                            ("-dash", "-- -dash")):
+            with self.subTest(name=name), contextlib.chdir(self.root):
+                (self.root / name).mkdir()
+                (self.root / name / "app.py").write_text("x = 1\n", "utf-8")
+                code, out, err = self.run_cli("init", "--", name)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out, f"next: devdocs estimate {shown}\n")
+                program, command, *rest = shlex.split(out.removeprefix("next: "))
+                code, out, err = self.run_cli(command, "--json", *rest)   # as pasted
+                self.assertEqual((program, code), ("devdocs", 0), err)
+                self.assertEqual(json.loads(out)["files"], 1)   # app.py, not the shop
+
+    def test_the_next_line_names_the_project_the_variable_gave(self) -> None:
+        # A variable set for init alone, as `DEVDOCS_PATH=app devdocs init`
+        # sets it, is gone by the next command: a bare line would price the
+        # current directory instead.
+        here = self.elsewhere()
+        code, out, err = self.run_cli("init")
+        self.assertEqual((code, out), (0, "next: devdocs estimate\n"), err)
+        (here / "my app").mkdir()
+        code, out, err = self.run_cli("init", env={"DEVDOCS_PATH": " my app "})
+        self.assertEqual((code, out), (0, "next: devdocs estimate 'my app'\n"), err)
+        self.assertTrue((here / "my app" / "devdocs.toml").is_file())
+        (here / "-app").mkdir()
+        code, out, err = self.run_cli("init", env={"DEVDOCS_PATH": "-app"})
+        self.assertEqual((code, out), (0, "next: devdocs estimate -- -app\n"), err)
+
+    def test_on_windows_the_next_line_needs_no_quotes_for_a_plain_path(self) -> None:
+        # Regression: 'C:\proj', quoted for its backslash, and cmd.exe keeps
+        # single quotes as part of the path. Windows reads C:/proj as C:\proj.
+        for path, shown in ((r"C:\proj", "C:/proj"), (r"src\app", "src/app"),
+                            (r"C:\my proj", "'C:/my proj'"), (r"-a\b", "-- -a/b")):
+            with self.subTest(path=path):
+                self.assertEqual(cli._next_step(path, windows=True),
+                                 f"next: devdocs estimate {shown}")
+        self.assertEqual(cli._next_step(r"a\b", windows=False),   # a POSIX name
+                         r"next: devdocs estimate 'a\b'")
+
     @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
     def test_a_directory_it_cannot_open_is_refused(self) -> None:
         self.root.chmod(0o000)
@@ -1180,6 +1289,7 @@ class TestOutput(unittest.TestCase):
         for argv, shown in (
             (["estimate", str(folder), "--explain", "--quiet"], b"  \\u5927.py  ("),
             (["init", str(folder)], b"next: devdocs estimate "),
+            (["init", str(folder), "--force"], b"\\u65e5\\u672c'\n"),   # quoted
         ):
             with self.subTest(argv=argv):
                 raw = io.BytesIO()
@@ -1740,6 +1850,19 @@ class TestWhatAStopSays(CliCase):
             line = self.stopped("cache", "clear", str(self.root))
         self.assertEqual(line, "warning: interrupted; the cache is empty or as it was; "
                                "`devdocs cache stats` tells which")
+
+    def test_init_before_it_writes(self) -> None:
+        # Before it writes, no --force advice: --force would replace a config
+        # this run never touched.
+        config = self.root / "devdocs.toml"
+        config.write_text("max_cost = 9.99  # by hand\n", "utf-8")
+        for flags in ((), ("--force",)):
+            with self.subTest(flags=flags), \
+                    mock.patch.object(cli, "search_start", signals()):
+                line = self.stopped("init", str(self.root), *flags)
+                self.assertEqual(line, "warning: interrupted; nothing was written")
+                self.assertEqual(config.read_text("utf-8"),
+                                 "max_cost = 9.99  # by hand\n")
 
     def test_init_once_it_writes(self) -> None:
         config, ignore = self.root / "devdocs.toml", self.root / ".gitignore"
