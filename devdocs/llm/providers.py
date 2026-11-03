@@ -45,6 +45,9 @@ __all__ = [
     "EMBEDDING_MODEL",
     "AnthropicProvider",
     "GeminiProvider",
+    "anthropic_error",
+    "decode_message",
+    "encode_messages",
 ]
 
 _MAX_PAGES = 20
@@ -456,7 +459,7 @@ _SPEND_LIMIT_PREFIXES = (
 )
 
 
-def _encode_messages(
+def encode_messages(
     request: Request, info: ModelInfo | None, *, cache: bool, sampling: bool = True
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     """The Messages body and its beta headers, for both Anthropic providers.
@@ -489,7 +492,7 @@ def _encode_messages(
     return payload, betas
 
 
-def _decode_message(message: Any, model: str, provider: str) -> Completion:
+def decode_message(message: Any, model: str, provider: str) -> Completion:
     """A Messages response, as decoded JSON or an SDK object, as a Completion."""
     stop = _text(_field(message, "stop_reason"))
     finish = _ANTHROPIC_FINISH.get(stop, Finish.OTHER)
@@ -615,7 +618,7 @@ def _restate(usage: Usage, ran: ModelInfo, priced: ModelInfo) -> Usage:
     )
 
 
-def _anthropic_error(
+def anthropic_error(
     status: int,
     body: Any,
     retry_after: str | None,
@@ -711,7 +714,7 @@ class AnthropicProvider:
         ever read it back. Below the model's minimum cacheable length (512 to
         4,096 tokens) the marker is a silent no-op, not an error.
         """
-        return _encode_messages(request, info, cache=self.cache)
+        return encode_messages(request, info, cache=self.cache)
 
     def generate(self, request: Request) -> Completion:
         payload, betas = self.encode(request, find(request.model))
@@ -734,7 +737,7 @@ class AnthropicProvider:
         billed: declined fallback attempts are added, and a refusal billed by
         nobody costs nothing.
         """
-        return _decode_message(body, model, self.provider)
+        return decode_message(body, model, self.provider)
 
     def list_models(self) -> list[str]:
         """Model ids the key can call, as /v1/models lists them, every page."""
@@ -762,8 +765,8 @@ class AnthropicProvider:
         return sorted(set(found))
 
     def _error(self, response: HttpResponse) -> DevDocsError:
-        """Map the error envelope; see `_anthropic_error`."""
-        return _anthropic_error(
+        """Map the error envelope; see `anthropic_error`."""
+        return anthropic_error(
             response.status, _json_body(response), response.header("retry-after"),
             provider=self.provider,
         )

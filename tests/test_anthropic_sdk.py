@@ -249,6 +249,15 @@ class TestConstruction(SDKCase):
         with self.assertRaises(ConfigError):
             self.provider_class("")
 
+    def test_what_it_shares_with_the_raw_provider_is_public(self) -> None:
+        # Regression: it imported them as private names of providers.
+        from devdocs.llm import anthropic_sdk, providers
+
+        for name in ("encode_messages", "decode_message", "anthropic_error"):
+            with self.subTest(name):
+                self.assertIn(name, providers.__all__)
+                self.assertIs(getattr(anthropic_sdk, name), getattr(providers, name))
+
 
 class TestRequests(SDKCase):
     def test_parameters_follow_the_catalog(self) -> None:

@@ -98,9 +98,7 @@ class Embeddings:
             cost=sum(self._price(group) for group in batches),
         )
 
-    def update(
-        self, *, progress: Callable[[int, int], None] | None = None
-    ) -> tuple[int, float]:
+    def update(self) -> tuple[int, float]:
         """Embed every chunk that lacks a current vector.
 
         Returns (chunks embedded, dollars booked). Batches already stored are
@@ -114,7 +112,6 @@ class Embeddings:
         if self.embedder is None:
             raise ConfigError("no embedding model configured")
         batches = self._batches()
-        total = sum(len(group) for group in batches)
         limit = self.budget.requests + self.max_requests
         done = 0
         spent = 0.0
@@ -131,8 +128,6 @@ class Embeddings:
                 self.usage.record(self.model.id, cost=cost)
             done += len(group)
             spent += cost
-            if progress is not None:
-                progress(done, total)
         return done, spent
 
     def _send(
