@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -1066,6 +1067,293 @@ class TestInitAndCache(CliCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot open project root", err)
 
+    def test_a_config_it_cannot_write_names_the_file(self) -> None:
+        # Regression: an OSError was an internal error, exit 1.
+        target = self.root / "devdocs.toml"
+        target.mkdir()
+        code, _, err = self.run_cli("init", str(self.root), "--force")
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: cannot write {target.resolve()}: ", err)
+        self.assertNotIn("internal error", err)
+
+    def test_a_full_disk_names_the_file_too(self) -> None:
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(Path, "write_text", side_effect=full):
+            code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("devdocs.toml: No space left on device", err)
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_config_link_to_nothing_is_refused_and_nothing_made(self) -> None:
+        # Regression: exists() says False of it, so init wrote through it, even
+        # without --force, making the file it names, perhaps outside the project.
+        root = self.root.resolve()
+        config = root / "devdocs.toml"
+        (root / "config").mkdir()
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        for link in (str(outside / "devdocs.toml"), "config/devdocs.toml",
+                     "pyproject.toml/x"):
+            for flags in ((), ("--force",)):
+                with self.subTest(link=link, flags=flags):
+                    config.unlink(missing_ok=True)
+                    config.symlink_to(link)
+                    code, _, err = self.run_cli("init", str(root), *flags)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(f"devdocs: error: cannot write {config}: it links "
+                                  f"to {link}, which leads nowhere\n  hint: remove the "
+                                  "link, or make the file it names and pass --force\n",
+                                  err)
+                    self.assertEqual(os.readlink(config), link)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list((root / "config").iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_config_link_to_a_file_is_replaced_through_it_with_force(self) -> None:
+        # As a file is: kept without --force.
+        shared = self.root / "shared.toml"
+        shared.write_text("max_cost = 9\n", "utf-8")
+        (self.root / "devdocs.toml").symlink_to(shared.name)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", err)
+        self.assertEqual(shared.read_text("utf-8"), "max_cost = 9\n")
+        code, _, err = self.run_cli("init", str(self.root), "--force")
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.root / "devdocs.toml").is_symlink())
+        self.assertIn("[devdocs]", shared.read_text("utf-8"))
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_gitignore_it_cannot_change_names_the_file(self) -> None:
+        # Regression: an internal error, with the config already written.
+        ignore = self.root / ".gitignore"
+        target = (self.root / "devdocs.toml").resolve()
+        for mode, did in ((0o444, "append"), (0o000, "read")):
+            with self.subTest(did):
+                target.unlink(missing_ok=True)
+                ignore.write_bytes(b"build/\n")
+                ignore.chmod(mode)
+                self.addCleanup(ignore.chmod, 0o644)
+                code, _, err = self.run_cli("init", str(self.root))
+                self.assertEqual(code, 2)
+                self.assertIn(f"devdocs: error: cannot add .devdocs/ to "
+                              f"{ignore.resolve()}: Permission denied\n"
+                              f"  hint: {target} is written; add .devdocs/ to "
+                              ".gitignore yourself\n", err)
+                self.assertTrue(target.is_file())
+                ignore.chmod(0o644)
+                self.assertEqual(ignore.read_bytes(), b"build/\n")
+
+    def test_a_gitignore_on_a_full_disk_names_the_file_too(self) -> None:
+        # Any OSError: not only the refused permission of the test above.
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(b"build/\n")
+        real = Path.open
+
+        def full(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if mode == "ab":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", full):
+            code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: cannot add .devdocs/ to {ignore.resolve()}: "
+                      "No space left on device\n", err)
+        self.assertNotIn("internal error", err)
+        self.assertEqual(ignore.read_bytes(), b"build/\n")
+
+    def modes_of_gitignore(self) -> list[str]:
+        """The modes `init` opens the .gitignore with, however it opens it."""
+        modes: list[str] = []
+        real = io.open
+
+        def opened(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and Path(file).name == ".gitignore":
+                modes.append(mode)
+            return real(file, mode, *args, **kwargs)
+
+        with mock.patch.object(io, "open", opened), \
+                mock.patch("builtins.open", opened):
+            code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+        return modes
+
+    def test_a_gitignore_is_read_and_appended_to_never_written_over(self) -> None:
+        # Regression: it was written back whole, which the bytes alone cannot
+        # show of a file that is fine as text.
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(b"build/\n")
+        self.assertEqual(self.modes_of_gitignore(), ["rb", "ab"])
+        self.assertEqual(ignore.read_bytes(), b"build/\n.devdocs/\n")
+        (self.root / "devdocs.toml").unlink()
+        self.assertEqual(self.modes_of_gitignore(), ["rb"])   # it lists the entry now
+
+    def test_force_adds_the_entry_too(self) -> None:
+        # A stop's message sends the user to --force to finish this step.
+        config, ignore = self.root / "devdocs.toml", self.root / ".gitignore"
+        config.write_text("max_cost = 9\n", "utf-8")
+        ignore.write_bytes(b"build/\n")
+        code, _, err = self.run_cli("init", str(self.root), "--force")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", config.read_text("utf-8"))
+        self.assertEqual(ignore.read_bytes(), b"build/\n.devdocs/\n")
+
+    def inited(self, before: bytes) -> tuple[bytes, str]:
+        """What a .gitignore holding `before` holds after init, and init's log."""
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(before)
+        (self.root / "devdocs.toml").unlink(missing_ok=True)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+        return ignore.read_bytes(), err
+
+    def test_a_gitignore_only_ever_gains_the_entry(self) -> None:
+        # Regression: it was read as text and written back whole, CRLF as LF and
+        # a byte that is not UTF-8 as U+FFFD.
+        entry = b".devdocs/"
+        for before, added in (
+            (b"", entry + b"\n"),
+            (b"\n", entry + b"\n"),
+            (b"build/\n", entry + b"\n"),
+            (b"build/", b"\n" + entry + b"\n"),
+            (b"a\r\nb\r\n", entry + b"\r\n"),
+            (b"a\r\nb", b"\r\n" + entry + b"\r\n"),
+            (b"a\nb\nc\r\n", entry + b"\n"),                # mostly LF
+            (b"a\r\nb\r\nc\n", entry + b"\r\n"),            # mostly CRLF
+            (b"a\r\nb\n", entry + b"\r\n"),                 # as many of each
+            (b"a\r\nb\r", b"\n" + entry + b"\r\n"),          # just the LF it lacks
+            (b"a\nb\r", b"\n" + entry + b"\n"),
+            (b"a\rb\r", b"\n" + entry + b"\n"),               # no line break, to git
+            (b"caf\xe9/\n", entry + b"\n"),                  # Latin-1
+            (b"caf\xe9/\r\n\xff\xfe", b"\r\n" + entry + b"\r\n"),
+            (b"\xef\xbb\xbfa\r\n", entry + b"\r\n"),         # a BOM
+            (b"\xff\xfea\x00/\x00\n\x00", b"\n" + entry + b"\n"),   # UTF-16
+            (b"# no entry\n.devdocs\n/.devdocs/\n.devdocs/*\n", entry + b"\n"),
+            (b"x.devdocs/\n.devdocs/x\n", entry + b"\n"),
+            ("\ufeff.devdocs/\n".encode(), entry + b"\n"),   # not a word of its own
+        ):
+            with self.subTest(before=before):
+                after, log = self.inited(before)
+                self.assertEqual(after, before + added)
+                self.assertIn("added .devdocs/ to .gitignore", log)
+
+    def test_a_gitignore_that_lists_the_entry_is_not_touched(self) -> None:
+        # Every spelling the text it was read as, split on whitespace, gave.
+        for before in (b".devdocs/", b".devdocs/\n", b".devdocs/\r\n",
+                       b"a\r.devdocs/\r", b"  .devdocs/  \n", b"\t.devdocs/\t\n",
+                       b"\x0c.devdocs/\x0b\n",
+                       b"a .devdocs/ b\n", b"# .devdocs/\n", b"caf\xe9/\n.devdocs/",
+                       ".devdocs/\u00a0\n".encode(), "\u2003.devdocs/\n".encode(),
+                       b".devdocs/\x1f\n", b"\xff\xfe .devdocs/ \xff"):
+            with self.subTest(before=before):
+                after, log = self.inited(before)
+                self.assertEqual(after, before)
+                self.assertNotIn(".gitignore", log)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_read_only_gitignore_that_lists_the_entry_is_no_error(self) -> None:
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(b".devdocs/\n")
+        ignore.chmod(0o444)
+        self.addCleanup(ignore.chmod, 0o644)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+
+    @unittest.skipIf(os.name == "nt", "needs a POSIX file mode and links")
+    def test_a_gitignore_link_is_refused_and_its_file_left_as_it_was(self) -> None:
+        # Regression: the entry was appended through it, yet git reads no
+        # .gitignore that is a link, nor does devdocs' scan: it never applied.
+        real = self.root / "shared.ignore"
+        real.write_bytes(b"build/\n")
+        real.chmod(0o640)
+        (self.root / ".gitignore").symlink_to(real.name)
+        node = real.stat().st_ino
+        self.assert_ignore_refused(self.LINKED)
+        self.assertTrue((self.root / ".gitignore").is_symlink())
+        self.assertEqual(real.read_bytes(), b"build/\n")
+        info = real.stat()
+        self.assertEqual((info.st_ino, info.st_mode & 0o777), (node, 0o640))
+
+    def test_no_gitignore_is_made(self) -> None:
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+        self.assertFalse((self.root / ".gitignore").exists())
+        self.assertNotIn(".gitignore", err)
+
+    LINKED = "it is a symbolic link, which git does not read"   # wherever it leads
+
+    def assert_ignore_refused(self, reason: str) -> None:
+        """init, as --force lets it run again, refuses the .gitignore for
+        `reason`, saying what it wrote and what is left to do."""
+        root = self.root.resolve()
+        code, _, err = self.run_cli("init", str(root), "--force")
+        self.assertEqual(code, 2, err)
+        self.assertIn(f"devdocs: error: cannot add .devdocs/ to {root / '.gitignore'}: "
+                      f"{reason}\n  hint: {root / 'devdocs.toml'} is written; add "
+                      ".devdocs/ to .gitignore yourself\n", err)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_gitignore_link_past_a_folder_it_cannot_search_is_refused(self) -> None:
+        # Regression: an internal error on 3.11 to 3.13. From 3.14 Path.is_file
+        # says False for it, so init went on in silence, adding no entry.
+        locked = self.root / "locked"
+        locked.mkdir()
+        (locked / "ignore").write_bytes(b"build/\n")
+        (self.root / ".gitignore").symlink_to("locked/ignore")
+        locked.chmod(0o000)
+        self.addCleanup(locked.chmod, 0o755)
+        self.assert_ignore_refused(self.LINKED)
+        locked.chmod(0o755)
+        self.assertEqual((locked / "ignore").read_bytes(), b"build/\n")
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_gitignore_link_to_nothing_is_refused_and_nothing_made(self) -> None:
+        # Regression: passed by in silence. Appending through it would make
+        # its target, perhaps outside the project. The last two lead nowhere,
+        # though the pyproject.toml they name is there.
+        root = self.root.resolve()
+        ignore = root / ".gitignore"
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        for link in ("shared/ignore", str(outside / "ignore"), "pyproject.toml/x",
+                     "missing/../pyproject.toml", "pyproject.toml/../pyproject.toml"):
+            with self.subTest(link=link):
+                ignore.unlink(missing_ok=True)
+                ignore.symlink_to(link)
+                self.assert_ignore_refused(self.LINKED)
+                self.assertEqual(os.readlink(ignore), link)
+        self.assertFalse((root / "shared").exists())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_directory_named_gitignore_is_refused_and_left_alone(self) -> None:
+        # Regression: passed by in silence, as a missing .gitignore is; only that is.
+        ignore = self.root / ".gitignore"
+        ignore.mkdir()
+        self.assert_ignore_refused("it is not a regular file")
+        self.assertEqual(list(ignore.iterdir()), [])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs a FIFO")
+    def test_a_fifo_named_gitignore_is_refused_and_never_opened(self) -> None:
+        # Reading one waits for a writer, for ever: here an open fails at once.
+        os.mkfifo(self.root / ".gitignore")
+        real = io.open
+
+        def opened(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and Path(file).name == ".gitignore":
+                raise AssertionError(f"init opened {file}")
+            return real(file, *args, **kwargs)
+
+        with mock.patch.object(io, "open", opened), mock.patch("builtins.open", opened):
+            self.assert_ignore_refused("it is not a regular file")
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_gitignore_link_to_no_regular_file_is_refused(self) -> None:
+        ignore = self.root / ".gitignore"
+        for link in ("shop", os.devnull, ".gitignore"):   # a folder, a device, a loop
+            with self.subTest(link=link):
+                ignore.unlink(missing_ok=True)
+                ignore.symlink_to(link)
+                self.assert_ignore_refused(self.LINKED)
+
     def test_every_option_the_template_mentions_is_valid(self) -> None:
         self.run_cli("init", str(self.root))
         text = (self.root / "devdocs.toml").read_text("utf-8")
@@ -1867,7 +2155,7 @@ class TestWhatAStopSays(CliCase):
     def test_init_once_it_writes(self) -> None:
         config, ignore = self.root / "devdocs.toml", self.root / ".gitignore"
         ignore.write_bytes(b"build/\n")
-        for owner, step in ((Path, "write_text"),):
+        for owner, step in ((Path, "write_text"), (cli, "_ignore_state")):
             with self.subTest(step), mock.patch.object(owner, step, signals()):
                 line = self.stopped("init", str(self.root), "--force")
                 self.assertEqual(line, "warning: interrupted; its files may be "
