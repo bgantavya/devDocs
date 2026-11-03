@@ -2,8 +2,10 @@
 
 The pipeline names a provider by string — "gemini", "anthropic", or
 "anthropic-sdk" for the official SDK — and never imports a provider module.
-This is the one place that maps the name to a class, so adding a provider
-means one entry here and one in `config`.
+This is the one place that maps the name to a class. Adding a provider takes
+an entry here, its key variables in `config`, its models and price ceiling in
+`catalog`, and, if the catalog files its models under another name, as for
+"anthropic-sdk", that name for the offline model in the CLI's `_client`.
 """
 
 from __future__ import annotations

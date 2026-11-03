@@ -672,9 +672,10 @@ class AnthropicProvider:
 
     Encoding follows each model's accepted parameters from the catalog:
     Sonnet 5 and Opus 5 reject `temperature` with a 400, Haiku 4.5 rejects
-    `effort`. Opus 5 requests opt into server-side refusal fallbacks
-    (`fallbacks: "default"`), so a declined request is re-run on Anthropic's
-    recommended fallback model instead of coming back empty.
+    `effort`. Requests to a model the catalog marks `server_fallbacks` opt into
+    server-side refusal fallbacks (`fallbacks: "default"`), so a declined
+    request is re-run on Anthropic's recommended fallback model instead of
+    coming back empty.
     """
 
     provider = "anthropic"
