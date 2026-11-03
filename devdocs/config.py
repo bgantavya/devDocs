@@ -353,10 +353,11 @@ def _validate(config: Config) -> None:
 
 
 def search_start(flagged: Any, environment: Mapping[str, str]) -> Path:
-    """Where the search for the config file starts: the project path the flag
-    gives, else DEVDOCS_PATH, else the current directory; a blank variable is
-    unset. A `path` in the file cannot steer it. Checked here, so a typo is
-    reported as one, not by a config file found above it."""
+    """Where the search for the config file starts, and `devdocs init` writes
+    one: the project path the flag gives, else DEVDOCS_PATH, else the current
+    directory; a blank variable is unset. A `path` in the file cannot steer
+    either. Checked here, so a typo is reported as one, not by a config file
+    found above it."""
     if flagged is not None:
         return project_root(flagged)
     return project_root(environment.get("DEVDOCS_PATH", "").strip() or ".")
