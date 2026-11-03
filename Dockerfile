@@ -24,7 +24,10 @@ RUN groupadd --gid 10001 devdocs \
  && useradd --uid 10001 --gid 10001 --no-log-init --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin devdocs \
  && install -d -o 10001 -g 10001 /work
-# Bind mount: the wheel never lands in a layer.
+# Bind mount: the wheel never lands in a layer. No extras and --no-index, so
+# nothing is fetched and devdocs runs on the standard library alone. That leaves
+# provider = "anthropic-sdk" refused here, with a hint; provider = "anthropic"
+# reaches the same API over the built-in HTTP client.
 RUN --mount=type=bind,from=build,source=/dist,target=/dist \
     pip install --no-cache-dir --no-index --root-user-action=ignore /dist/*.whl
 WORKDIR /work
