@@ -6,7 +6,21 @@ retrying. Every failure therefore has a distinct class and a stable exit code,
 and `DevDocsError.exit_code` is what `cli.main` returns.
 
 Exit codes are part of the public contract and follow the same deprecation
-rules as the Python API.
+rules as the Python API:
+
+    1    anything unexpected, and DevDocsError itself
+    2    ConfigError
+    3    AuthError
+    4    ProviderError
+    5    RateLimited
+    6    ModelNotFound
+    7    BudgetExceeded
+    8    unused: a file that cannot be parsed degrades to a stub, so no failure
+         maps to it, and the code stays free rather than the others moving
+    9    StorageError
+    10   QuotaExhausted
+    130  Interrupted, and KeyboardInterrupt
+    143  Interrupted, when SIGTERM asked for the stop; the CLI tells them apart
 """
 
 from __future__ import annotations
@@ -18,7 +32,6 @@ __all__ = [
     "DevDocsError",
     "Interrupted",
     "ModelNotFound",
-    "ParseError",
     "ProviderError",
     "QuotaExhausted",
     "RateLimited",
@@ -170,12 +183,6 @@ class BudgetExceeded(DevDocsError):
         super().__init__(message)
         self.spent = spent
         self.limit = limit
-
-
-class ParseError(DevDocsError):
-    """A source file could not be parsed. Degrades to a stub, rarely fatal."""
-
-    exit_code = 8
 
 
 class StorageError(DevDocsError):

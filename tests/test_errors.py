@@ -8,6 +8,7 @@ import io
 import re
 import unittest
 
+from devdocs import errors
 from devdocs.errors import (
     AuthError,
     BudgetExceeded,
@@ -15,7 +16,6 @@ from devdocs.errors import (
     DevDocsError,
     Interrupted,
     ModelNotFound,
-    ParseError,
     ProviderError,
     QuotaExhausted,
     RateLimited,
@@ -26,8 +26,7 @@ from devdocs.llm import stop
 
 ALL: tuple[type[DevDocsError], ...] = (
     DevDocsError, ConfigError, AuthError, ProviderError, RateLimited,
-    ModelNotFound, BudgetExceeded, ParseError, StorageError, QuotaExhausted,
-    Interrupted,
+    ModelNotFound, BudgetExceeded, StorageError, QuotaExhausted, Interrupted,
 )
 
 
@@ -40,11 +39,27 @@ class TestExitCodes(unittest.TestCase):
         # Changing any of these is a breaking change for callers.
         expected: dict[type[DevDocsError], int] = {
             DevDocsError: 1, ConfigError: 2, AuthError: 3, ProviderError: 4,
-            RateLimited: 5, ModelNotFound: 6, BudgetExceeded: 7, ParseError: 8,
-            StorageError: 9, QuotaExhausted: 10, Interrupted: 130,
+            RateLimited: 5, ModelNotFound: 6, BudgetExceeded: 7, StorageError: 9,
+            QuotaExhausted: 10, Interrupted: 130,
         }
         for cls, code in expected.items():
             self.assertEqual(cls.exit_code, code, cls.__name__)
+
+    def test_eight_is_left_unused(self) -> None:
+        # A file that cannot be parsed degrades to a stub, so nothing raises it;
+        # the others keep their codes, as they are public contract.
+        self.assertFalse(hasattr(errors, "ParseError"))
+        classes = [cls for cls in vars(errors).values()
+                   if isinstance(cls, type) and issubclass(cls, DevDocsError)]
+        self.assertEqual(set(classes), set(ALL))
+        self.assertNotIn(8, [cls.exit_code for cls in classes])
+        self.assertRegex(errors.__doc__ or "", r"\n\s+8\s+unused")
+
+    def test_every_code_is_listed_where_the_codes_are_listed(self) -> None:
+        for cls in ALL:
+            with self.subTest(cls.__name__):
+                self.assertRegex(errors.__doc__ or "",
+                                 rf"\n\s+{cls.exit_code}\s+.*\b{cls.__name__}\b")
 
     def test_a_stop_refusal_is_also_named_in_stop(self) -> None:
         self.assertIs(stop.Interrupted, Interrupted)

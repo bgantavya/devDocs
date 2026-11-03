@@ -30,7 +30,7 @@ from typing import Any
 from devdocs.errors import ConfigError, DevDocsError, ProviderError
 from devdocs.llm import Completion, Request
 from devdocs.llm.catalog import find
-from devdocs.llm.providers import _anthropic_error, _decode_message, _encode_messages
+from devdocs.llm.providers import anthropic_error, decode_message, encode_messages
 
 __all__ = ["AnthropicSDKProvider", "sdk_available"]
 
@@ -75,7 +75,7 @@ class AnthropicSDKProvider:
         self.cache = cache
 
     def generate(self, request: Request) -> Completion:
-        params, betas = _encode_messages(
+        params, betas = encode_messages(
             request, find(request.model), cache=self.cache, sampling=False
         )
         try:
@@ -86,7 +86,7 @@ class AnthropicSDKProvider:
                 response = self._client.messages.create(**params)
         except Exception as err:
             raise self._error(err) from err
-        return _decode_message(response, request.model, self.provider)
+        return decode_message(response, request.model, self.provider)
 
     def list_models(self) -> list[str]:
         """Model ids the key can call; iterating the page fetches every page."""
@@ -107,7 +107,7 @@ class AnthropicSDKProvider:
             retry_after = (
                 headers.get("retry-after") if isinstance(headers, Mapping) else None
             )
-            return _anthropic_error(
+            return anthropic_error(
                 status if isinstance(status, int) else 0,
                 getattr(err, "body", None),
                 retry_after if isinstance(retry_after, str) else None,
