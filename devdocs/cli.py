@@ -30,6 +30,7 @@ import contextlib
 import json
 import os
 import queue
+import shlex
 import signal
 import sys
 import threading
@@ -37,7 +38,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import FrameType
 from typing import Any, TextIO
 
@@ -47,8 +48,8 @@ from devdocs.config import (
     Config,
     key_variables,
     load_config,
-    project_root,
     resolve_api_key,
+    search_start,
 )
 from devdocs.errors import ConfigError, DevDocsError, exit_code_for
 from devdocs.index.cache import ResponseCache
@@ -275,6 +276,7 @@ class _Interrupts:
 
 _PATH_HELP = ("project root; else $DEVDOCS_PATH, the path in "
               f"{CONFIG_FILENAME}, or the current directory")
+_INIT_PATH_HELP = "project root; else $DEVDOCS_PATH or the current directory"
 _JSON_HELP = "JSON on stdout"
 _KEY_HELP = "API key; else $GEMINI_API_KEY etc., or the config file"
 _PROVIDER_HELP = ("whose models write the prose; anthropic-sdk needs the anthropic "
@@ -395,8 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", help=_JSON_HELP)
 
     init = commands.add_parser("init", help=f"write a starter {CONFIG_FILENAME}")
-    init.add_argument("path", nargs="?", default=".",
-                      help="project root (default: current directory)")
+    init.add_argument("path", nargs="?", default=None, help=_INIT_PATH_HELP)
     init.add_argument("--provider", choices=PROVIDERS, default=Config.provider,
                       help=_PROVIDER_HELP)
     init.add_argument("--force", action="store_true", help="overwrite an existing file")
@@ -744,8 +745,23 @@ out = "docs"
 """
 
 
+def _next_step(path: str | None, *, windows: bool = os.name == "nt") -> str:
+    """The command to run after init, to paste into a shell: quoted, after `--`
+    if it starts with a dash, and on Windows with `/` for `\\`, whose quotes
+    cmd.exe would keep. With no path given, DEVDOCS_PATH's: one set for init
+    alone (`DEVDOCS_PATH=app devdocs init`) is gone by the next command."""
+    if path is None:
+        path = os.environ.get("DEVDOCS_PATH", "").strip() or None
+    words = ["devdocs", "estimate"]
+    if path is not None:
+        if windows:
+            path = PureWindowsPath(path).as_posix()
+        words += ["--", path] if path.startswith("-") else [path]
+    return f"next: {shlex.join(words)}"
+
+
 def _init(args: argparse.Namespace, out: _Output, interrupts: _Interrupts) -> int:
-    root = project_root(args.path)   # before anything is written
+    root = search_start(args.path, os.environ)   # before anything is written
     target = root / CONFIG_FILENAME
     if target.exists() and not args.force:
         raise ConfigError(f"{target} already exists", hint="pass --force to replace it")
@@ -760,7 +776,7 @@ def _init(args: argparse.Namespace, out: _Output, interrupts: _Interrupts) -> in
             joiner = "" if text.endswith("\n") or not text else "\n"
             ignore.write_text(f"{text}{joiner}{STATE_DIR}/\n", "utf-8")
             out.info(f"added {STATE_DIR}/ to .gitignore (local cache and run ledger)")
-    out.result(f"next: devdocs estimate {args.path}", {"config": str(target)})
+    out.result(_next_step(args.path), {"config": str(target)})
     return 0
 
 
