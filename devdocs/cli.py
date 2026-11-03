@@ -39,6 +39,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path, PureWindowsPath
+from stat import S_ISLNK, S_ISREG
 from types import FrameType
 from typing import Any, TextIO
 
@@ -745,6 +746,63 @@ out = "docs"
 """
 
 
+def _ignore_entry(data: bytes) -> bytes:
+    """What to append to a .gitignore holding `data` to list the state
+    directory: nothing when a word of it, split as `str.split` splits, already
+    is that entry, even in a comment. It ends as most of the file's lines do,
+    in CRLF or LF. A last line without a break gets one first, and a last CR
+    just its LF: git reads CRLF as one break, a lone CR as none."""
+    entry = f"{STATE_DIR}/"
+    if entry in data.decode("utf-8", errors="replace").split():
+        return b""
+    crlf = data.count(b"\r\n")
+    ending = b"\r\n" if crlf and 2 * crlf >= data.count(b"\n") else b"\n"
+    if not data or data.endswith(b"\n"):
+        lead = b""
+    else:
+        lead = b"\n" if data.endswith(b"\r") else ending
+    return lead + entry.encode() + ending
+
+
+def _ignore_unfit(ignore: Path) -> str | None:
+    """Why `ignore`, which is there, can take no entry; None if it can. Only a
+    regular file can: since 2.32 git reads no .gitignore that is a link, nor
+    does devdocs' scan, and reading a FIFO would block. os.lstat follows no
+    link, so every Python says the same."""
+    info = os.lstat(ignore)
+    if S_ISLNK(info.st_mode):
+        return "it is a symbolic link, which git does not read"
+    return None if S_ISREG(info.st_mode) else "it is not a regular file"
+
+
+def _ignore_state(ignore: Path, written: Path, out: _Output) -> None:
+    """List the state directory in `ignore`, if that file lacks it; where
+    nothing has the name, make none. Only ever appends, so every byte, and the
+    file itself and its mode, stay as they were. Anything else by the name is
+    refused, as a file it cannot read is; see `_ignore_unfit`. `written` is
+    what the hint of a refusal says is done already."""
+    def refused(reason: str) -> ConfigError:
+        return ConfigError(
+            f"cannot add {STATE_DIR}/ to {ignore}: {reason}",
+            hint=f"{written} is written; add {STATE_DIR}/ to {ignore.name} yourself",
+        )
+
+    if not os.path.lexists(ignore):
+        return
+    try:
+        unfit = _ignore_unfit(ignore)
+        if unfit:
+            raise refused(unfit)
+        entry = _ignore_entry(ignore.read_bytes())
+        if not entry:
+            return
+        with ignore.open("ab") as stream:
+            stream.write(entry)
+    except OSError as err:
+        raise refused(err.strerror or str(err)) from err
+    out.info(f"added {STATE_DIR}/ to .gitignore (local cache and run ledger)")
+
+
 def _next_step(path: str | None, *, windows: bool = os.name == "nt") -> str:
     """The command to run after init, to paste into a shell: quoted, after `--`
     if it starts with a dash, and on Windows with `/` for `\\`, whose quotes
@@ -760,22 +818,38 @@ def _next_step(path: str | None, *, windows: bool = os.name == "nt") -> str:
     return f"next: {shlex.join(words)}"
 
 
+def _link_to_nothing(path: Path) -> str | None:
+    """What `path` links to, if it is a link that leads nowhere: `exists` says
+    False of it, and writing through it would make that file, perhaps outside
+    the project. What else os.stat raises, the write would too."""
+    if not os.path.islink(path):
+        return None
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return os.readlink(path)
+    return None
+
+
 def _init(args: argparse.Namespace, out: _Output, interrupts: _Interrupts) -> int:
     root = search_start(args.path, os.environ)   # before anything is written
     target = root / CONFIG_FILENAME
-    if target.exists() and not args.force:
-        raise ConfigError(f"{target} already exists", hint="pass --force to replace it")
-    interrupts.writing = True
-    target.write_text(_TEMPLATE.format(provider=args.provider), "utf-8")
+    try:
+        linked = _link_to_nothing(target)
+        if linked is not None:   # with --force too: it would make a file elsewhere
+            raise ConfigError(
+                f"cannot write {target}: it links to {linked}, which leads nowhere",
+                hint="remove the link, or make the file it names and pass --force",
+            )
+        if target.exists() and not args.force:
+            raise ConfigError(f"{target} already exists",
+                              hint="pass --force to replace it")
+        interrupts.writing = True
+        target.write_text(_TEMPLATE.format(provider=args.provider), "utf-8")
+    except OSError as err:
+        raise ConfigError(f"cannot write {target}: {err.strerror or err}") from err
     out.info(f"wrote {target}")
-
-    ignore = root / ".gitignore"
-    if ignore.is_file():
-        text = ignore.read_text("utf-8", errors="replace")
-        if f"{STATE_DIR}/" not in text.split():
-            joiner = "" if text.endswith("\n") or not text else "\n"
-            ignore.write_text(f"{text}{joiner}{STATE_DIR}/\n", "utf-8")
-            out.info(f"added {STATE_DIR}/ to .gitignore (local cache and run ledger)")
+    _ignore_state(root / ".gitignore", target, out)
     out.result(_next_step(args.path), {"config": str(target)})
     return 0
 
