@@ -144,7 +144,7 @@ def _certificates() -> Capability:
     return Capability(
         "certificates",
         count > 0,
-        f"{count} CA certificates",
+        f"{count:,} CA certificate{'' if count == 1 else 's'}",
         "" if count else "run 'Install Certificates.command' or set SSL_CERT_FILE",
     )
 

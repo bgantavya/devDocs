@@ -33,7 +33,7 @@ from devdocs.render.model import (
     SymbolDoc,
 )
 from devdocs.render.style import Reply
-from devdocs.render.text import folded
+from devdocs.render.text import counted, folded
 from devdocs.scan import SourceFile
 
 __all__ = [
@@ -208,7 +208,7 @@ class Composer:
             for p in paths[:_MAX_LINKS]
         ]
         if len(paths) > _MAX_LINKS:
-            shown.append(Link(f"{len(paths) - _MAX_LINKS} more"))
+            shown.append(Link(f"{len(paths) - _MAX_LINKS:,} more"))
         return tuple(shown)
 
     # -- file documents ----------------------------------------------------
@@ -280,7 +280,7 @@ class Composer:
             items.append(Item("Module", (self._module_link(node.module),)))
         items.append(Item(LANGUAGE_NAMES.get(source.language, source.language.title())))
         lines = (facts.loc if facts else 0) or source.lines
-        items.append(Item(f"{lines:,} lines"))
+        items.append(Item(counted(lines, "line")))
         if node is not None and node.entry_point:
             items.append(Item(f"Entry point: {node.entry_point}"))
         if node is not None and node.dependents:
@@ -433,7 +433,7 @@ class Composer:
         return ""
 
     def _module_facts(self, path: str, files: Sequence[str]) -> Section:
-        items: list[Item] = [Item(f"{len(files)} files")]
+        items: list[Item] = [Item(counted(len(files), "file"))]
         parent = posixpath.dirname(path) if path else None
         while parent is not None and parent not in self.modules and parent:
             parent = posixpath.dirname(parent)
@@ -554,12 +554,12 @@ class Composer:
             return f"{self.project} has no documentable source files."
         ranked = sorted(languages.items(), key=lambda kv: (-kv[1], kv[0]))
         spoken = ", ".join(
-            f"{LANGUAGE_NAMES.get(name, name.title())} ({count})"
+            f"{LANGUAGE_NAMES.get(name, name.title())} ({count:,})"
             for name, count in ranked
         )
         modules = len(self.modules)
         noun = "directory" if modules == 1 else "directories"
         return (
-            f"{self.project} has {total} documented source files in {modules} "
-            f"{noun}: {spoken}."
+            f"{self.project} has {counted(total, 'documented source file')} in "
+            f"{modules:,} {noun}: {spoken}."
         )
