@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import unittest
+from typing import Any
+from unittest import mock
 
 from devdocs.capabilities import Capability, Report, probe_all
 
@@ -45,6 +48,27 @@ class TestProbes(unittest.TestCase):
 
     def test_unknown_capability_lookup_is_none(self) -> None:
         self.assertIsNone(self.report.get("no-such-probe"))
+
+
+class TestSyntax(unittest.TestCase):
+    def test_syntax_newer_than_the_interpreter_is_noted_not_failed(self) -> None:
+        # Regression: on 3.11 the probe failed for 3.12 syntax, so doctor
+        # exited 1 on every install, when that costs only the files using it.
+        real = ast.parse
+
+        def parse_as_311(source: str, *args: Any, **kwargs: Any) -> ast.Module:
+            if "def f[T]" in source or source == 'f"{"a"}"':
+                raise SyntaxError("invalid syntax")
+            return real(source, *args, **kwargs)
+
+        with mock.patch("ast.parse", parse_as_311):
+            report = probe_all()
+        syntax = report.get("syntax")
+        assert syntax is not None
+        self.assertEqual((syntax.ok, syntax.value), (True, "2/4 constructs"))
+        self.assertIn("cannot parse: pep695-generics (3.12+), pep701-fstrings (3.12+)",
+                      syntax.detail)
+        self.assertNotIn(syntax, report.failures)
 
 
 class TestRendering(unittest.TestCase):
