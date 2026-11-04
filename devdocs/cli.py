@@ -67,7 +67,7 @@ from devdocs.legacy import (
     translate,
 )
 from devdocs.llm.budget import Budget, Router
-from devdocs.llm.catalog import CATALOG, PRICES_CHECKED, Tier, catalogued
+from devdocs.llm.catalog import CATALOG, PRICES_CHECKED, catalogued, find
 from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.factory import PROVIDERS, OfflineModel, make_provider
 from devdocs.llm.stop import Interrupted, leave_signals
@@ -75,6 +75,7 @@ from devdocs.render import PDF_ENGINES
 
 if TYPE_CHECKING:
     from devdocs.capabilities import Capability
+    from devdocs.generate import Estimate
 
 __all__ = ["build_parser", "main"]
 
@@ -634,10 +635,10 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
         f"at most ${estimate.cost:.4f}",
     ]
     if config.free_tier and estimate.requests:
-        days = _free_days(config, estimate.requests)
+        days = _free_days(estimate)
         if days > 1:
-            lines.append(f"free tier: about {days:,} days of daily quota; "
-                         "runs resume where they stop")
+            lines.append(f"free tier: up to {days:,} days of daily quota, fewer if "
+                         "other models can take over; runs resume where they stop")
     if estimate.demoted:
         stubs = "a stub" if len(estimate.demoted) == 1 else "stubs"
         flags = {"max_cost": f"--max-cost ${config.max_cost:g}",
@@ -666,13 +667,28 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
     return 0
 
 
-def _free_days(config: Config, requests: int) -> int:
-    file_models = [m for m in CATALOG
-                   if m.provider == config.provider and m.tier is Tier.FILE]
-    daily = file_models[0].free_rpd if file_models else None
-    if not daily:
-        return 0
-    return -(-requests // daily)
+def _free_days(estimate: Estimate) -> int:
+    """The most days of free-tier quota the plan's calls take, by the daily
+    limit of the model each is priced at, as each has its own; 0 if one has none.
+
+    A run asks tier by tier, so each tier starts on the day the one before it
+    ends: their days add up, less those they share. That is the worst case.
+    Once a model's quota is spent the next model a key reaches takes over, so
+    a run may end sooner, even in one go; which it reaches, `estimate`, having
+    no key, cannot know. A pinned model has none to take over, nor has a tier
+    whose next models the free tier leaves out, so the line says "if".
+    """
+    needed: dict[str, int] = {}
+    for item in estimate.items:
+        if not item.cached:
+            needed[item.model] = needed.get(item.model, 0) + item.requests
+    days = 1
+    for model, requests in needed.items():
+        info = find(model)
+        if info is None or not info.free_rpd:
+            return 0
+        days += (requests - 1) // info.free_rpd
+    return days
 
 
 def _key_where(args: argparse.Namespace, source: KeySource) -> str:

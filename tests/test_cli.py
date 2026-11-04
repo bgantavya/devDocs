@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import errno
 import importlib
 import io
@@ -43,8 +44,9 @@ from devdocs.errors import (
     StorageError,
 )
 from devdocs.generate import Estimate, ExportSummary, PricedItem, RunSummary
+from devdocs.index import ledger
 from devdocs.index.db import Database
-from devdocs.llm import Completion, Request
+from devdocs.llm import Completion, Request, catalog
 from devdocs.llm.client import LLMClient
 from devdocs.render import WriteReport
 from devdocs.render.markdown import MarkdownRenderer
@@ -907,6 +909,26 @@ class TestEstimate(CliCase):
         self.assertNotIn("to fit", out)
         self.assertEqual((data["demoted"], data["demoted_by"]), ([], []))
 
+    def test_the_free_tier_line_goes_by_the_models_the_plan_uses(self) -> None:
+        # Regression: every call was divided by the file tier's 1000 a day, so
+        # high quality, all on the 100 a day of gemini-2.5-pro, seemed to fit one.
+        for number in range(200):
+            path = self.root / "pkg" / f"part{number}.py"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(f"def part{number}():\n    return {number}\n", "utf-8")
+        out, data = self.priced("--quality", "high", "--max-cost", "0")
+        self.assertEqual({i["model"] for i in data["items"]}, {"gemini-2.5-pro"})
+        days = -(-data["requests"] // 100)
+        self.assertGreater(days, 1)
+        self.assertIn(f"free tier: up to {days} days of daily quota, fewer if other "
+                      "models can take over; runs resume where they stop\n", out)
+        for argv in (["--quality", "cheap"],              # fits flash-lite's 1000 a day
+                     ["--quality", "high", "--paid"],     # no such limit
+                     ["--quality", "high", "--provider", "anthropic"]):   # no free tier
+            with self.subTest(argv=argv):
+                out, _ = self.priced(*argv, "--max-cost", "0")
+                self.assertNotIn("free tier", out)
+
     def test_semantic_estimate_quotes_the_embeddings_first(self) -> None:
         code, out, _ = self.run_cli("estimate", str(self.root), "--context",
                                     "semantic", "--json")
@@ -1056,6 +1078,113 @@ class TestEstimateAndGenerateAgree(CliCase):
                 self.assertEqual(self.bought("--max-requests", "1"), [call])
         overview = self.root / "docs" / "architecture.md"
         self.assertIn("A small shop", overview.read_text("utf-8"))
+
+
+class TestFreeDays(unittest.TestCase):
+    """Days of free-tier quota, by the daily limit of each model a plan uses."""
+
+    @staticmethod
+    def days(*items: tuple[str, int]) -> int:
+        return cli._free_days(Estimate(items=[
+            PricedItem("file", str(number), model, 1, 1, 0.1, False, requests=requests)
+            for number, (model, requests) in enumerate(items)
+        ]))
+
+    def test_a_model_takes_the_days_its_limit_says(self) -> None:
+        for requests, days in ((1, 1), (100, 1), (101, 2), (200, 2), (201, 3)):
+            with self.subTest(requests=requests):
+                self.assertEqual(self.days(("gemini-2.5-pro", requests)), days)
+
+    def test_each_tier_has_its_own_limit(self) -> None:
+        self.assertEqual(self.days(("gemini-2.5-flash-lite", 1000)), 1)
+        self.assertEqual(self.days(("gemini-2.5-flash", 1000)), 4)
+        self.assertEqual(self.days(("gemini-embedding-001", 1001)), 2)
+
+    def test_calls_to_one_model_share_its_limit(self) -> None:
+        one_model = ("gemini-2.5-flash", 200), ("gemini-2.5-flash", 100)
+        self.assertEqual(self.days(*one_model), 2)
+
+    def test_a_tier_starts_on_the_day_the_one_before_ends(self) -> None:
+        # flash-lite takes days 1 to 3, flash days 3 to 5, pro the fifth
+        self.assertEqual(self.days(("gemini-2.5-flash-lite", 2500),
+                                   ("gemini-2.5-flash", 600),
+                                   ("gemini-2.5-pro", 1)), 5)
+        # all in a day each: the same day
+        self.assertEqual(self.days(("gemini-2.5-flash-lite", 1000),
+                                   ("gemini-2.5-flash", 250),
+                                   ("gemini-2.5-pro", 100)), 1)
+
+    def test_a_snapshot_has_the_limit_of_its_model(self) -> None:
+        self.assertEqual(self.days(("gemini-2.5-pro-preview-09-2025", 101)), 2)
+
+    def test_a_model_without_a_free_limit_gives_no_figure(self) -> None:
+        for model in ("claude-haiku-5-5", "gemini-3.1-pro-preview", "gemini-unknown"):
+            with self.subTest(model):
+                self.assertEqual(self.days((model, 5000)), 0)
+                self.assertEqual(self.days(("gemini-2.5-flash", 5000), (model, 1)), 0)
+
+    def test_what_the_cache_holds_takes_no_quota(self) -> None:
+        cached = PricedItem("file", "a.py", "gemini-2.5-pro", 0, 0, 0.0, True,
+                            requests=500)
+        self.assertEqual(cli._free_days(Estimate(items=[cached])), 1)
+
+
+class TestFreeDaysAgainstARun(CliCase):
+    """What `estimate` says of free days, against scripted runs of 25 files on a
+    hundredth of the catalog's limits, 10 a day on the file tier's models, the
+    quota day turned by hand. The figure is the most a run can take, so the
+    line says "up to"."""
+
+    LINE = ("free tier: up to 3 days of daily quota, fewer if other models can take "
+            "over; runs resume where they stop\n")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.day = 1
+        small = tuple(dataclasses.replace(info, free_rpm=100_000,
+                                          free_rpd=info.free_rpd // 100)
+                      if info.free_rpd else info for info in catalog.CATALOG)
+        self.enterContext(mock.patch.object(catalog, "CATALOG", small))
+        self.enterContext(mock.patch.object(
+            ledger, "quota_day", lambda now=None: f"2026-01-{self.day:02}"))
+        self.project = self.enterContext(tempfile.TemporaryDirectory())
+        for number in range(25):
+            Path(self.project, f"part{number}.py").write_text(
+                f"def part{number}():\n    return {number}\n", "utf-8")
+
+    def estimated(self, *flags: str) -> str:
+        code, out, err = self.run_cli("estimate", self.project, "--max-cost", "0",
+                                      "--quiet", *flags)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def days_to_finish(self, model: TaggedModel, *flags: str) -> int:
+        """The quota days a run takes, stopping on its quota and resumed each day."""
+        for self.day in range(1, 10):
+            code, _, err = self.run_cli("generate", self.project, "--api-key", "k",
+                                        "--max-cost", "0", "--quiet", *flags,
+                                        model=model)
+            if code == 0:
+                return self.day
+            self.assertEqual(code, 10, err)
+        self.fail("the run never finished")
+
+    def test_a_pinned_model_takes_all_the_days_it_says(self) -> None:
+        flags = ("--model", "gemini-2.5-flash-lite")
+        self.assertIn(self.LINE, self.estimated(*flags))
+        self.assertEqual(self.days_to_finish(TaggedModel(), *flags), 3)
+
+    def test_one_model_to_a_tier_takes_no_more(self) -> None:
+        self.assertIn(self.LINE, self.estimated())
+        self.assertEqual(self.days_to_finish(TaggedModel()), 3)
+
+    def test_a_key_that_reaches_every_model_takes_fewer(self) -> None:
+        class Everything(TaggedModel):
+            def list_models(self) -> list[str]:
+                return [m.id for m in catalog.CATALOG if m.provider == "gemini"]
+
+        self.assertIn(self.LINE, self.estimated())
+        self.assertEqual(self.days_to_finish(Everything()), 1)
 
 
 class TestInitAndCache(CliCase):
