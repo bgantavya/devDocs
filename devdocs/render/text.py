@@ -18,10 +18,22 @@ import unicodedata
 from collections.abc import Iterator
 from urllib.parse import quote
 
-__all__ = ["code_spans", "code_text", "folded", "relpath", "url_path"]
+__all__ = [
+    "code_spans",
+    "code_text",
+    "counted",
+    "folded",
+    "relpath",
+    "url_path",
+]
 
 _TICKS = re.compile(r"`+")
 _URL_SAFE = frozenset(string.ascii_letters + string.digits + "-._~/")
+
+
+def counted(number: int, noun: str) -> str:
+    """`number` of `noun`, as a reader says it: `1 file`, `1,204 lines`."""
+    return f"{number:,} {noun}{'' if number == 1 else 's'}"
 
 
 def code_spans(text: str) -> Iterator[tuple[bool, str]]:

@@ -71,6 +71,19 @@ class TestSyntax(unittest.TestCase):
         self.assertTrue(report.ok)
 
 
+class TestCertificates(unittest.TestCase):
+    def test_the_count_reads_as_a_person_says_it(self) -> None:
+        # Regression: "1 CA certificates", and "1204 CA certificates".
+        for count, value in ((0, "0 CA certificates"), (1, "1 CA certificate"),
+                             (1204, "1,204 CA certificates")):
+            context = mock.Mock(get_ca_certs=mock.Mock(return_value=[{}] * count))
+            with self.subTest(count=count), \
+                    mock.patch("ssl.create_default_context", return_value=context):
+                certificates = probe_all().get("certificates")
+                assert certificates is not None
+                self.assertEqual(certificates.value, value)
+
+
 class TestRendering(unittest.TestCase):
     def test_failure_is_marked(self) -> None:
         line = str(Capability("thing", False, "1.0", "why it matters"))

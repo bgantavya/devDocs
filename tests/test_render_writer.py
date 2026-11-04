@@ -516,6 +516,17 @@ class TestConflicts(WriterCase):
         self.assertTrue(caught.exception.message.endswith(
             ": p0.md, p1.md, p2.md, p3.md, p4.md and 3 more"))
 
+    def test_a_large_count_reads_as_a_person_says_it(self) -> None:
+        names = [f"p{n:04}.md" for n in range(1204)]
+        for name in names:
+            self.plant(name)
+        with self.assertRaises(ConfigError) as caught:
+            self.write(dict.fromkeys(names, b"page\n"))
+        self.assertEqual(caught.exception.message, (
+            f"refusing to replace 1,204 files in {self.out} that devdocs has no record "
+            "of writing: p0000.md, p0001.md, p0002.md, p0003.md, p0004.md "
+            "and 1,199 more"))
+
 
 class TestFailures(WriterCase):
     """A write the file system fails is a ConfigError that names the file

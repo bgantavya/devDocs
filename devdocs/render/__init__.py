@@ -78,6 +78,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from devdocs.errors import ConfigError
 from devdocs.render.model import SCHEMA_VERSION, DocSet
+from devdocs.render.text import counted
 
 __all__ = [
     "FORMATS",
@@ -541,7 +542,7 @@ def _identities(out: Path, paths: Iterable[str]) -> set[tuple[int, int]]:
 
 
 def _count(number: int) -> str:
-    return f"{number} file{'' if number == 1 else 's'}"
+    return counted(number, "file")
 
 
 def _them(paths: list[str]) -> str:
@@ -552,7 +553,7 @@ def _names(paths: list[str]) -> str:
     """The first few `paths`, and how many more there are."""
     shown = ", ".join(paths[:_NAMED])
     more = len(paths) - _NAMED
-    return f"{shown} and {more} more" if more > 0 else shown
+    return f"{shown} and {more:,} more" if more > 0 else shown
 
 
 def _holds(target: Path, data: bytes) -> bool:

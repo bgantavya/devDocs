@@ -317,7 +317,7 @@ class Planner:
         )
         for index, item in enumerate(ranked):
             if index < cut:
-                mode, reason = Mode.PROSE, f"ranked {index + 1} of {total}"
+                mode, reason = Mode.PROSE, f"ranked {index + 1:,} of {total:,}"
             else:
                 mode, reason = Mode.STUB, "below coverage cut"
             if item.relpath in included:
@@ -368,7 +368,7 @@ class Planner:
                 reason = "single file" if count == 1 else f"fewer than {minimum} files"
                 result.append(replace(module, reason=reason))
             elif index < cut:
-                reason = f"ranked {index + 1} of {len(rank)}"
+                reason = f"ranked {index + 1:,} of {len(rank):,}"
                 result.append(replace(module, mode=Mode.PROSE, reason=reason))
             else:
                 result.append(replace(module, reason="below module cut"))

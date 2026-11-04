@@ -98,6 +98,7 @@ from devdocs.render import (
 )
 from devdocs.render.model import DocSet, Layout, Mode, RunInfo
 from devdocs.render.style import Reply, StyleGuard, acceptable, parse_reply
+from devdocs.render.text import counted
 from devdocs.retrieve import Retriever
 from devdocs.scan import Scanner, ScanResult, SourceFile
 
@@ -320,13 +321,13 @@ def _again(summary: RunSummary, cut: int, answers: int, vectors: int) -> str:
     of. `vectors` is how many chunks the next run would embed."""
     failed = len(summary.failed)
     why = (f"stopped early ({summary.stopped})" if summary.stopped
-           else f"{failed} item{'' if failed == 1 else 's'} failed" if failed
-           else f"{cut} item{'' if cut == 1 else 's'} over budget" if cut
+           else f"{failed:,} item{'' if failed == 1 else 's'} failed" if failed
+           else f"{cut:,} item{'' if cut == 1 else 's'} over budget" if cut
            else "")
     if not why:
         held = "the answers are cached" if answers else "no answers were needed"
         if vectors:
-            chunks = f"{vectors} chunk{'' if vectors == 1 else 's'}"
+            chunks = f"{vectors:,} chunk{'' if vectors == 1 else 's'}"
             return f"{held}, so running again pays only to embed {chunks}"
         return f"{held}, so running again costs nothing"
     if not answers:
@@ -437,8 +438,9 @@ class Pipeline:
         )
         prepared.retriever = self._retriever(prepared)
         self.log(
-            f"scanned {len(scan.files)} files, {len(documentable)} documentable, "
-            f"{plan.calls()} model calls planned ({time.monotonic() - started:.1f}s)"
+            f"scanned {counted(len(scan.files), 'file')}, {len(documentable):,} "
+            f"documentable, {counted(plan.calls(), 'model call')} planned "
+            f"({time.monotonic() - started:.1f}s)"
         )
         return prepared
 
@@ -571,8 +573,8 @@ class Pipeline:
         over = " and ".join(self._embedding_over(quote.requests, quote.cost))
         if over:
             self.log(
-                f"semantic context skipped: embedding {quote.chunks} chunks "
-                f"could take {quote.requests} requests and "
+                f"semantic context skipped: embedding {counted(quote.chunks, 'chunk')} "
+                f"could take {counted(quote.requests, 'request')} and "
                 f"${quote.cost:.4f}, over half of {over}; raise that or use "
                 "--context standard"
             )
@@ -588,7 +590,7 @@ class Pipeline:
                       "without vectors get standard context, and the next run tries "
                       "again")
         else:
-            self.log(f"embedded {done} chunks (${spent:.4f})")
+            self.log(f"embedded {counted(done, 'chunk')} (${spent:.4f})")
         self._attach(prepared.retriever, embeddings)
         return failure
 
@@ -1207,7 +1209,8 @@ class Pipeline:
         """
         docset = read_manifest(self.out)
         run = docset.run
-        self.log(f"read {len(docset.documents)} documents from {self.out / MANIFEST}")
+        self.log(f"read {counted(len(docset.documents), 'document')} from "
+                 f"{self.out / MANIFEST}")
         written = OutputWriter(self.out).add(self._render(docset), force=force)
         if self.failures:
             raise self.failures[0][1]
@@ -1240,10 +1243,10 @@ class Pipeline:
         if not warnings:
             return []
         meaning, remedy = _WARNINGS.get(renderer.format, ("warnings", ""))
-        lines = [f"{renderer.format}: {meaning} ({len(warnings)}):"]
+        lines = [f"{renderer.format}: {meaning} ({len(warnings):,}):"]
         lines += [f"  {warning}" for warning in warnings[:_SHOWN_WARNINGS]]
         if len(warnings) > _SHOWN_WARNINGS:
-            lines.append(f"  and {len(warnings) - _SHOWN_WARNINGS} more")
+            lines.append(f"  and {len(warnings) - _SHOWN_WARNINGS:,} more")
         if remedy:
             lines.append(f"  {remedy}")
         self.log("\n".join(lines))

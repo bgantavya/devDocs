@@ -42,9 +42,11 @@ from devdocs.errors import (
     RateLimited,
     StorageError,
 )
+from devdocs.generate import Estimate, ExportSummary, PricedItem, RunSummary
 from devdocs.index.db import Database
 from devdocs.llm import Completion, Request
 from devdocs.llm.client import LLMClient
+from devdocs.render import WriteReport
 from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet
 from devdocs.render.pdf import external
@@ -493,6 +495,138 @@ class TestFatalErrors(CliCase):
         self.assertEqual(err, "devdocs: internal error: ValueError: oops\n")
 
 
+class OneModel(TaggedModel):
+    """A key that can reach one catalogued model, and one other."""
+
+    def list_models(self) -> list[str]:
+        return ["gemini-2.5-flash-lite", "some-other-model"]
+
+
+class TestCounts(CliCase):
+    """One of anything is singular. Regression: "1 documents", and the like."""
+
+    def lone_file(self) -> str:
+        """A project of one undocumented file, which gets prose."""
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        Path(root, "a.py").write_text("def f():\n    return 1\n", "utf-8")
+        return root
+
+    def test_the_summary_of_a_run(self) -> None:
+        summary = RunSummary(documents=1, prose=1, requests=1, cache_hits=1,
+                             input_tokens=1, output_tokens=1)
+        with mock.patch.object(generate_module.Pipeline, "run", return_value=summary):
+            code, out, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                          model=OneModel())
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 document (1 with prose, 0 from facts alone) in docs\n"
+                      "1 model call, 1 cache hit, 1 input / 1 output token, $0.0000\n",
+                      out)
+        self.assertIn("gemini: 2 models available to this key", err)
+
+    def test_the_summary_of_a_bigger_run(self) -> None:
+        # Regression: 1500 on one line, 1,500 on the next.
+        summary = RunSummary(documents=3000, prose=1500, stubs=1500, requests=2,
+                             cache_hits=2, input_tokens=1500, output_tokens=1500)
+        with mock.patch.object(generate_module.Pipeline, "run", return_value=summary):
+            _, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k")
+        self.assertIn("3,000 documents (1,500 with prose, 1,500 from facts alone) in "
+                      "docs\n2 model calls, 2 cache hits, "
+                      "1,500 input / 1,500 output tokens, ", out)
+
+    def test_a_bigger_estimate(self) -> None:
+        plan = mock.Mock(files=[None] * 3000)
+        plan.prose_files.return_value = [None] * 1500
+        cached = PricedItem("file", "a.py", "gemini-2.5-flash-lite", 0, 0, 0.0, True)
+        with mock.patch.object(generate_module.Pipeline, "prepare",
+                               return_value=mock.Mock(plan=plan)), \
+                mock.patch.object(generate_module.Pipeline, "estimate",
+                                  return_value=Estimate(items=[cached] * 1200)):
+            _, out, err = self.run_cli("estimate", str(self.root))
+        self.assertIn("3,000 files: 1,500 with prose, 1,500 from facts alone\n"
+                      "0 model calls (none), 1,200 already cached\n", out, err)
+
+    def test_a_bigger_export(self) -> None:
+        report = WriteReport(written=["a"] * 1500, unchanged=["b"] * 1500)
+        summary = ExportSummary(documents=3000, formats=["html"], written=report)
+        with mock.patch.object(generate_module.Pipeline, "export",
+                               return_value=summary):
+            _, out, err = self.run_cli("export", str(self.root))
+        self.assertIn("3,000 documents as html in docs: 1,500 files written, "
+                      "1,500 unchanged\n", out, err)
+
+    def test_a_limit_is_named_as_it_is_typed(self) -> None:
+        # A flag's value: --max-requests 1,500 would be refused.
+        kept = PricedItem("file", "a.py", "gemini-2.5-flash-lite", 1, 1, 0.1, False,
+                          requests=1500)
+        over = Estimate(items=[kept], demoted={("file", "b.py"): "max_requests"})
+        plan = mock.Mock(files=[None] * 2)
+        plan.prose_files.return_value = [None]
+        with mock.patch.object(generate_module.Pipeline, "prepare",
+                               return_value=mock.Mock(plan=plan)), \
+                mock.patch.object(generate_module.Pipeline, "estimate",
+                                  return_value=over):
+            _, out, err = self.run_cli("estimate", str(self.root), "--max-cost", "0",
+                                       "--max-requests", "1500")
+        self.assertIn("1 item left as a stub to fit --max-requests 1500\n", out, err)
+
+    def test_a_key_that_reaches_one_model(self) -> None:
+        class Lone(TaggedModel):
+            def list_models(self) -> list[str]:
+                return ["gemini-2.5-flash-lite"]
+
+        _, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                 model=Lone())
+        self.assertIn("gemini: 1 model available to this key", err)
+        _, out, _ = self.run_cli("doctor", str(self.root), "--api-key", "k",
+                                 model=Lone())
+        self.assertIn("ok provider             1 model; catalogued: "
+                      "gemini-2.5-flash-lite", out)
+
+    def test_an_estimate(self) -> None:
+        _, out, _ = self.run_cli("estimate", self.lone_file())
+        self.assertIn("1 file: 1 with prose, 0 from facts alone\n"
+                      "1 model call (1 file), 0 already cached\n", out)
+        _, out, _ = self.run_cli("estimate", str(self.root), "--max-cost", "0",
+                                 "--max-requests", "4")
+        self.assertIn("1 item left as a stub to fit", out)
+        self.assertIn("4 files: 3 with prose, 1 from facts alone\n"
+                      "4 model calls (3 files, 1 module), 0 already cached\n", out)
+        _, out, _ = self.run_cli("estimate", str(self.root), "--max-cost", "0",
+                                 "--max-requests", "3")
+        self.assertIn("2 items left as stubs to fit", out)
+
+    def test_an_estimate_of_one_output_token(self) -> None:
+        priced = Estimate(items=[PricedItem("file", "a.py", "gemini-2.5-flash-lite",
+                                            1, 1, 0.1, False)])
+        with mock.patch.object(generate_module.Pipeline, "estimate",
+                               return_value=priced):
+            _, out, _ = self.run_cli("estimate", str(self.root))
+        self.assertIn("at most 1 input / 1 output token, at most $0.1000\n", out)
+
+    def test_the_cache(self) -> None:
+        root = self.lone_file()
+        self.run_cli("generate", root, "--api-key", "k", "--quiet")
+        _, out, _ = self.run_cli("cache", "stats", root)
+        self.assertIn("1 cached response, bought for $", out)
+        _, out, _ = self.run_cli("cache", "clear", root)
+        self.assertEqual(out, "removed 1 cached response\n")
+        _, out, _ = self.run_cli("cache", "clear", root)
+        self.assertEqual(out, "removed 0 cached responses\n")
+
+    def test_the_models(self) -> None:
+        _, out, _ = self.run_cli("models", "--api-key", "k", model=OneModel())
+        self.assertIn("(+1 other model; pin one with --model)", out)
+        _, out, _ = self.run_cli("models", "--api-key", "k")
+        self.assertIn("(+0 other models; pin one with --model)", out)
+
+    def test_one_rendering_warning(self) -> None:
+        self.assertEqual(cli._warnings(["odd"]),
+                         ["1 rendering warning; --json lists it"])
+        self.assertEqual(cli._warnings(["odd", "odder"]),
+                         ["2 rendering warnings; --json lists them all"])
+        self.assertEqual(cli._warnings([]), [])
+
+
 class TestHelp(unittest.TestCase):
     """What `--help` says, and that it says something for every option."""
 
@@ -759,7 +893,7 @@ class TestEstimate(CliCase):
         # All it cut is the module, before the fourth file spent the requests.
         limit = f"{sum(files) + 0.00001:.8f}"
         line, named = self.cut("--max-cost", limit, "--max-requests", "4")
-        self.assertEqual(line, "1 items left as stubs to fit "
+        self.assertEqual(line, "1 item left as a stub to fit "
                                f"--max-cost ${float(limit):g}")
         self.assertEqual(named, ["max_cost"])
         # Past the last file kept, too, the cost made the cut: requests are left.
@@ -867,8 +1001,7 @@ class TestLimitsCountCalls(CliCase):
         self.assertEqual(code, 0, err)   # as any run that its plan fits ends
         self.assertEqual([request.tag for request in self.model.calls],
                          ["architecture"])
-        self.assertIn("\n1 model call", out)
-        self.assertIn(", 4 cache hits, ", out)
+        self.assertIn("\n1 model call, 4 cache hits, ", out)
         self.assertNotIn("stopped early", out)
         for relpath in self.CACHED:
             page = self.root / "docs" / f"{relpath}.md"
