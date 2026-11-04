@@ -10,6 +10,8 @@ because "no CA certificates" must be reported, not crash the run.
 
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
 import ssl
 import sys
@@ -137,10 +139,26 @@ def _tls() -> Capability:
     )
 
 
+def _hashed(directory: str | None) -> int:
+    """How many certificates an OpenSSL hashed directory holds, by their names:
+    `5ad8a5d6.0`, where a revocation list is `.r0`."""
+    try:
+        names = os.listdir(directory) if directory else []
+    except OSError:
+        return 0
+    return sum(1 for name in names if re.fullmatch(r"[0-9a-f]{8}\.[0-9]+", name))
+
+
 def _certificates() -> Capability:
-    """An empty trust store means every HTTPS call fails with a confusing error."""
+    """An empty trust store means every HTTPS call fails with a confusing error.
+
+    OpenSSL reads a directory of certificates, as Debian and Ubuntu keep them,
+    only as a connection needs one, so `get_ca_certs` lists none from there;
+    those are counted by name.
+    """
     context = ssl.create_default_context()
-    count = len(context.get_ca_certs())
+    paths = ssl.get_default_verify_paths()
+    count = len(context.get_ca_certs()) or _hashed(paths.capath)
     return Capability(
         "certificates",
         count > 0,

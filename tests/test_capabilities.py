@@ -78,10 +78,31 @@ class TestCertificates(unittest.TestCase):
                              (1204, "1,204 CA certificates")):
             context = mock.Mock(get_ca_certs=mock.Mock(return_value=[{}] * count))
             with self.subTest(count=count), \
-                    mock.patch("ssl.create_default_context", return_value=context):
+                    mock.patch("ssl.create_default_context", return_value=context), \
+                    mock.patch("ssl.get_default_verify_paths",
+                               return_value=mock.Mock(capath=None)):
                 certificates = probe_all().get("certificates")
                 assert certificates is not None
                 self.assertEqual(certificates.value, value)
+
+    def test_a_directory_of_certificates_counts(self) -> None:
+        # Regression: OpenSSL reads such a directory only on use, so with no CA
+        # file, as uv's Python has on Ubuntu, doctor saw none and exited 1.
+        names = ["5ad8a5d6.0", "5ad8a5d6.1", "ab12cd34.0", "ab12cd34.r0", "ca.pem"]
+        certs = "/etc/ssl/certs"
+        context = mock.Mock(get_ca_certs=mock.Mock(return_value=[]))
+        for capath, listed, value in ((certs, names, "3 CA certificates"),
+                                      (certs, OSError(), "0 CA certificates"),
+                                      (None, names, "0 CA certificates")):
+            paths = mock.Mock(capath=capath)
+            with self.subTest(capath=capath, listed=listed), \
+                    mock.patch("ssl.create_default_context", return_value=context), \
+                    mock.patch("ssl.get_default_verify_paths", return_value=paths), \
+                    mock.patch("os.listdir", side_effect=[listed]):
+                certificates = probe_all().get("certificates")
+                assert certificates is not None
+                self.assertEqual((certificates.ok, certificates.value),
+                                 (value != "0 CA certificates", value))
 
 
 class TestRendering(unittest.TestCase):
