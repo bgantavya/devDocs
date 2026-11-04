@@ -726,9 +726,12 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
         lines.append(f"!! config               {err}")
         out.result("\n".join(lines), {**data, "config": str(err)})
         return 2
+    max_cost = f"${config.max_cost:g}" if config.max_cost else "no limit"
+    max_requests = config.max_requests or "no limit"
     lines.append(f"ok config               provider={config.provider} "
                  f"quality={config.quality} context={config.context} "
-                 f"max_cost=${config.max_cost:g} formats={','.join(config.formats)}")
+                 f"max_cost={max_cost} max_requests={max_requests} "
+                 f"formats={','.join(config.formats)}")
     data["formats"] = list(config.formats)
     data["pdf_engine"] = {"configured": config.pdf_engine,
                           "path": engines.get(config.pdf_engine)}

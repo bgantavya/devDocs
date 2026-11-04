@@ -1478,6 +1478,23 @@ class TestDoctorAndModels(CliCase):
                                           model=model, env=env)
         return code, json.loads(out), err
 
+    def test_no_limit_is_said_so(self) -> None:
+        # Regression: "max_cost=$0", and no word on max_requests.
+        toml = self.root / "devdocs.toml"
+        for text, shown in (
+            ("", "max_cost=$0.5 max_requests=no limit "),
+            ("max_cost = 0\n", "max_cost=no limit max_requests=no limit "),
+            ("max_cost = 2.5\nmax_requests = 40\n", "max_cost=$2.5 max_requests=40 "),
+            ("max_cost = 0\nmax_requests = 7\n", "max_cost=no limit max_requests=7 "),
+        ):
+            with self.subTest(text):
+                toml.write_text(text, "utf-8")
+                _, out = self.doctor()
+                self.assertIn(shown, out)
+                self.assertNotIn("$0 ", out)
+        _, out = self.doctor(env={"DEVDOCS_MAX_COST": "0"})
+        self.assertIn("max_cost=no limit ", out)
+
     def test_the_json_says_where_the_key_came_from_and_never_shows_it(self) -> None:
         # Regression: --json said nothing of the key.
         key = "AIza-SECRET-0123"
