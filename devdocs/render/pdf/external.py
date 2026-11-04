@@ -76,7 +76,8 @@ def find(engine: str) -> str | None:
         if path:
             return path
     for candidate in _browser_locations():
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        # not Path.is_file: before 3.14 it raises for a folder it cannot search
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
 

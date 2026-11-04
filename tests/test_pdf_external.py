@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -60,7 +63,7 @@ class TestExternal(unittest.TestCase):
         with (
             self.which({}),
             mock.patch(f"{EXTERNAL}.sys.platform", "darwin"),
-            mock.patch.object(Path, "is_file", lambda path: path == app),
+            mock.patch(f"{EXTERNAL}.os.path.isfile", lambda path: Path(path) == app),
             mock.patch(f"{EXTERNAL}.os.access", return_value=True),
         ):
             self.assertEqual(Path(external.find("chrome") or ""), app)
@@ -69,10 +72,23 @@ class TestExternal(unittest.TestCase):
             self.which({}),
             mock.patch(f"{EXTERNAL}.sys.platform", "win32"),
             mock.patch.dict("os.environ", {"LOCALAPPDATA": "C:/Users/me"}),
-            mock.patch.object(Path, "is_file", lambda path: path == exe),
+            mock.patch(f"{EXTERNAL}.os.path.isfile", lambda path: Path(path) == exe),
             mock.patch(f"{EXTERNAL}.os.access", return_value=True),
         ):
             self.assertEqual(Path(external.find("chrome") or ""), exe)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_browser_in_a_folder_it_cannot_search_is_absent(self) -> None:
+        # Regression: before 3.14 Path.is_file raised, and doctor and a chrome
+        # run ended in an internal error.
+        locked = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, locked)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        with self.which({}), mock.patch.object(external, "_browser_locations",
+                                                return_value=[locked / "chrome"]):
+            self.assertIsNone(external.find("chrome"))
+            self.assertEqual(external.available_engines(), {"builtin": sys.executable})
 
     def test_available_engines(self) -> None:
         with (
