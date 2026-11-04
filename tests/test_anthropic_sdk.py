@@ -241,8 +241,9 @@ class TestConstruction(SDKCase):
         original = anthropic_sdk.sdk_available
         anthropic_sdk.sdk_available = lambda: False
         self.addCleanup(setattr, anthropic_sdk, "sdk_available", original)
-        with self.assertRaises(ConfigError):
+        with self.assertRaises(ConfigError) as caught:
             anthropic_sdk.AnthropicSDKProvider("key")
+        self.assertEqual(caught.exception.hint, anthropic_sdk.SDK_HINT)   # doctor's too
 
     def test_failing_sdk_client_is_a_config_error(self) -> None:
         self.recorder["construct_raises"] = AnthropicError("api_key must be set")
