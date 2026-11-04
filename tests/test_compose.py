@@ -362,6 +362,54 @@ class TestModuleAndArchitecture(unittest.TestCase):
         self.assertEqual(doc.meta.mode, Mode.STUB)
 
 
+class TestCounts(unittest.TestCase):
+    """A count reads as a person would say it. Regression: "1 files", "1 lines"
+    and "1 documented source files"."""
+
+    def test_a_files_lines(self) -> None:
+        for loc, text in ((1, "1 line"), (2, "2 lines"), (1204, "1,204 lines")):
+            with self.subTest(loc=loc):
+                c = composer()
+                facts = FileFacts(Path("app/store.py"), "python", loc=loc)
+                c.facts = {**c.facts, "app/store.py": facts}
+                section = c.file(plan("app/store.py", Mode.STUB), None).section("facts")
+                assert section is not None
+                self.assertIn(text, [item.text for item in section.items])
+
+    def test_a_modules_files(self) -> None:
+        for files, text in ((("app/store.py",), "1 file"),
+                            (("app/client.py", "app/store.py"), "2 files")):
+            with self.subTest(text=text):
+                doc = composer().module(ModulePlan("app", files, 1.0, Mode.STUB, "t"),
+                                        None, {})
+                section = doc.section("facts")
+                assert section is not None
+                self.assertIn(text, [item.text for item in section.items])
+
+    def test_the_overviews_files_and_directories(self) -> None:
+        def overview(modules: tuple[str, ...], languages: dict[str, int]) -> str:
+            c = Composer(project="p", files={}, facts={}, graph=ProjectGraph(),
+                         hashes={}, modules=modules)
+            section = c.architecture(None, {}, languages).section("overview")
+            assert section is not None
+            return section.text[0]
+
+        self.assertEqual(overview(("",), {"python": 1}),
+                         "p has 1 documented source file in 1 directory: Python (1).")
+        self.assertEqual(overview(("a", "b"), {"go": 1, "python": 1}),
+                         "p has 2 documented source files in 2 directories: "
+                         "Go (1), Python (1).")
+        # Regression: no count in the sentence had its comma.
+        self.assertEqual(overview(tuple(f"m{n}" for n in range(1200)),
+                                  {"go": 4, "python": 1200}),
+                         "p has 1,204 documented source files in 1,200 directories: "
+                         "Python (1,200), Go (4).")
+
+    def test_the_links_left_out(self) -> None:
+        links = composer()._links([f"f{n}.py" for n in range(1212)])
+        self.assertEqual(links[-1].text, "1,204 more")
+
+
 class TestHelpers(unittest.TestCase):
     def test_first_sentence(self) -> None:
         self.assertEqual(first_sentence("Parses x. Then y."), "Parses x.")

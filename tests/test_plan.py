@@ -772,7 +772,7 @@ class TestCoverageCut(unittest.TestCase):
     def test_large_project(self) -> None:
         files = uniform(20_000).plan().files
         self.assertEqual(sum(p.mode is Mode.PROSE for p in files), 4_000)
-        self.assertEqual(files[3_999].reason, "ranked 4000 of 20000")
+        self.assertEqual(files[3_999].reason, "ranked 4,000 of 20,000")
         self.assertEqual(files[4_000].reason, "below coverage cut")
 
 
@@ -869,6 +869,10 @@ class TestModules(unittest.TestCase):
                 ("d09", Mode.STUB, "below module cut"),
             ],
         )
+
+    def test_a_large_rank_is_grouped(self) -> None:
+        modules = directories(4_000).plan().modules
+        self.assertEqual(modules[999].reason, "ranked 1,000 of 4,000")
 
 
 class TestArchitecture(unittest.TestCase):

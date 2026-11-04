@@ -211,7 +211,7 @@ def shop() -> DocSet:
         sections=(
             Section("purpose", "Purpose", text=("Project root.",)),
             Section("facts", "Facts", items=(
-                Item("1 files"),
+                Item("1 file"),
                 Item("Submodules", (Link("src/shop", "module:src/shop"),)),
             )),
         ),
@@ -460,7 +460,7 @@ schema: "1.0.0"
 
 Project root.
 
-1 files · **Submodules:** [src/shop](src/shop/index.md)
+1 file · **Submodules:** [src/shop](src/shop/index.md)
 """)
 
 ARCHITECTURE = md("""

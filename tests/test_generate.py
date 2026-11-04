@@ -51,7 +51,7 @@ from devdocs.llm.catalog import find
 from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.http import HttpResponse, RetryPolicy
 from devdocs.llm.providers import GeminiProvider
-from devdocs.render import Renderer
+from devdocs.render import MANIFEST, Renderer, read_manifest
 from devdocs.render.markdown import MarkdownRenderer
 from devdocs.render.model import DocSet
 from devdocs.render.pdf import PdfRenderer, external
@@ -1648,6 +1648,54 @@ class TestSemanticContext(PipelineCase):
         reached = [m for m in messages if m.startswith("semantic context: reached")]
         self.assertEqual(len(reached), 1)
         self.assertGreater(summary.prose, 0)
+
+
+class TestCountsAtOne(PipelineCase):
+    """Progress lines say one of a thing in the singular."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for relpath in PROJECT:
+            (self.tmp / relpath).unlink()
+        (self.tmp / "one.py").write_text("def f() -> None:\n    return None\n",
+                                         "utf-8")   # one chunk
+        self.model = EmbeddingModel()
+
+    def test_one_of_each(self) -> None:
+        # Regression: 'scanned 1 files', '1 model calls', '1 chunks', '1 requests'
+        # and '1 documents'.
+        messages: list[str] = []
+        pipeline = self.pipeline(context="semantic", max_requests=1,
+                                 log=messages.append)
+        pipeline.run(pipeline.prepare())
+        self.assertTrue(messages[0].startswith(
+            "scanned 1 file, 1 documentable, 1 model call planned ("), messages)
+        self.assertIn("semantic context skipped: embedding 1 chunk could take 1 "
+                      "request and ", "\n".join(messages))
+        messages.clear()
+        pipeline = self.pipeline(context="semantic", log=messages.append)
+        pipeline.run(pipeline.prepare())
+        self.assertIn("embedded 1 chunk ($", "\n".join(messages))
+
+        whole = read_manifest(pipeline.out)
+        one = DocSet(project=whole.project)
+        one.add(whole.documents[0])
+        pipeline.write(one)
+        messages.clear()
+        pipeline.export()
+        self.assertEqual(messages, [f"read 1 document from {pipeline.out / MANIFEST}"])
+
+
+class TestCountsInThousands(PipelineCase):
+    """Progress lines group a count by thousands, as the summaries do."""
+
+    def test_the_render_warnings(self) -> None:
+        messages: list[str] = []
+        pipeline = self.pipeline(log=messages.append, renderers=[Noisy(1204)])
+        pipeline.run(pipeline.prepare())
+        (message,) = [m for m in messages if m.startswith("pdf:")]
+        self.assertIn(" (1,204):\n", message)
+        self.assertIn("\n  and 1,194 more\n", message)
 
 
 def failing(error: BaseException) -> Callable[[], None]:

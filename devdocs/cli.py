@@ -526,6 +526,11 @@ def _client(
 # -- commands --------------------------------------------------------------------
 
 
+def _count(number: int, noun: str) -> str:
+    """`number` of `noun`, in the plural unless it is one."""
+    return f"{number:,} {noun}{'' if number == 1 else 's'}"
+
+
 def _generate(
     args: argparse.Namespace, out: _Output, interrupts: _Interrupts
 ) -> int:
@@ -538,7 +543,8 @@ def _generate(
         pipeline = Pipeline(config, client=client, db=db, log=out.info, warn=out.warn,
                             project=config.name, description=config.description)
         available = client.discover()
-        out.info(f"{config.provider}: {len(available)} models available to this key")
+        out.info(f"{config.provider}: {_count(len(available), 'model')} "
+                 "available to this key")
         prepared = pipeline.prepare()
         pipeline.check(prepared, force=args.force)   # buys nothing: a stop is at once
         with interrupts.paying():
@@ -546,11 +552,11 @@ def _generate(
                                    force=args.force, checked=True)
 
     lines = [
-        f"{summary.documents} documents ({summary.prose} with prose, "
-        f"{summary.stubs} from facts alone) in {config.out}",
-        f"{summary.requests} model calls, {summary.cache_hits} cache hits, "
-        f"{summary.input_tokens:,} input / {summary.output_tokens:,} output tokens, "
-        f"${summary.cost:.4f}",
+        f"{_count(summary.documents, 'document')} ({summary.prose:,} with prose, "
+        f"{summary.stubs:,} from facts alone) in {config.out}",
+        f"{_count(summary.requests, 'model call')}, "
+        f"{_count(summary.cache_hits, 'cache hit')}, {summary.input_tokens:,} input / "
+        f"{_count(summary.output_tokens, 'output token')}, ${summary.cost:.4f}",
     ]
     if summary.resumed:
         lines.append(f"resumed run {summary.run_id}")
@@ -573,15 +579,12 @@ def _generate(
     return 4 if summary.failed else 0
 
 
-def _count(number: int, noun: str) -> str:
-    return f"{number} {noun}{'' if number == 1 else 's'}"
-
-
 def _warnings(warnings: Sequence[str]) -> list[str]:
     """A result line counting rendering warnings, which the log details."""
     if not warnings:
         return []
-    return [f"{_count(len(warnings), 'rendering warning')}; --json lists them all"]
+    them = "it" if len(warnings) == 1 else "them all"
+    return [f"{_count(len(warnings), 'rendering warning')}; --json lists {them}"]
 
 
 def _export(args: argparse.Namespace, out: _Output) -> int:
@@ -595,7 +598,7 @@ def _export(args: argparse.Namespace, out: _Output) -> int:
         f"{_count(summary.documents, 'document')}{run} as "
         f"{', '.join(summary.formats)} in {config.out}: "
         f"{_count(len(report.written), 'file')} written, "
-        f"{len(report.unchanged)} unchanged",
+        f"{len(report.unchanged):,} unchanged",
     ]
     if len(report.written) <= _LISTED:
         lines += [f"  {Path(config.out, path).as_posix()}" for path in report.written]
@@ -621,23 +624,25 @@ def _estimate(args: argparse.Namespace, out: _Output) -> int:
         if not item.cached:
             by_kind[item.kind] = by_kind.get(item.kind, 0) + item.requests
     lines = [
-        f"{len(plan.files)} files: {len(plan.prose_files())} with prose, "
-        f"{len(plan.files) - len(plan.prose_files())} from facts alone",
-        f"{estimate.requests} model calls "
-        f"({', '.join(f'{n} {k}' for k, n in sorted(by_kind.items())) or 'none'}), "
-        f"{estimate.cached} already cached",
-        f"at most {estimate.input_tokens:,} input / {estimate.output_tokens:,} output "
-        f"tokens, at most ${estimate.cost:.4f}",
+        f"{_count(len(plan.files), 'file')}: {len(plan.prose_files()):,} with prose, "
+        f"{len(plan.files) - len(plan.prose_files()):,} from facts alone",
+        f"{_count(estimate.requests, 'model call')} "
+        f"({', '.join(_count(n, k) for k, n in sorted(by_kind.items())) or 'none'}), "
+        f"{estimate.cached:,} already cached",
+        f"at most {estimate.input_tokens:,} input / "
+        f"{_count(estimate.output_tokens, 'output token')}, "
+        f"at most ${estimate.cost:.4f}",
     ]
     if config.free_tier and estimate.requests:
         days = _free_days(config, estimate.requests)
         if days > 1:
-            lines.append(f"free tier: about {days} days of daily quota; "
+            lines.append(f"free tier: about {days:,} days of daily quota; "
                          "runs resume where they stop")
     if estimate.demoted:
+        stubs = "a stub" if len(estimate.demoted) == 1 else "stubs"
         flags = {"max_cost": f"--max-cost ${config.max_cost:g}",
                  "max_requests": f"--max-requests {config.max_requests}"}
-        lines.append(f"{len(estimate.demoted)} items left as stubs to fit "
+        lines.append(f"{_count(len(estimate.demoted), 'item')} left as {stubs} to fit "
                      + " and ".join(flags[name] for name in estimate.demoted_by))
     if args.explain:
         lines.append("")
@@ -741,7 +746,7 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
         blocking = True
     age = (date.today() - date.fromisoformat(PRICES_CHECKED)).days
     if age > 180:
-        lines.append(f"!! prices               checked {PRICES_CHECKED}, {age} days "
+        lines.append(f"!! prices               checked {PRICES_CHECKED}, {age:,} days "
                      "ago; verify against the vendor's pricing page")
 
     sdk = _anthropic_sdk() if config.provider == "anthropic-sdk" else None
@@ -778,7 +783,7 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
             reachable = catalogued(available)
             known = [m.id for m in CATALOG
                      if m.provider == model.provider and m.id in reachable]
-            detail = (f"{len(available)} models; "
+            detail = (f"{_count(len(available), 'model')}; "
                       f"catalogued: {', '.join(known) or 'none'}")
             lines.append(f"ok provider             {detail}")
             data["models"] = sorted(available)
@@ -944,7 +949,7 @@ def _models(args: argparse.Namespace, out: _Output) -> int:
             f"{row['input_per_mtok']:>9.2f} {row['output_per_mtok']:>7.2f}"
         )
     others = len([m for m in available if not catalogued({m})])
-    lines.append(f"(+{others} other models; pin one with --model)")
+    lines.append(f"(+{_count(others, 'other model')}; pin one with --model)")
     out.result("\n".join(lines), {"catalogued": rows, "available": sorted(available)})
     return 0
 
@@ -955,7 +960,7 @@ def _cache(args: argparse.Namespace, out: _Output) -> int:
         cache = ResponseCache(db)
         if args.action == "clear":
             removed = cache.clear()
-            text = f"removed {removed} cached responses"
+            text = f"removed {_count(removed, 'cached response')}"
             if not os.path.exists(db.path):   # in memory: there was none
                 root = Path(config.path).resolve()
                 text = f"nothing to clear: {root} has no cache yet"
@@ -963,7 +968,7 @@ def _cache(args: argparse.Namespace, out: _Output) -> int:
             return 0
         entries, cost = cache.stats()
     out.result(
-        f"{entries} cached responses, bought for ${cost:.4f} in total",
+        f"{_count(entries, 'cached response')}, bought for ${cost:.4f} in total",
         {"entries": entries, "cost_usd": cost},
     )
     return 0
