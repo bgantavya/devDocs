@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import importlib
 import io
 import json
 import os
@@ -19,6 +20,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import types
 import unittest
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -1464,6 +1466,206 @@ class TestDoctorAndModels(CliCase):
         self.assertEqual(code, 2)
         self.assertIn("!! config               no output format configured", out)
 
+    def doctor_json(
+        self, *argv: str, model: Any = None, env: dict[str, str] | None = None
+    ) -> tuple[int, dict[str, Any], str]:
+        """`doctor --json` on a healthy machine: its exit code, JSON and stderr."""
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.object(external, "available_engines",
+                               return_value={"builtin": "/usr/bin/python3"}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, err = self.run_cli("doctor", str(self.root), "--json", *argv,
+                                          model=model, env=env)
+        return code, json.loads(out), err
+
+    def test_the_json_says_where_the_key_came_from_and_never_shows_it(self) -> None:
+        # Regression: --json said nothing of the key.
+        key = "AIza-SECRET-0123"  # gitleaks:allow (a fake key)
+        toml = self.root / "devdocs.toml"
+        path = str(toml.resolve())
+
+        def status(origin: str | None, where: str | None) -> dict[str, Any]:
+            return {"found": origin is not None, "origin": origin, "where": where,
+                    "shared": False}
+
+        for argv, env, text, expected in (
+            (["--api-key", key], None, "", status("flag", "--api-key")),
+            ([], {"GEMINI_API_KEY": key}, "", status("env", "GEMINI_API_KEY")),
+            ([], {"GOOGLE_API_KEY": key}, "", status("env", "GOOGLE_API_KEY")),
+            ([], {"DEVDOCS_API_KEY": key}, "", status("env", "DEVDOCS_API_KEY")),
+            (["--provider", "anthropic"], {"ANTHROPIC_API_KEY": key}, "",
+             status("env", "ANTHROPIC_API_KEY")),
+            ([], None, f'api_key = "{key}"\n', status("file", path)),
+            ([], None, "", status(None, None)),
+        ):
+            with self.subTest(expected=expected):
+                toml.write_text(text, "utf-8")
+                code, data, err = self.doctor_json("--offline", *argv, env=env)
+                self.assertEqual(data["api_key"], expected)
+                self.assertEqual(code, 0 if expected["found"] else 1)
+                self.assertNotIn(key, json.dumps(data))
+                self.assertNotIn(key, err)
+                healthy = Report((Capability("python", True, "3.11"),))
+                with mock.patch.object(capabilities, "probe_all", return_value=healthy):
+                    _, out, err = self.run_cli("doctor", str(self.root), "--offline",
+                                               *argv, env=env)
+                self.assertNotIn(key, out + err)
+                if expected["found"]:
+                    self.assertIn(
+                        f"ok api key              from {expected['origin']} "
+                        f"{expected['where']}\n", out + "\n")
+
+    def test_the_config_files_path_is_the_file_that_was_read(self) -> None:
+        toml = self.root / "devdocs.toml"
+        toml.write_text('api_key = "k"\n', "utf-8")
+        path = str(toml.resolve())
+        for argv, env in ((["doctor", str(self.root / "shop")], None),   # from below
+                          (["doctor"], {"DEVDOCS_PATH": str(self.root)})):
+            with self.subTest(argv=argv):
+                _, out, _ = self.run_cli(*argv, "--offline", "--json", env=env)
+                self.assertEqual(json.loads(out)["api_key"]["where"], path)
+        # a `path` in the file moves the project, not the file
+        toml.write_text('api_key = "k"\npath = "shop"\n', "utf-8")
+        with contextlib.chdir(self.root):
+            _, out, _ = self.run_cli("doctor", "--offline", "--json")
+        self.assertEqual(json.loads(out)["api_key"]["where"], path)
+
+    def test_the_json_gives_the_outcome_of_the_provider_check(self) -> None:
+        # Regression: a failed or skipped check left no trace in --json.
+        code, data, _ = self.doctor_json("--api-key", "k")
+        self.assertEqual(code, 0)
+        check = data["provider_check"]
+        self.assertEqual((check["provider"], check["status"]), ("gemini", "ok"))
+        self.assertTrue(check["detail"].startswith("3 models; catalogued: "), check)
+        self.assertEqual(data["models"], sorted(TaggedModel().list_models()))
+
+        class Rejecting(TaggedModel):
+            def list_models(self) -> list[str]:
+                raise AuthError("Gemini rejected the API key", hint="check the key")
+
+        code, data, _ = self.doctor_json("--api-key", "k", model=Rejecting())
+        self.assertEqual(code, 1)
+        self.assertEqual(data["provider_check"], {
+            "provider": "gemini", "status": "failed",
+            "detail": "Gemini rejected the API key\n  hint: check the key",
+        })
+        self.assertNotIn("models", data)
+
+        made = mock.Mock(side_effect=AssertionError("a model was made"))
+        with mock.patch.object(cli, "make_provider", made):
+            for argv, why in ((["--offline", "--api-key", "k"], "--offline"),
+                              (["--offline"], "--offline"),
+                              ([], "no API key")):
+                with self.subTest(argv=argv):
+                    out, err = io.StringIO(), io.StringIO()
+                    with clean_env(), contextlib.redirect_stdout(out), \
+                            contextlib.redirect_stderr(err):
+                        cli.main(["doctor", str(self.root), "--json", *argv])
+                    self.assertEqual(json.loads(out.getvalue())["provider_check"], {
+                        "provider": "gemini", "status": "skipped", "detail": why,
+                    })
+        made.assert_not_called()
+
+    def test_a_config_error_leaves_the_rest_unchecked(self) -> None:
+        (self.root / "devdocs.toml").write_text("bogus = 1\n", "utf-8")
+        code, data, _ = self.doctor_json("--api-key", "k")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown option 'bogus'", data["config"])
+        self.assertNotIn("api_key", data)
+        self.assertNotIn("provider_check", data)
+
+    def sdk_doctor(self, sdk: Any) -> tuple[int, str, dict[str, Any]]:
+        """`doctor --offline --provider anthropic-sdk` with `sdk` as the anthropic
+        module, None for a package that is not there: the exit code, lines and
+        JSON."""
+        with mock.patch.dict(sys.modules, {"anthropic": sdk}):
+            code, out = self.doctor("--provider", "anthropic-sdk")
+            same, data, _ = self.doctor_json("--offline", "--api-key", "k",
+                                             "--provider", "anthropic-sdk")
+        self.assertEqual(same, code)
+        return code, out, data
+
+    def test_a_missing_sdk_blocks_even_offline_and_says_how_to_install_it(self) -> None:
+        # Regression: doctor passed, and the run then failed.
+        code, out, data = self.sdk_doctor(None)
+        self.assertEqual(code, 1)
+        self.assertIn("!! anthropic-sdk          cannot import anthropic: "
+                      "ModuleNotFoundError", out)
+        self.assertIn("pip install 'devdocs[anthropic]'", out)
+        sdk = data["anthropic_sdk"]
+        self.assertFalse(sdk["ok"])
+        self.assertIn("pip install 'devdocs[anthropic]'", sdk["detail"])
+
+    def test_a_broken_sdk_is_found_by_importing_it(self) -> None:
+        with mock.patch.object(importlib, "import_module",
+                               side_effect=AttributeError("half a module")):
+            code, out, data = self.sdk_doctor(types.SimpleNamespace())
+        self.assertEqual(code, 1)
+        self.assertIn("cannot import anthropic: AttributeError: half a module", out)
+        self.assertFalse(data["anthropic_sdk"]["ok"])
+
+    def test_an_sdk_that_imports_passes(self) -> None:
+        code, out, data = self.sdk_doctor(
+            types.SimpleNamespace(__version__="2.3.0", Anthropic=object))
+        self.assertEqual(code, 0)
+        self.assertIn("ok anthropic-sdk          2.3.0", out)
+        self.assertEqual(data["anthropic_sdk"], {"name": "anthropic-sdk", "ok": True,
+                                                 "value": "2.3.0", "detail": ""})
+
+    def test_what_only_shares_the_sdks_name_is_found_out(self) -> None:
+        # Regression: an empty folder named anthropic in the current directory
+        # imported as a package, under `python -m devdocs`; doctor passed, and
+        # the run then could not start.
+        for stray in ("anthropic/", "anthropic.py"):
+            folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+            if stray.endswith("/"):
+                (folder / stray).mkdir()
+            else:
+                (folder / stray).write_text("", "utf-8")
+            with self.subTest(stray), mock.patch.dict(sys.modules):
+                sys.modules.pop("anthropic", None)
+                # the stray alone on the path for its import; doctor imports lazily
+                with mock.patch.object(sys, "path", [str(folder)]):
+                    importlib.import_module("anthropic")
+                code, out = self.doctor("--provider", "anthropic-sdk")
+                self.assertEqual(code, 1)
+                self.assertIn("!! anthropic-sdk          no Anthropic client in the "
+                              f"anthropic found at {folder}", out)
+                self.assertIn("pip install 'devdocs[anthropic]'", out)
+
+    def test_without_the_sdk_the_provider_is_not_asked(self) -> None:
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.dict(sys.modules, {"anthropic": None}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, _ = self.run_cli("doctor", str(self.root), "--api-key", "k",
+                                        "--provider", "anthropic-sdk", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["provider_check"], {
+            "provider": "anthropic-sdk", "status": "skipped",
+            "detail": "the anthropic SDK is not usable",
+        })
+
+    def test_with_the_sdk_the_provider_is_asked(self) -> None:
+        sdk = types.SimpleNamespace(__version__="2.3.0", Anthropic=object)
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.dict(sys.modules, {"anthropic": sdk}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, err = self.run_cli("doctor", str(self.root), "--api-key", "k",
+                                          "--provider", "anthropic-sdk", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["provider_check"]["status"], "ok")
+
+    def test_the_other_providers_need_no_sdk(self) -> None:
+        absent = {"anthropic": None}
+        for provider in ("gemini", "anthropic"):
+            with self.subTest(provider), mock.patch.dict(sys.modules, absent):
+                code, out = self.doctor("--provider", provider)
+                self.assertEqual(code, 0)
+                self.assertNotIn("anthropic-sdk", out)
+                _, data, _ = self.doctor_json("--offline", "--api-key", "k",
+                                              "--provider", provider)
+                self.assertNotIn("anthropic_sdk", data)
+
     def test_models_marks_what_the_key_can_reach(self) -> None:
         code, out, _ = self.run_cli("models", "--api-key", "k", "--json")
         self.assertEqual(code, 0)
@@ -1523,6 +1725,18 @@ class TestDemoKey(CliCase):
         code, _, err = self.demo("generate", str(self.root), "--provider", "anthropic")
         self.assertEqual(code, 2)
         self.assertIn("no API key", err)
+
+    def test_doctor_reports_it_as_shared(self) -> None:
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, err = self.demo("doctor", str(self.root), "--offline")
+            _, data, _ = self.demo("doctor", str(self.root), "--offline", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("ok api key              from demo (shared demo key)\n", out)
+        self.assertEqual(json.loads(data)["api_key"], {
+            "found": True, "origin": "demo", "where": "", "shared": True,
+        })
+        self.assertNotIn("DEMO-SECRET", out + data + err)
 
 
 def gone() -> TextIO:

@@ -32,9 +32,10 @@ from devdocs.llm import Completion, Request
 from devdocs.llm.catalog import find
 from devdocs.llm.providers import anthropic_error, decode_message, encode_messages
 
-__all__ = ["AnthropicSDKProvider", "sdk_available"]
+__all__ = ["SDK_HINT", "AnthropicSDKProvider", "sdk_available"]
 
-_SDK_HINT = "pip install 'devdocs[anthropic]', or use provider = 'anthropic'"
+# for an SDK that is missing or broken; doctor's hint too
+SDK_HINT = "pip install 'devdocs[anthropic]', or use provider = 'anthropic'"
 
 
 def sdk_available() -> bool:
@@ -57,7 +58,7 @@ class AnthropicSDKProvider:
     ) -> None:
         if not sdk_available():
             raise ConfigError(
-                "provider 'anthropic-sdk' needs the anthropic package", hint=_SDK_HINT
+                "provider 'anthropic-sdk' needs the anthropic package", hint=SDK_HINT
             )
         try:
             import anthropic
@@ -68,7 +69,7 @@ class AnthropicSDKProvider:
         except Exception as err:
             raise ConfigError(
                 f"could not start the anthropic SDK: {type(err).__name__}: {err}",
-                hint=_SDK_HINT,
+                hint=SDK_HINT,
             ) from err
         self._sdk: Any = anthropic
         self._client: Any = client
