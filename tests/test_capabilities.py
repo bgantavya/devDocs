@@ -17,7 +17,7 @@ class TestProbes(unittest.TestCase):
     def test_every_probe_reports(self) -> None:
         names = {capability.name for capability in self.report.capabilities}
         self.assertLessEqual(
-            {"python", "syntax", "sqlite", "sqlite-fts5", "tls", "certificates"},
+            {"python", "syntax", "sqlite", "sqlite-threads", "tls", "certificates"},
             names,
         )
 
@@ -31,11 +31,11 @@ class TestProbes(unittest.TestCase):
         assert sqlite is not None
         self.assertRegex(sqlite.value, r"^\d+\.\d+")
 
-    def test_missing_fts5_is_not_fatal(self) -> None:
-        # Degraded search must not fail the run, so this probe never reports !!.
-        fts5 = self.report.get("sqlite-fts5")
-        assert fts5 is not None
-        self.assertTrue(fts5.ok)
+    def test_nothing_is_probed_that_nothing_uses(self) -> None:
+        # Regression: doctor reported an FTS5 "lexical prefilter", when no
+        # query uses FTS5 and BM25 is pure Python.
+        self.assertIsNone(self.report.get("sqlite-fts5"))
+        self.assertNotIn("prefilter", str(self.report))
 
     def test_report_renders_one_line_per_capability(self) -> None:
         rendered = str(self.report)
