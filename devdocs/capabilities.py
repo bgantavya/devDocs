@@ -83,23 +83,30 @@ def _python() -> Capability:
 
 
 def _syntax_level() -> Capability:
-    """Highest syntax this interpreter parses, which bounds parse fidelity."""
+    """Highest syntax this interpreter parses, which bounds parse fidelity.
+
+    Syntax newer than the interpreter blocks no run: a file that uses it gets
+    the token scan's fewer facts, or none, and the rest are unaffected. So it
+    is noted, never failed; an interpreter too old to run devdocs at all is
+    the python probe's to fail.
+    """
     import ast
 
     supported: list[str] = []
-    missing: list[str] = []
+    newer: list[str] = []
     for label, since, source in _SYNTAX_PROBES:
         try:
             ast.parse(source)
             supported.append(label)
         except SyntaxError:
-            missing.append(f"{label} ({since}+)")
+            newer.append(f"{label} ({since}+)")
 
     return Capability(
         "syntax",
-        not missing,
+        True,
         f"{len(supported)}/{len(_SYNTAX_PROBES)} constructs",
-        "" if not missing else "cannot parse: " + ", ".join(missing),
+        "" if not newer else (f"cannot parse: {', '.join(newer)}; files that "
+                              "use them get fewer facts or none"),
     )
 
 
