@@ -3,7 +3,7 @@
 A zero-dependency tool cannot lean on a package manager to guarantee its
 environment, so it has to ask. Every check here is cheap, side-effect free, and
 never raises: a probe that fails returns a Capability describing the failure,
-because "FTS5 is missing" must degrade the search path, not crash the run.
+because "no CA certificates" must be reported, not crash the run.
 
 `devdocs doctor` is a thin printer over `probe_all`.
 """
@@ -114,20 +114,6 @@ def _sqlite() -> Capability:
     return Capability("sqlite", True, sqlite3.sqlite_version)
 
 
-def _fts5() -> Capability:
-    """FTS5 drives the lexical prefilter. Absent is degraded, not fatal."""
-    connection = sqlite3.connect(":memory:")
-    try:
-        connection.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
-        return Capability("sqlite-fts5", True, "available")
-    except sqlite3.OperationalError:
-        return Capability(
-            "sqlite-fts5", True, "missing", "lexical prefilter falls back to scan"
-        )
-    finally:
-        connection.close()
-
-
 def _sqlite_threads() -> Capability:
     """threadsafety 1 means one connection per thread; 3 means shareable."""
     level = sqlite3.threadsafety
@@ -167,7 +153,6 @@ _PROBES: tuple[tuple[str, Callable[[], Capability]], ...] = (
     ("python", _python),
     ("syntax", _syntax_level),
     ("sqlite", _sqlite),
-    ("sqlite-fts5", _fts5),
     ("sqlite-threads", _sqlite_threads),
     ("tls", _tls),
     ("certificates", _certificates),
