@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import os
 import queue
@@ -41,12 +42,14 @@ from datetime import date
 from pathlib import Path, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
 from types import FrameType
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from devdocs import __version__
 from devdocs.config import (
     CONFIG_FILENAME,
     Config,
+    KeySource,
+    find_config_file,
     key_variables,
     load_config,
     resolve_api_key,
@@ -69,6 +72,9 @@ from devdocs.llm.client import CallEvent, LLMClient
 from devdocs.llm.factory import PROVIDERS, OfflineModel, make_provider
 from devdocs.llm.stop import Interrupted, leave_signals
 from devdocs.render import PDF_ENGINES
+
+if TYPE_CHECKING:
+    from devdocs.capabilities import Capability
 
 __all__ = ["build_parser", "main"]
 
@@ -664,6 +670,43 @@ def _free_days(config: Config, requests: int) -> int:
     return -(-requests // daily)
 
 
+def _key_where(args: argparse.Namespace, source: KeySource) -> str:
+    """Where a key came from, never the key: the flag, the variable's name, or
+    the config file's path, looked for as `load_config` did, since `source`
+    holds only its name."""
+    if source.origin == "flag":
+        return "--api-key"
+    if source.origin == "file":
+        found = find_config_file(search_start(args.path, os.environ))
+        return str(found or source.detail)
+    return source.detail
+
+
+def _anthropic_sdk() -> Capability:
+    """Whether the `anthropic` package imports and has the client that provider
+    anthropic-sdk starts, with or without a key. Finding it would not do: a
+    broken install is found, and fails when the run starts. Nor would importing
+    it: so does a stray anthropic.py, or a folder of that name in the current
+    directory, which `python -m devdocs` puts on the path."""
+    from devdocs.capabilities import Capability
+    from devdocs.llm.anthropic_sdk import SDK_HINT
+
+    try:
+        sdk = importlib.import_module("anthropic")
+    except Exception as err:
+        return Capability("anthropic-sdk", False,
+                          f"cannot import anthropic: {type(err).__name__}: {err}",
+                          SDK_HINT)
+    if not callable(getattr(sdk, "Anthropic", None)):
+        found = (getattr(sdk, "__file__", None)
+                 or ", ".join(getattr(sdk, "__path__", ())))
+        return Capability("anthropic-sdk", False,
+                          f"no Anthropic client in the anthropic found at {found}",
+                          SDK_HINT)
+    version = str(getattr(sdk, "__version__", "imported"))
+    return Capability("anthropic-sdk", True, version)
+
+
 def _doctor(args: argparse.Namespace, out: _Output) -> int:
     from devdocs.capabilities import Capability, probe_all
     from devdocs.render.pdf.external import available_engines
@@ -698,30 +741,50 @@ def _doctor(args: argparse.Namespace, out: _Output) -> int:
         lines.append(f"!! prices               checked {PRICES_CHECKED}, {age} days "
                      "ago; verify against the vendor's pricing page")
 
+    sdk = _anthropic_sdk() if config.provider == "anthropic-sdk" else None
+    if sdk is not None:
+        lines.append(str(sdk))
+        data["anthropic_sdk"] = asdict(sdk)
+        blocking = blocking or not sdk.ok
+
+    data["api_key"] = {"found": False, "origin": None, "where": None, "shared": False}
     try:
         key = _key(config, args.api_key, out)
-        source = config.key_source
-        where = f"{source.origin} {source.detail}".strip() if source else "?"
-        lines.append(f"ok api key              from {where}"
-                     + (" (shared demo key)" if source and source.shared else ""))
     except ConfigError as err:
         lines.append(f"!! api key              {err}")
         key = ""
         blocking = True
+    else:
+        source = config.key_source
+        assert source is not None   # `_key` set it
+        where = _key_where(args, source)
+        data["api_key"] = {"found": True, "origin": source.origin, "where": where,
+                           "shared": source.shared}
+        lines.append(f"ok api key              from {source.origin} {where}".rstrip()
+                     + (" (shared demo key)" if source.shared else ""))
 
-    if key and not args.offline:
+    skipped = ("--offline" if args.offline
+               else "no API key" if not key
+               else "the anthropic SDK is not usable" if sdk and not sdk.ok
+               else "")
+    check = {"provider": config.provider, "status": "skipped", "detail": skipped}
+    if not skipped:
         try:
             model = make_provider(config.provider, key)
             available = set(model.list_models())
             reachable = catalogued(available)
             known = [m.id for m in CATALOG
                      if m.provider == model.provider and m.id in reachable]
-            lines.append(f"ok provider             {len(available)} models; "
-                         f"catalogued: {', '.join(known) or 'none'}")
+            detail = (f"{len(available)} models; "
+                      f"catalogued: {', '.join(known) or 'none'}")
+            lines.append(f"ok provider             {detail}")
             data["models"] = sorted(available)
+            check.update(status="ok", detail=detail)
         except DevDocsError as err:
             lines.append(f"!! provider             {err}")
+            check.update(status="failed", detail=str(err))
             blocking = True
+    data["provider_check"] = check
 
     out.result("\n".join(lines), data)
     return 1 if blocking else 0
