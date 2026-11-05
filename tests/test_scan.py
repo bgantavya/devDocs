@@ -412,9 +412,40 @@ class TestPythonRoles(ScanCase):
 
     def test_python_test_conventions(self) -> None:
         for relative in ("shop/tests.py", "conftest.py", "pkg/util_tests.py", "test.py",
-                         "pkg/testing.py", "pkg/tests/helpers.py"):
+                         "pkg/tests/helpers.py", "pkg/testing/helpers.py",
+                         "pkg/test/helpers.py", "test_cart.py", "pkg/test_cart.py",
+                         "pkg/tests_cart.py", "pkg/cart_test.py", "pkg/sub/conftest.py",
+                         "Test_Loud.PY", "deep/Tests/er/util.py"):
             with self.subTest(relative=relative):
                 self.assertIs(self.classify(relative), Role.TEST)
+
+    def test_a_name_that_only_starts_with_test_is_no_test(self) -> None:
+        # Regression: every .py name starting `test` was a test, so undocumented.
+        # testing.py holds public helpers too, as click's CliRunner.
+        names = {"testament.py", "pkg/testing.py", "pkg/testing_utils.py",
+                 "pkg/tester.py", "pkg/testbed.py", "pkg/testimony.py"}
+        for relative in sorted(names):
+            with self.subTest(relative=relative):
+                self.assertIs(self.classify(relative), Role.SOURCE)
+        documentable = {f.relpath for f in Scanner(self.root).scan().documentable}
+        self.assertEqual(documentable, names)
+
+    def test_python_test_names_mark_only_python(self) -> None:
+        # Regression: `tests_` took other files' roles too, leaving source undocumented.
+        for relative, role in {"tests_api.js": Role.SOURCE,
+                               "tests_runner.go": Role.SOURCE,
+                               "tests_plan.md": Role.DOCS, "tests_notes.txt": Role.DOCS,
+                               "tests_settings.yaml": Role.CONFIG,
+                               "conftest.js": Role.SOURCE, "TESTS.md": Role.DOCS,
+                               "test.yaml": Role.CONFIG}.items():
+            with self.subTest(relative=relative):
+                self.assertIs(self.classify(relative), role)
+        self.write("tests_results.csv", "a,b\n")
+        result = Scanner(self.root).scan()
+        self.assertEqual(result.skipped["tests_results.csv"],
+                         "not a recognised source or config file")
+        self.assertEqual({f.relpath for f in result.documentable},
+                         {"tests_api.js", "tests_runner.go", "conftest.js"})
 
 
 if __name__ == "__main__":
