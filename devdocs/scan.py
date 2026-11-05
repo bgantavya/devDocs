@@ -66,9 +66,12 @@ DEFAULT_IGNORES: tuple[str, ...] = (
     "/build/", "/dist/", "/target/", "/out/", "/vendor/", "/third_party/",
 )
 
-# Path segments that mark tests and vendored code.
+# What in a path marks tests and vendored code.
 _TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs", "testing"}
+_TEST_PREFIXES = ("test_", "spec_")   # the word, so not testament.py
 _TEST_SUFFIXES = ("_test", "_tests", ".test", ".spec")
+_PY_TEST_FILES = {"conftest.py", "test.py", "tests.py"}   # not testing.py: often public
+_PY_TEST_PREFIX = "tests_"
 _VENDOR_DIRS = {"vendor", "third_party", "thirdparty", "external", "node_modules"}
 
 # Generated code: by name, and by the markers generators put in the header.
@@ -384,9 +387,10 @@ def _role(relpath: str, language: str, suffix: str) -> Role:
         return Role.VENDORED
     if (
         segments & _TEST_DIRS
-        or name.startswith(("test_", "spec_"))
+        or name in _PY_TEST_FILES
+        or name.startswith(_TEST_PREFIXES)
+        or (suffix == ".py" and name.startswith(_PY_TEST_PREFIX))
         or any(name.endswith(f"{marker}{suffix}") for marker in _TEST_SUFFIXES)
-        or (suffix == ".py" and (name.startswith("test") or name == "conftest.py"))
     ):
         return Role.TEST
     if language and (
