@@ -78,7 +78,7 @@ from devdocs.render.pdf.fonts import (
     Font,
     describe,
 )
-from devdocs.render.text import code_spans, code_text, folded, relpath
+from devdocs.render.text import claim, code_spans, code_text, folded, relpath
 
 __all__ = ["PdfRenderer"]
 
@@ -707,12 +707,7 @@ def _split_paths(documents: Sequence[Document]) -> dict[str, str]:
     for document in documents:
         root = document.kind is DocKind.MODULE and document.path == Layout.module("")
         stem = "pdf/" + ("root" if root else document.path)
-        name, count = f"{stem}.pdf", 1
-        while folded(name) in taken:
-            count += 1
-            name = f"{stem}-{count}.pdf"
-        taken.add(folded(name))
-        paths[document.id] = name
+        paths[document.id] = claim(stem, ".pdf", taken)
     return paths
 
 
