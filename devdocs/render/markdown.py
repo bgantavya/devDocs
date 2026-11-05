@@ -12,6 +12,12 @@ the page it lands on. Links are relative paths between pages, so the output
 reads the same on a code host, in a static site or straight from disk. Pages
 carry no counts, costs or timestamps: an unchanged source renders to
 identical bytes, and a regeneration diffs only where something changed.
+
+A document's page is `<path>.md`, named as the HTML site names its pages: the
+home page keeps README.md, and should two documents still claim one name, the
+later in reading order gets `-2`, `-3` and so on. Names that differ only in
+case or Unicode normalization count as one, as macOS stores them as one file
+by default, and Windows those differing in case.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from devdocs.render.model import (
     Section,
     SymbolDoc,
 )
-from devdocs.render.text import code_spans, relpath, url_path
+from devdocs.render.text import claim, code_spans, folded, relpath, url_path
 
 __all__ = ["MarkdownRenderer"]
 
@@ -72,25 +78,27 @@ class MarkdownRenderer:
 
     def render(self, docset: DocSet) -> dict[str, bytes]:
         """Every page as UTF-8 bytes, keyed by POSIX path under the out dir.
-
-        The home page carries no front matter, being no document, and is
-        rendered last so it keeps README.md should a document's path land there.
-        """
+        The home page carries no front matter, being no document."""
+        home = f"{Layout.home()}{self.extension}"
+        taken = {folded(home)}
+        order = docset.sorted()
+        names = {d.id: claim(d.path, self.extension, taken) for d in order}
         index = {document.id: document for document in docset.documents}
-        pages = {
-            f"{document.path}{self.extension}": self._document(docset, index, document)
-            for document in docset.sorted()
-        }
-        pages[f"{Layout.home()}{self.extension}"] = self._home(docset, index)
+        pages = {names[d.id]: self._document(docset, index, names, d) for d in order}
+        pages[home] = self._home(docset, index, names, home)
         return dict(sorted(pages.items()))
 
     def _document(
-        self, docset: DocSet, index: Mapping[str, Document], document: Document
+        self,
+        docset: DocSet,
+        index: Mapping[str, Document],
+        names: Mapping[str, str],
+        document: Document,
     ) -> bytes:
         page = _Page(
             index,
-            document.path,
-            extension=self.extension,
+            names,
+            names[document.id],
             language=document.meta.language,
             diagrams=self.diagrams,
         )
@@ -120,8 +128,14 @@ class MarkdownRenderer:
                 blocks.extend(body)
         return _finish(blocks)
 
-    def _home(self, docset: DocSet, index: Mapping[str, Document]) -> bytes:
-        page = _Page(index, Layout.home(), extension=self.extension)
+    def _home(
+        self,
+        docset: DocSet,
+        index: Mapping[str, Document],
+        names: Mapping[str, str],
+        home: str,
+    ) -> bytes:
+        page = _Page(index, names, home)
         blocks = [_heading(1, docset.project or "Documentation")]
         blocks.extend(_paragraphs(docset.description))
 
@@ -153,21 +167,22 @@ class MarkdownRenderer:
 
 
 class _Page:
-    """Rendering state for one page: where it sits and which anchors it holds."""
+    """Rendering state for one page: its file `here`, each document's file in
+    `names`, and which anchors it holds."""
 
     def __init__(
         self,
         index: Mapping[str, Document],
-        path: str,
+        names: Mapping[str, str],
+        here: str,
         *,
-        extension: str,
         language: str = "",
         diagrams: bool = True,
     ) -> None:
         self.index = index
-        self.path = path
-        self.directory = posixpath.dirname(path) or "."
-        self.extension = extension
+        self.names = names
+        self.here = here
+        self.directory = posixpath.dirname(here) or "."
         self.language = _FENCE_LANGUAGE.get(language, language)
         self.diagrams = diagrams
         self.anchors: set[str] = set()
@@ -176,14 +191,13 @@ class _Page:
 
     def href(self, link: Link) -> str | None:
         """Where `link` points from this page; None when it points nowhere."""
-        target = self.index.get(link.target) if link.target else None
+        target = self.names.get(link.target) if link.target else None
         if target is None:
             return None
         fragment = f"#{url_path(link.anchor)}" if link.anchor else ""
-        if fragment and target.path == self.path:
+        if fragment and target == self.here:
             return fragment
-        page = relpath(f"{target.path}{self.extension}", self.directory)
-        return url_path(page) + fragment
+        return url_path(relpath(target, self.directory)) + fragment
 
     def link(self, link: Link) -> str:
         href = self.href(link)

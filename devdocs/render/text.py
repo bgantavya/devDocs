@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from urllib.parse import quote
 
 __all__ = [
+    "claim",
     "code_spans",
     "code_text",
     "counted",
@@ -126,3 +127,15 @@ def folded(name: str) -> str:
     a file system does costs at most a needless suffix; folding less loses a
     file."""
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+def claim(stem: str, extension: str, taken: set[str]) -> str:
+    """A file name of its own: `<stem><extension>`, or with `-2`, `-3` and so
+    on after the stem where `taken` holds that name, as `folded` has it. The
+    name returned joins `taken`."""
+    name, count = f"{stem}{extension}", 1
+    while folded(name) in taken:
+        count += 1
+        name = f"{stem}-{count}{extension}"
+    taken.add(folded(name))
+    return name
