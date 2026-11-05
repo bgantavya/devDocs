@@ -34,7 +34,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind
+from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind, count_lines
 from devdocs.parse.masking import Masked, Syntax, mask
 from devdocs.scan import LANGUAGES
 
@@ -174,7 +174,7 @@ class GenericParser:
         language = LANGUAGES.get(path.suffix.lower(), "")
         if language not in self.spec.languages:
             language = self.spec.languages[0]
-        loc = source.count("\n") + 1
+        loc = count_lines(source)
         try:
             masked = mask(source, self.spec.syntax)
             return self._scan(path, source, masked, language, loc)
@@ -801,7 +801,9 @@ def _continues(masked: str, start: int, newline: int) -> bool:
 
 
 def _end_line(masked: str, start: int, header_end: int) -> int:
-    """Line of the brace closing the body that follows the header.
+    """Line of the brace closing the body that follows the header; of the
+    header's last character when no body follows; the file's last line when
+    nothing closes the body.
 
     The body may sit after `=>` (arrow functions) or `=` (type aliases), so
     those are stepped over before looking for the opening brace.
@@ -817,7 +819,7 @@ def _end_line(masked: str, start: int, header_end: int) -> int:
             position += 1
 
     if position >= len(masked) or masked[position] != "{":
-        return masked.count("\n", 0, header_end) + 1 if header_end > start else line
+        return masked.count("\n", 0, header_end - 1) + 1 if header_end > start else line
     depth = 0
     for index in range(position, len(masked)):
         char = masked[index]
@@ -827,7 +829,7 @@ def _end_line(masked: str, start: int, header_end: int) -> int:
             depth -= 1
             if depth == 0:
                 return masked.count("\n", 0, index) + 1
-    return masked.count("\n") + 1
+    return count_lines(masked)
 
 
 def skip_angles(text: str) -> str:

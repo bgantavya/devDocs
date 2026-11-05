@@ -25,10 +25,18 @@ __all__ = [
     "Parser",
     "Symbol",
     "SymbolKind",
+    "count_lines",
     "get_parser",
     "register",
     "supported_languages",
 ]
+
+
+def count_lines(text: str) -> int:
+    """How many lines `text` holds, its line ends normalized as reading a file
+    as text does: a final newline ends the last line and starts no other. The
+    scanner gets the same count from a file's bytes."""
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
 
 
 class SymbolKind(StrEnum):

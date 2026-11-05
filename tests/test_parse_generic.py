@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind, get_parser
 from devdocs.scan import LANGUAGES
@@ -26,6 +27,68 @@ def parse_text(source: str, suffix: str) -> FileFacts:
     parser = get_parser(LANGUAGES[suffix])
     assert parser is not None
     return parser.parse(Path("inline" + suffix), source)
+
+
+class TestLines(unittest.TestCase):
+    def test_lines_are_counted_whatever_ends_the_file(self) -> None:
+        # Regression: a final newline counted as one more line.
+        for source, loc in {"": 0, "\n": 1, "x := 1": 1, "x := 1\n": 1,
+                            "x := 1\n\n": 2, "a()\nb()": 2, "a()\nb()\n": 2,
+                            "a()\r\nb()\r\n": 2}.items():
+            with self.subTest(source=source):
+                self.assertEqual(parse_text(source, ".go").loc, loc)
+
+    def test_a_scan_that_fails_still_counts_them(self) -> None:
+        parser = get_parser("go")
+        assert parser is not None
+        failing = mock.patch("devdocs.parse.generic.mask", side_effect=RecursionError)
+        with failing:
+            facts = parser.parse(Path("inline.go"), "a()\nb()\n")
+        self.assertIs(facts.confidence, Confidence.FAILED)
+        self.assertEqual(facts.loc, 2)
+
+    def test_what_nothing_closes_ends_on_the_last_line(self) -> None:
+        # Regression: it ended one past the last line of a file with a final newline.
+        for source, suffix, spans in (
+            ("func Run() {\n\tx()\n", ".go", {"Run": (1, 2)}),
+            ("func Run() {\n\tx()", ".go", {"Run": (1, 2)}),
+            ("func Run() {\n\tx()\n\n", ".go", {"Run": (1, 3)}),
+            ("func Run(\n", ".go", {"Run": (1, 1)}),
+            ("pub struct S {\n    a: u8,\n", ".rs", {"S": (1, 2)}),
+            ("function f() {\n  x();\n", ".js", {"f": (1, 2)}),
+            ("export class C {\n  m() {\n    y();\n", ".ts",
+             {"C": (1, 3), "m": (2, 3)}),
+            ("public class A {\n  int x;\n", ".java", {"A": (1, 2)}),
+        ):
+            with self.subTest(source=source):
+                facts = parse_text(source, suffix)
+                self.assertEqual({symbol.name: (symbol.line, symbol.end_line)
+                                  for top in facts.symbols for symbol in top.walk()},
+                                 spans)
+
+    def test_a_closed_block_still_ends_on_its_brace(self) -> None:
+        facts = parse_text("func Run() {\n\tx()\n}\n\nvar V = 1\n", ".go")
+        self.assertEqual(index(facts)["Run"].end_line, 3)
+        self.assertEqual(index(facts)["V"].end_line, 5)
+
+    def test_no_cut_of_a_file_puts_a_symbol_past_its_end(self) -> None:
+        for suffix, whole in {
+            ".go": ("func Run() {\n\tx()\n}\n\ntype T struct {\n\tA int\n}\n\n"
+                    "var V = 1\nfunc Many(\n\ta int,\n) {\n}\n"),
+            ".rs": "pub fn f() {\n    x();\n}\n\npub struct S {\n    a: u8,\n}\n",
+            ".ts": ("export class C {\n  m() {\n    y();\n  }\n}\n"
+                    "export const g = () => {\n  z();\n};\n"
+                    "export const h = (a: number) =>\n  a + 1;\n"
+                    "export type T = {\n  a: number;\n};\n"),
+            ".java": "public class A {\n  public void m() {\n    y();\n  }\n}\n",
+        }.items():
+            for cut in range(len(whole) + 1):
+                source = whole[:cut]
+                facts = parse_text(source, suffix)
+                for top in facts.symbols:
+                    for symbol in top.walk():
+                        self.assertLessEqual(symbol.end_line, facts.loc,
+                                             f"{symbol.name} in {source!r}")
 
 
 def index(facts: FileFacts) -> dict[str, Symbol]:
