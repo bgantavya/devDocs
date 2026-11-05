@@ -75,7 +75,7 @@ from devdocs.render.model import (
     Section,
     SymbolDoc,
 )
-from devdocs.render.text import code_spans, code_text, folded, relpath, url_path
+from devdocs.render.text import claim, code_spans, code_text, folded, relpath, url_path
 
 __all__ = ["BOOK", "HOME", "ROOT_MODULE", "HtmlRenderer"]
 
@@ -756,12 +756,7 @@ def _pages(documents: Sequence[Document]) -> dict[str, str]:
     for document in documents:
         root = document.kind is DocKind.MODULE and document.path == Layout.module("")
         stem = ROOT_MODULE.removesuffix(".html") if root else document.path
-        name, count = f"{stem}.html", 1
-        while folded(name) in taken:
-            count += 1
-            name = f"{stem}-{count}.html"
-        taken.add(folded(name))
-        pages[document.id] = name
+        pages[document.id] = claim(stem, ".html", taken)
     return pages
 
 
