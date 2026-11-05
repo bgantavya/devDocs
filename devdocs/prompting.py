@@ -39,7 +39,7 @@ from devdocs.context import Snippet
 from devdocs.graph import FileNode, ProjectGraph, is_stdlib
 from devdocs.llm.budget import estimate_tokens
 from devdocs.llm.catalog import Tier
-from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind
+from devdocs.parse import Confidence, FileFacts, Symbol, SymbolKind, count_lines
 from devdocs.plan import FilePlan, ModulePlan
 
 __all__ = ["Prompt", "PromptBuilder", "excerpt", "system_prompt"]
@@ -170,7 +170,7 @@ class PromptBuilder:
         """The prompt for one file: its place in the graph, the symbols to
         describe, retrieved context, and its source trimmed to `source_tokens`."""
         lines = self._project()
-        loc = facts.loc or (source.count("\n") + 1 if source else 0)
+        loc = facts.loc or count_lines(source)
         shape = ", ".join(
             part for part in (facts.language, _plural(loc, "line")) if part
         )

@@ -1028,7 +1028,7 @@ class FilePromptTest(unittest.TestCase):
         )
         self.assertEqual(prompt.user, "\n".join([
             "Project: shop",
-            "File: docs/snippet (3 lines)",
+            "File: docs/snippet (2 lines)",   # regression: the final newline made 3
             "Describe: a, b, c, d, e",
             "",
             "Source:",

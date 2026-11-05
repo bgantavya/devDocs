@@ -9,8 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from devdocs.generate import Pipeline
 from devdocs.ignore import GitignoreMatcher
-from devdocs.scan import Role, Scanner
+from devdocs.parse import get_parser
+from devdocs.scan import _HEAD_BYTES, Role, Scanner
 
 # Every one of these was skipped by v3's substring filter.
 V3_CASUALTIES = (
@@ -163,6 +165,44 @@ class TestResult(ScanCase):
         result = Scanner(self.root).scan()
         self.assertEqual([f.relpath for f in result.files], ["a.py", "b.py"])
         self.assertEqual(result.files[1].lines, 3)
+
+    def test_lines_are_counted_as_the_parsers_count_them(self) -> None:
+        # Pages and scores use either count, so a file must not have two.
+        for text in ("x = 1", "x = 1\n", "x = 1\ny = 2\n", "x = 1\n\n", "\n",
+                     "x = 1\r\ny = 2\r\n", "x = 1\ry = 2\r", "x = 1\ry = 2", "\r",
+                     "\r\n", "\r\r", "\n\r", "x = 1\r\ny = 2\rz = 3\n", "x = 1\r\r\n"):
+            for name in ("a.py", "a.go"):
+                with self.subTest(text=text, name=name):
+                    path = self.root / name
+                    path.write_bytes(text.encode("utf-8"))
+                    found = next(f for f in Scanner(self.root).scan().files
+                                 if f.relpath == name)
+                    parser = get_parser(found.language)
+                    assert parser is not None
+                    read = Pipeline._read(found)
+                    self.assertEqual(parser.parse(path, read).loc, found.lines)
+
+    def test_classic_mac_lines_are_counted(self) -> None:
+        # Regression: a file ending its lines in CR alone counted as one line.
+        self.write("a.go")
+        (self.root / "a.go").write_bytes(b"a()\rb()\rc()\r")
+        self.assertEqual(Scanner(self.root).scan().files[0].lines, 3)
+
+    def test_a_line_end_across_two_reads_is_one(self) -> None:
+        second = _HEAD_BYTES + (1 << 20)   # where the second read after the head starts
+        for at in (_HEAD_BYTES, second):
+            before = b"x" * (at - 1)
+            for tail, lines in ((b"\r\ny\r\n", 2), (b"\r\n", 1), (b"\ry", 2),
+                                (b"\r", 1), (b"\r\r\n", 2), (b"\n\n", 2)):
+                with self.subTest(at=at, tail=tail):
+                    path = self.root / "a.py"
+                    path.write_bytes(before + tail)
+                    found = Scanner(self.root, max_bytes=2 * second).scan().files[0]
+                    self.assertEqual(found.lines, lines)
+                    parser = get_parser(found.language)
+                    assert parser is not None
+                    read = Pipeline._read(found)
+                    self.assertEqual(parser.parse(path, read).loc, lines)
 
     def test_grouping_helpers(self) -> None:
         self.write("a.py")

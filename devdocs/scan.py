@@ -366,15 +366,20 @@ def _claim(path: Path, seen: set[tuple[int, int]]) -> bool:
 
 
 def _read(path: Path) -> tuple[bytes, int]:
-    """Read a file once: its head, for header sniffing, and its line count."""
+    """Read a file once: its head, for header sniffing, and its line count. That
+    is what `count_lines` says of the file read as text, where LF, CRLF and a
+    lone CR each end a line."""
+    lines = 0
+    last = b""
     with path.open("rb") as handle:
-        head = handle.read(_HEAD_BYTES)
-        lines = head.count(b"\n")
-        last = head[-1:]
-        while chunk := handle.read(1 << 20):
-            lines += chunk.count(b"\n")
+        head = chunk = handle.read(_HEAD_BYTES)
+        while chunk:
+            lines += chunk.count(b"\n") + chunk.count(b"\r") - chunk.count(b"\r\n")
+            if last == b"\r" and chunk.startswith(b"\n"):   # a CRLF split across reads
+                lines -= 1
             last = chunk[-1:]
-    return head, lines + (1 if last and last != b"\n" else 0)
+            chunk = handle.read(1 << 20)
+    return head, lines + (1 if last and last not in (b"\r", b"\n") else 0)
 
 
 def _role(relpath: str, language: str, suffix: str) -> Role:
