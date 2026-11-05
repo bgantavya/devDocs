@@ -350,7 +350,7 @@ class TestSignatures(unittest.TestCase):
                     [("f", FUNCTION, 2, 4, "def f(a, b)", []),
                      ("X", CONSTANT, 1, 1, "X = 1", [])],
                 )
-                self.assertEqual(facts.loc, 5)
+                self.assertEqual(facts.loc, 4)
 
     def test_a_leading_bom_is_valid_python(self) -> None:
         body = (
@@ -375,7 +375,7 @@ class TestSignatures(unittest.TestCase):
             [("Invoice", CLASS, 6, 10, "class Invoice",
               [("total", METHOD, 9, 10, "def total(self) -> Decimal", [])])],
         )
-        self.assertEqual(facts.loc, 11)
+        self.assertEqual(facts.loc, 10)
 
     def test_a_constant_signature_is_its_first_line(self) -> None:
         facts = parse(
@@ -718,7 +718,19 @@ class TestDegraded(unittest.TestCase):
             facts = parse("x = 1\n")
         self.assertIs(facts.confidence, Confidence.FAILED)
         self.assertEqual(facts.notes, ["parser error: TypeError: boom"])
-        self.assertEqual(facts.loc, 2)
+        self.assertEqual(facts.loc, 1)
+
+    def test_lines_are_counted_whatever_ends_the_file(self) -> None:
+        # Regression: a final newline counted as one more line.
+        for source, loc in {"": 0, "\n": 1, "x = 1": 1, "x = 1\n": 1, "x = 1\n\n": 2,
+                            "x = 1\ny = 2": 2, "x = 1\ny = 2\n": 2, "\ufeff": 0,
+                            "\ufeffx = 1\n": 1, "x = 1\r\ny = 2\r\n": 2,
+                            "x = 1\ry = 2\r": 2}.items():
+            with self.subTest(source=source):
+                self.assertEqual(parse(source).loc, loc)
+        for failed in ("(\n", "x = '\udcff'\n"):
+            with self.subTest(source=failed):
+                self.assertEqual(parse(failed).loc, 1)
 
     def test_odd_inputs_never_raise(self) -> None:
         cases = {

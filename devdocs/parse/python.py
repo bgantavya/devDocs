@@ -47,6 +47,7 @@ from devdocs.parse import (
     FileFacts,
     Symbol,
     SymbolKind,
+    count_lines,
     register,
 )
 
@@ -87,7 +88,7 @@ class PythonParser:
         try:
             text = source.removeprefix(_BOM)
             text = text.replace("\r\n", "\n").replace("\r", "\n")
-            loc = text.count("\n") + 1
+            loc = count_lines(text)
             return self._parse(path, text, loc)
         except Exception as err:   # never let one file end a run
             return _failed(path, loc, f"parser error: {type(err).__name__}: {err}")
