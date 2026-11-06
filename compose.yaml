@@ -1,9 +1,13 @@
 # devdocs in a container, run against the current directory ($PWD, mounted at
 # /work; PowerShell and cmd export no PWD: there, this file's directory).
 # DEVDOCS_UID and DEVDOCS_GID (default 1000) make docs/ and .devdocs/ yours;
-# API keys and DEVDOCS_PROVIDER pass through from the shell:
+# API keys and the DEVDOCS_* settings pass through from the shell:
 #   export DEVDOCS_UID=$(id -u) DEVDOCS_GID=$(id -g)
 #   docker compose -f path/to/devDocs/compose.yaml run --rm devdocs generate
+# DEVDOCS_PATH and DEVDOCS_OUT are read in the container: keep them relative,
+# inside the directory mounted at /work. Most paths elsewhere are missing or
+# read-only there (refused), but /tmp is the container's tmpfs: pages written
+# there are lost when the container exits.
 # The image is pulled from ghcr.io, or built from this checkout if that fails.
 # Stopping sends SIGINT and allows 150 s before SIGKILL: nothing new is sent,
 # in-flight calls (120 s HTTP timeout) finish and are cached, the pages are
@@ -16,12 +20,32 @@ services:
     volumes:
       - "${PWD:-.}:/work"
     user: "${DEVDOCS_UID:-1000}:${DEVDOCS_GID:-1000}"
+    # Bare names: what the shell leaves unset stays unset.
     environment:
       - DEVDOCS_API_KEY
       - GEMINI_API_KEY
       - GOOGLE_API_KEY
       - ANTHROPIC_API_KEY
       - DEVDOCS_PROVIDER
+      - DEVDOCS_MODEL
+      - DEVDOCS_QUALITY
+      - DEVDOCS_CONTEXT
+      - DEVDOCS_MAX_COST
+      - DEVDOCS_MAX_REQUESTS
+      - DEVDOCS_CONCURRENCY
+      - DEVDOCS_FREE_TIER
+      - DEVDOCS_PATH
+      - DEVDOCS_OUT
+      - DEVDOCS_INCLUDE
+      - DEVDOCS_EXCLUDE
+      - DEVDOCS_PER_FILE
+      - DEVDOCS_FORMATS
+      - DEVDOCS_PDF_ENGINE
+      - DEVDOCS_PDF_SPLIT
+      - DEVDOCS_PAGE_SIZE
+      - DEVDOCS_NAME
+      - DEVDOCS_DESCRIPTION
+      - DEVDOCS_DEBUG
     init: true
     stop_signal: SIGINT
     stop_grace_period: 150s
