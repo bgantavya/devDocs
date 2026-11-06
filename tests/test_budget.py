@@ -277,6 +277,26 @@ class TestRouter(unittest.TestCase):
         router.restore("gemini-2.5-pro")
         self.assertEqual([m.id for m in router.ladder(Tier.FILE)], ["gemini-2.5-pro"])
 
+    def test_free_models_below_a_tier_follow_it_for_their_answers_on_loan(
+        self,
+    ) -> None:
+        flash = known("gemini-3.8-flash")
+        for free_only in (True, False):     # --paid finds them too
+            router = Router("gemini", free_only=free_only)
+            candidates = router.candidates(Tier.ARCHITECTURE)
+            own = [m for m in candidates if m.tier is Tier.ARCHITECTURE]
+            self.assertEqual(candidates[: len(own)], own)
+            self.assertIn(flash, candidates[len(own) :])
+            self.assertTrue(all(m.free_rpm for m in candidates[len(own) :]))
+            self.assertEqual(router.lent(Tier.ARCHITECTURE, flash), "architecture")
+            self.assertEqual(router.lent(Tier.MODULE, flash), "")
+        high = Router("gemini", quality="high", free_only=True)
+        self.assertEqual(high.lent(Tier.FILE, flash), "architecture")
+        pinned = Router("gemini", pinned=flash.id)
+        self.assertEqual(pinned.lent(Tier.ARCHITECTURE, flash), "")
+        claude = Router("anthropic", free_only=True).candidates(Tier.ARCHITECTURE)
+        self.assertEqual({m.tier for m in claude}, {Tier.ARCHITECTURE})
+
 
 class FakeClock:
     def __init__(self) -> None:

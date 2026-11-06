@@ -124,15 +124,17 @@ class LLMClient:
         if self.on_event is not None:
             self.on_event(CallEvent(kind, model, tag, detail, cost))
 
-    def _key(self, request: Request) -> str:
+    def _key(self, request: Request, *, lent: str = "") -> str:
         assert self.cache is not None
-        return self.cache.key(request, provider=self.model.provider)
+        return self.cache.key(request, provider=self.model.provider, lent=lent)
 
     def _keyed(
-        self, info: ModelInfo, system: str, text: str, max_output: int
+        self, tier: Tier, info: ModelInfo, system: str, text: str, max_output: int
     ) -> str:
-        """The cache key of a call whose prompt is identified by `text`."""
-        return self._key(self._request(info, system, text, max_output, ""))
+        """The cache key of `info`'s answer to `tier` work whose prompt is
+        identified by `text`: apart from its own tier's when it is on loan."""
+        request = self._request(info, system, text, max_output, "")
+        return self._key(request, lent=self.router.lent(tier, info))
 
     def retried(
         self, model: str, tag: str
@@ -198,9 +200,11 @@ class LLMClient:
         rungs = self.router.ladder(tier)
         if rungs:
             return rungs
+        loans = self.router.free_only           # a paid ladder never lends
         with self._lock:
             spent = [self._quota[info.id][1] for info in candidates
-                     if info.id in self._quota]
+                     if info.id in self._quota
+                     and (loans or not self.router.lent(tier, info))]
         if spent:
             why = spent[0]
             raise QuotaExhausted(why.message, status=why.status, provider=why.provider)
@@ -230,7 +234,7 @@ class LLMClient:
         if self.cache is not None:
             text = prompt if identity is None else identity
             for info in candidates:
-                key = self._keyed(info, system, text, max_output_tokens)
+                key = self._keyed(tier, info, system, text, max_output_tokens)
                 if self.cache.get(key) is not None:
                     return Quote(info.id, 0, 0, 0.0, cached=True)
         info = self._rungs(tier, candidates)[0]
@@ -262,11 +266,12 @@ class LLMClient:
 
         text = prompt if identity is None else identity
         return self._cached(
-            self.router.candidates(tier), system, text, max_output_tokens, usable
+            tier, self.router.candidates(tier), system, text, max_output_tokens, usable
         )
 
     def _cached(
         self,
+        tier: Tier,
         candidates: list[ModelInfo],
         system: str,
         text: str,
@@ -276,7 +281,8 @@ class LLMClient:
         if self.cache is None:
             return None
         for info in candidates:
-            hit = self.cache.get(self._keyed(info, system, text, max_output_tokens))
+            key = self._keyed(tier, info, system, text, max_output_tokens)
+            hit = self.cache.get(key)
             if hit is not None and usable(hit):
                 return hit
         return None
@@ -312,7 +318,7 @@ class LLMClient:
             return completion.ok and (accept is None or accept(completion.text or ""))
 
         text = prompt if identity is None else identity
-        hit = self._cached(candidates, system, text, max_output_tokens, usable)
+        hit = self._cached(tier, candidates, system, text, max_output_tokens, usable)
         if hit is not None:
             self._emit("cache-hit", hit.model, tag)
             return hit
@@ -356,7 +362,7 @@ class LLMClient:
             good = usable(completion)
             if good and self.cache is not None:
                 self.cache.put(
-                    self._keyed(rung, system, text, max_output_tokens), completion
+                    self._keyed(tier, rung, system, text, max_output_tokens), completion
                 )
             # Reported once kept: a failing observer cannot lose a paid answer.
             self._emit("call", completion.model, tag,

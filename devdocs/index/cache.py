@@ -4,7 +4,8 @@ The key is a hash of everything that shapes the output: provider, model,
 system prompt, prompt, output cap, temperature and effort. Change any of them
 and the key changes, so a stale answer cannot be served for a new question.
 The prompt already embeds the source it documents, which is what makes an
-unchanged file a cache hit and an edited one a miss.
+unchanged file a cache hit and an edited one a miss. An answer a model gave
+on loan to a higher tier is keyed by that tier too, apart from its own.
 
 Only usable completions are stored. A blocked or empty response is not an
 answer worth replaying, and caching it would stop the next run retrying.
@@ -42,7 +43,8 @@ class ResponseCache:
         self.db = db
 
     @staticmethod
-    def key(request: Request, *, provider: str) -> str:
+    def key(request: Request, *, provider: str, lent: str = "") -> str:
+        """`lent` is the tier the request's model answers on loan, if any."""
         parts = [
             CACHE_VERSION,
             provider,
@@ -53,6 +55,8 @@ class ResponseCache:
             request.temperature,
             request.effort,
         ]
+        if lent:
+            parts.append(lent)      # last, so every other key stays as it was
         encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest()
 
