@@ -672,5 +672,66 @@ class TestDailyUsage(unittest.TestCase):
         self.assertEqual(quota_day(midday), "2026-06-02")
 
 
+class TestModelsOnLoan(ClientCase):
+    """Under free-tier pacing, a tier with no free model in reach borrows one."""
+
+    LISTED = frozenset(
+        {"gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.1-pro-preview"}
+    )
+
+    def free(self, client: LLMClient, quality: str = "cheap") -> None:
+        """A new run's router, on a free key that lists LISTED."""
+        client.router = Router("gemini", quality=quality, free_only=True,
+                               available=set(self.LISTED))
+
+    def test_an_answer_given_on_loan_is_found_by_every_later_run(self) -> None:
+        # Regression: it was cached under the lent model but looked for only
+        # among the tier's own, so every free-tier run bought the overview again.
+        flash = "gemini-3.8-flash"
+        client, model = self.make({flash: ok(flash)})
+        self.free(client)
+        self.assertEqual(client.complete(Tier.ARCHITECTURE, "SYS", "map").model, flash)
+        self.free(client)
+        self.assertTrue(client.complete(Tier.ARCHITECTURE, "SYS", "map").cached)
+        for router in (Router("gemini", free_only=True),     # estimate: no listing
+                       Router("gemini", available=set(self.LISTED))):     # --paid
+            client.router = router
+            self.assertTrue(client.quote(Tier.ARCHITECTURE, "SYS", "map").cached)
+            self.assertTrue(client.complete(Tier.ARCHITECTURE, "SYS", "map").cached)
+        self.assertEqual(model.calls, [flash])
+
+    def test_a_tier_whose_free_model_answers_404_finds_its_answer_on_loan(
+        self,
+    ) -> None:
+        pro, flash = "gemini-2.5-pro", "gemini-3.8-flash"
+        client, model = self.make({pro: ModelNotFound("gone"), flash: ok(flash)})
+        for _ in range(2):                  # two runs whose listing names pro
+            client.router = Router("gemini", free_only=True, available={pro, flash})
+            client.complete(Tier.ARCHITECTURE, "SYS", "map")
+        self.assertEqual(model.calls, [pro, flash])
+
+    def test_a_higher_quality_buys_its_own_answer_once(self) -> None:
+        lite, flash = "gemini-3.1-flash-lite", "gemini-3.8-flash"
+        client, model = self.make({lite: ok(lite), flash: ok(flash)})
+        self.free(client)
+        client.complete(Tier.FILE, "SYS", "page")
+        for _ in range(2):
+            self.free(client, quality="high")
+            self.assertEqual(client.complete(Tier.FILE, "SYS", "page").model, flash)
+        self.assertEqual(model.calls, [lite, flash])
+
+    def test_a_quota_spent_below_a_tier_stops_it_only_where_it_borrows(self) -> None:
+        flash = "gemini-3.8-flash"
+        for free_only, error in ((True, QuotaExhausted), (False, ConfigError)):
+            with self.subTest(free_only=free_only):
+                client, _ = self.make({flash: QuotaExhausted("day")})
+                client.router = Router("gemini", free_only=free_only,
+                                       available={flash})
+                with self.assertRaises(QuotaExhausted):
+                    client.complete(Tier.MODULE, "SYS", "summary")
+                with self.assertRaises(error):      # no architecture model listed
+                    client.complete(Tier.ARCHITECTURE, "SYS", "map")
+
+
 if __name__ == "__main__":
     unittest.main()

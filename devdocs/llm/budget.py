@@ -25,7 +25,15 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from devdocs.errors import BudgetExceeded, ConfigError, Interrupted, QuotaExhausted
-from devdocs.llm.catalog import ModelInfo, Tier, assume, find, ladder, tier_models
+from devdocs.llm.catalog import (
+    ModelInfo,
+    Tier,
+    assume,
+    find,
+    ladder,
+    lendable,
+    tier_models,
+)
 
 __all__ = ["Budget", "RateLimiter", "Router", "estimate_tokens", "token_ceiling"]
 
@@ -107,10 +115,27 @@ class Router:
 
         A cached answer is already paid for, so a model since retired or no
         longer listed can still serve it; only calling it is off the table.
+        The free models below the tier come last, for what they answered it
+        on loan (`lent`).
         """
         if self.pinned:
             return [self._pin()]
-        return tier_models(self.provider, self._start(tier))
+        start = self._start(tier)
+        return tier_models(self.provider, start) + lendable(self.provider, start)
+
+    def lent(self, tier: Tier, info: ModelInfo) -> str:
+        """The tier `info` serves on loan for `tier` work, or "" if none.
+
+        When no free model of a tier can serve it, a free-only ladder lends it
+        the strongest free model below. Those answers are cached under the
+        tier they were lent to, apart from what the model answers for its own
+        tier: later runs find them, and a quality setting that starts higher
+        never takes a lower tier's own answer for one of its own.
+        """
+        if self.pinned:
+            return ""
+        start = self._start(tier)
+        return start.value if info in lendable(self.provider, start) else ""
 
     def _pin(self) -> ModelInfo:
         assert self.pinned is not None
