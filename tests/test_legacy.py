@@ -78,7 +78,8 @@ class TestTranslation(InTempDir):
                          ["generate", ".", "--per-file", "--out", "docs"])
 
     def test_nothing_is_forced(self) -> None:
-        # v4 writes paths v3 never did; forced, it replaced hand-written files there
+        # v4 writes paths v3 never did; forced, it would replace hand-written
+        # files there
         self.assertNotIn("--force", translate([]))
         self.assertEqual(translate(["--overwrite"]), translate([]))
 
