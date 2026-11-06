@@ -37,7 +37,7 @@ from devdocs.render.pdf import PdfRenderer
 from devdocs.render.pdf.check import PdfFile
 from devdocs.scan import Role, Scanner
 from tests.test_markdown import file_doc, shop, sym
-from tests.test_pdf import shown
+from tests.test_pdf_layout import shown
 
 HOSTILE = "</script><img src=x onerror=alert(1)>"
 SITE_POLICY = ("default-src 'none'; style-src 'self'; script-src 'self'; "

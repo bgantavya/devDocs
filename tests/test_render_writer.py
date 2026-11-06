@@ -470,8 +470,8 @@ class TestConflicts(WriterCase):
     def test_a_write_that_dies_midway_leaves_a_record_of_its_files(self) -> None:
         """A rename failing, as over a file Windows holds open: the files
         renamed by then stay, the rest are as they were, and the manifest,
-        renamed first, lists them all. Regression: the hint asked for write
-        access to a directory devdocs could write."""
+        renamed first, lists them all. The hint names the file, not write
+        access to a directory devdocs can write."""
         self.write({"a.md": b"A\n"})
         real_replace = os.replace
 
@@ -536,8 +536,8 @@ class TestFailures(WriterCase):
     def test_a_name_the_file_system_cannot_hold_changes_nothing(self) -> None:
         """Regression: on macOS a page named for a Linux file holding a byte
         that is not UTF-8 ended the run as an internal error, after earlier
-        pages and the manifest had been replaced. The byte sits past the
-        first 40 characters, where an older temp name did not reach."""
+        pages had been replaced. The byte sits past the first 40 characters,
+        where an older temp name did not reach."""
         self.write({"a.md": b"A\n", "sub/b.md": b"B\n"})
         before, dirs = self.tree(), self.dirs()
         for name in (f"{'x' * 50}{ODD}.py.md", f"new/{ODD}/x.py.md"):
@@ -573,8 +573,8 @@ class TestFailures(WriterCase):
         self.assertEqual(caught.exception.hint, "choose an --out whose path is UTF-8")
 
     def test_an_out_the_file_system_cannot_name_is_named(self) -> None:
-        """Regression: where the out dir's path, not a page's, holds bytes
-        that are not UTF-8, the hint said to rename a source file."""
+        """Where the out dir's path, not a page's, holds bytes that are not
+        UTF-8, the hint names --out, not a source file."""
         for out in (self.base / f"docs-{ODD}", self.base / ODD / "docs"):
             with self.subTest(out=out):
                 self.out = out
@@ -589,7 +589,7 @@ class TestFailures(WriterCase):
 
     @unittest.skipIf(os.name == "nt", "Windows has its own limits and errors")
     def test_an_out_whose_path_is_too_long_is_named(self) -> None:
-        """Regression: the hint said to shorten a source file's name."""
+        """The hint names --out, not a source file's name to shorten."""
         self.out = self.base / ("d" * 300) / "docs"
         with self.assertRaises(ConfigError) as caught:
             self.write({"a.md": b"A\n"})
@@ -653,8 +653,8 @@ class TestFailures(WriterCase):
 
     @unittest.skipUnless(hasattr(os, "chflags"), "BSD file flags")
     def test_a_file_flagged_immutable_is_named_with_what_to_do(self) -> None:
-        """Its rename fails midway. Regression: the hint asked for write
-        access to the out dir, which devdocs had."""
+        """Its rename fails midway. The hint names the file, not write
+        access to the out dir, which devdocs has."""
         self.write({"a.md": b"A\n", "b.md": b"B\n"})
         target = self.out / "b.md"
         try:
@@ -674,9 +674,9 @@ class TestFailures(WriterCase):
         self.assertEqual(self.write(pages).written, ["b.md"])
 
     def test_only_one_temp_file_is_there_at_a_time(self) -> None:
-        """Regression: every temp file was written before any was renamed,
-        so a rewrite needed room on the disk for all its files at once, and
-        a process killed midway left them all behind."""
+        """Each temp file is renamed before the next is written, so a rewrite
+        needs room for one more file at a time, and a killed process leaves
+        at most one temp file."""
         self.write({f"p{n}.md": b"old\n" for n in range(5)})
         counts: list[int] = []
         real_fsync = os.fsync

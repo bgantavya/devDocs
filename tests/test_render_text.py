@@ -1,7 +1,7 @@
 """The text helpers every renderer shares: CommonMark code spans, relative
-links between pages, URL encoding and the file-name fold. Each was copied
-into two or three renderers before, and the copies had drifted; these tests
-hold the one behaviour they all get now."""
+links between pages, URL encoding and the file-name fold, each defined once
+(Markdown and the style guard each kept a copy of the code-span reader
+before). These tests hold the one behaviour every renderer gets."""
 
 from __future__ import annotations
 
@@ -51,14 +51,14 @@ class TestCodeText(unittest.TestCase):
         self.assertEqual(code_text("`   `"), "   ")
 
     def test_only_spaces_count_as_padding(self) -> None:
-        # Regression: the PDF's copy took ` \t ` for spaces alone and kept its
-        # padding; CommonMark strips it, as the HTML copy did.
+        # CommonMark strips one space from each end only when both ends are
+        # spaces and the span is not all spaces; a tab is not padding.
         self.assertEqual(code_text("` \t `"), "\t")
         self.assertEqual(code_text("`\ta\t`"), "\ta\t")
 
     def test_a_line_break_is_a_space_before_padding_is_judged(self) -> None:
-        # Regression: both copies dropped a break before the closing
-        # backticks, so `` a<LF>`` showed " a" where CommonMark shows "a".
+        # A line break is a space before the padding is judged, so `` a<LF>``
+        # shows "a", as in CommonMark.
         self.assertEqual(code_text("`` a\n``"), "a")
         self.assertEqual(code_text("`a\nb`"), "a b")
         self.assertEqual(code_text("`a\r\nb`"), "a b")
@@ -81,8 +81,8 @@ class TestRelpath(unittest.TestCase):
                 self.assertEqual(relpath(path, start), expected)
 
     def test_the_file_name_stays_where_a_directory_on_the_way_shares_it(self) -> None:
-        # The PDF's copy kept the name; the Markdown and HTML copies gave the
-        # directory itself, "." or "..".
+        # From a page under `a.md/`, the file `a.md` is ../a.md, never ".",
+        # the directory itself.
         self.assertEqual(relpath("a.md", "a.md"), "../a.md")
         self.assertEqual(relpath("pkg/a", "pkg/a/b"), "../../a")
 
@@ -110,7 +110,7 @@ class TestUrlPath(unittest.TestCase):
     def test_sub_delimiters_are_encoded_too(self) -> None:
         # Regression: Markdown's copy kept them, and CommonMark reads a
         # character reference in a link destination, so `f&ouml;.py` linked
-        # to `fö.py`; the HTML copy encoded them all.
+        # to `fö.py`.
         self.assertEqual(url_path("f&ouml;.py.md"), "f%26ouml%3B.py.md")
         self.assertEqual(url_path("!$'*+,;=@"), "%21%24%27%2A%2B%2C%3B%3D%40")
 
