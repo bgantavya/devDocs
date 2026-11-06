@@ -55,6 +55,7 @@ __all__ = [
     "catalogued",
     "find",
     "ladder",
+    "lendable",
     "tier_models",
 ]
 
@@ -477,4 +478,16 @@ def tier_models(provider: str, tier: Tier) -> list[ModelInfo]:
     return [
         info for step in _steps(tier) for info in CATALOG
         if info.routed and info.provider == provider and info.tier is step
+    ]
+
+
+def lendable(provider: str, tier: Tier) -> list[ModelInfo]:
+    """The free models below `tier`, strongest first: those a free-only
+    `ladder` may lend it when no free model of its own can serve it."""
+    if tier not in _ORDER:
+        return []
+    return [
+        info for lower in reversed(_ORDER[: _ORDER.index(tier)]) for info in CATALOG
+        if info.routed and info.provider == provider and info.tier is lower
+        and info.free_rpm
     ]
