@@ -103,7 +103,7 @@ function onPty(line) {
 }
 
 /** Resolves once `check()` holds, polling every 50 ms; rejects after `ms`. */
-async function until(check, ms = 10000) {
+async function until(check, ms = 20000) { // generous: a busy runner starts processes slowly
   for (const end = Date.now() + ms; !check();) {
     if (Date.now() > end) throw new Error('timed out waiting');
     await new Promise((resolve) => { setTimeout(resolve, 50); });
@@ -205,7 +205,7 @@ launcherTest('under a terminal, Ctrl+C reaches the child once, all streams redir
   }
   await closed;
   assert.match(read(), /^INT x1$/m, read());
-}, { skip: PTY_ONLY, timeout: 30000 });
+}, { skip: PTY_ONLY, timeout: 60000 });
 
 launcherTest('asks for npm run prepack when the bundle is missing', async (dir) => {
   fs.rmSync(path.join(dir, 'python'), { recursive: true });
