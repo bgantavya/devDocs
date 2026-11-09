@@ -1,0 +1,4 @@
+# devdocs documents this repository into site/ from any directory in it, leaving the hand-written docs/ alone.
+[devdocs]
+path = "."
+out = "site"
