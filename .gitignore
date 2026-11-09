@@ -50,6 +50,6 @@ npm/python/
 npm/LICENSE
 npm/*.tgz
 
-# devdocs: its own state, and its docs output
+# devdocs: its own state, and its output for this repository (devdocs.toml)
 .devdocs/
-docs/
+/site/
