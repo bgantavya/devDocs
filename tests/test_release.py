@@ -709,6 +709,12 @@ class TestGitCommands(unittest.TestCase):
     def test_lint_passes_an_empty_range(self) -> None:
         self.assertEqual(self.cli("lint-commits", "main..main")[:2], (0, ""))
 
+    def test_lint_leaves_out_what_another_revision_has(self) -> None:
+        code, out, err = self.cli("lint-commits", "v1.0.0..main", "^topic")
+        readme = self.hashes["readme"]
+        self.assertEqual((code, out), (1, f"{readme} Update README.md\n"))
+        self.assertIn("1 of 3 commits", err)    # topic has feat, fix, docs and perf
+
     def test_a_git_failure_exits_1(self) -> None:
         code, _, err = self.cli("lint-commits", "no-such-ref..main")
         self.assertEqual(code, 1)

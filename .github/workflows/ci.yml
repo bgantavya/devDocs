@@ -153,7 +153,11 @@ jobs:
       - name: Lint the subjects of the commits this pull request adds
         env:
           BASE_REF: ${{ github.base_ref }}
-        run: python scripts/release.py lint-commits "origin/${BASE_REF}..HEAD"
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        # what a merge brings in from the default branch is not this pull request's
+        run: >-
+          python scripts/release.py lint-commits
+          "origin/${BASE_REF}..HEAD" "^origin/${DEFAULT_BRANCH}"
 
   package:
     name: Package
