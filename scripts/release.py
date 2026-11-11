@@ -30,7 +30,7 @@ Commands, run from the repository root:
     python scripts/release.py check                 versions agree, or exit 1
     python scripts/release.py next [--json]         the release due now, if any
     python scripts/release.py bump VERSION          write VERSION to both files
-    python scripts/release.py lint-commits RANGE    flag non-conventional subjects
+    python scripts/release.py lint-commits REV...   flag non-conventional subjects
     python scripts/release.py notes RANGE           Markdown release notes
 
 Exit status: 0 success; 1 a failed check, or a git or file error; 2 bad usage,
@@ -555,7 +555,7 @@ def git(root: Path, *args: str) -> str:
     return done.stdout
 
 
-def log(root: Path, revisions: str) -> list[tuple[str, str]]:
+def log(root: Path, *revisions: str) -> list[tuple[str, str]]:
     """(short hash, full message) of each non-merge commit in `revisions`.
 
     Oldest first, in topological order, so the result does not depend on
@@ -565,7 +565,7 @@ def log(root: Path, revisions: str) -> list[tuple[str, str]]:
     out = git(
         root, "log", "--no-merges", "--topo-order", "--reverse",
         "--no-show-signature", "-z", "--format=%h%x1f%B",
-        "--end-of-options", revisions, "--",
+        "--end-of-options", *revisions, "--",
     )
     commits: list[tuple[str, str]] = []
     for record in out.split("\0"):
@@ -640,7 +640,7 @@ def cmd_bump(args: argparse.Namespace) -> int:
 
 
 def cmd_lint_commits(args: argparse.Namespace) -> int:
-    commits = log(args.root, args.range)
+    commits = log(args.root, *args.revisions)
     offenders = [
         (short, subject_of(message) or "(empty message)")
         for short, message in commits
@@ -703,9 +703,13 @@ def build_parser() -> argparse.ArgumentParser:
     bump.set_defaults(handler=cmd_bump)
 
     lint = commands.add_parser(
-        "lint-commits", help="list commits in RANGE whose subject is not conventional"
+        "lint-commits",
+        help="list commits in the revisions whose subject is not conventional",
     )
-    lint.add_argument("range", metavar="RANGE", help="git range, e.g. origin/v4..HEAD")
+    lint.add_argument(
+        "revisions", metavar="REV", nargs="+",
+        help="revisions as git log takes them, e.g. origin/v4..HEAD ^origin/master",
+    )
     lint.set_defaults(handler=cmd_lint_commits)
 
     notes = commands.add_parser("notes", help="print Markdown release notes for RANGE")
