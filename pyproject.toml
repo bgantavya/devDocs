@@ -57,7 +57,7 @@ dev = [
 Homepage = "https://github.com/bgantavya/devDocs"
 Repository = "https://github.com/bgantavya/devDocs"
 Issues = "https://github.com/bgantavya/devDocs/issues"
-Documentation = "https://github.com/bgantavya/devDocs#readme"
+Documentation = "https://github.com/bgantavya/devDocs/tree/v4/docs"
 
 [project.scripts]
 devdocs = "devdocs.cli:main"
