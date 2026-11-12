@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a new feature, or a change to how devdocs works. For a crash or an error, use "Bug report"; for a page devdocs wrote that is wrong or unclear, use "Generated docs problem".
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        devdocs runs on the Python standard library alone and keeps the cost of a run low, so a proposal that needs a new runtime dependency, or more model calls, should say why it is worth that. Search the existing issues first: the idea may have been discussed already.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way. A real case helps most.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: The solution you would like
+      description: What devdocs should do, such as a command, a flag, a setting or an output format, and what it would print or write.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Other ways to solve the problem, including what you do today.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Anything else that helps, such as an example project, or how other tools handle this.

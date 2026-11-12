@@ -1,0 +1,149 @@
+name: Generated docs problem
+description: A page devdocs wrote is wrong, incomplete or unclear. For a crash, an error message or a wrong exit status, use "Bug report".
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a page devdocs wrote: a fact that is false, something missing, prose that misleads, or broken links or layout. A crash, an error message or a wrong exit status is a **Bug report**.
+
+        A page with facts but no prose can be by design: devdocs pays a model only where prose adds most, within the run's cost limits, as [what gets prose](https://github.com/bgantavya/devDocs/blob/v4/docs/costs.md#what-gets-prose) explains. `devdocs estimate --explain` shows why a file got none.
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      description: Every format that shows the problem.
+      multiple: true
+      options:
+        - Markdown
+        - HTML
+        - PDF
+    validations:
+      required: true
+
+  - type: dropdown
+    id: problem
+    attributes:
+      label: What is wrong
+      options:
+        - A fact is false (a signature, type or default)
+        - Something is missing (a file, a symbol, a page)
+        - The prose misleads or says too little
+        - Links, layout or rendering
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: source-path
+    attributes:
+      label: Source file
+      description: The path, from the project root, of the file the page documents. For a directory's page, give the directory; for the architecture overview, write `architecture`.
+      placeholder: shop/cart.py
+    validations:
+      required: true
+
+  - type: textarea
+    id: source-excerpt
+    attributes:
+      label: Source excerpt
+      description: A short excerpt of the code the page documents, such as the declaration the page gets wrong. Not the whole file.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: page-excerpt
+    attributes:
+      label: What devdocs wrote
+      description: The excerpt of the page that is wrong, copied as text. For a PDF, give the page number too.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: should-say
+    attributes:
+      label: What it should say
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: devdocs version
+      description: The `generator` of the run in `index.json`, in the output directory (`run.generator`), or what `devdocs --version` prints if that version wrote the page.
+      placeholder: devdocs 4.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: The `provider` of the run in `index.json` (`run.provider`).
+      options:
+        - gemini
+        - anthropic
+        - anthropic-sdk
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The page's `mode`, `model` and `tier`, from the `meta` of its document in `index.json`. A Markdown page carries them in its front matter too, and an HTML page names the model under its title ("prose by ..."). A page whose mode is `stub` was written from facts alone, by no model.
+      placeholder: "mode: prose, model: gemini-2.5-flash-lite, tier: file"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: quality
+    attributes:
+      label: Quality
+      description: The `quality` setting of the run, from its `--quality`, `DEVDOCS_QUALITY` or devdocs.toml, else the default, `cheap`. Unless the run had `--quality`, `devdocs doctor --offline` shows it on its `config` line.
+      options:
+        - cheap
+        - balanced
+        - high
+    validations:
+      required: true
+
+  - type: dropdown
+    id: context
+    attributes:
+      label: Context
+      description: The `context` setting of the run, from its `--context`, `DEVDOCS_CONTEXT` or devdocs.toml, else the default, `standard`. Unless the run had `--context`, the same `config` line shows it.
+      options:
+        - "off"
+        - standard
+        - semantic
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pdf-engine
+    attributes:
+      label: PDF engine
+      description: For a PDF only. The engine that printed it, from the `--pdf-engine` of the command that wrote it, `DEVDOCS_PDF_ENGINE` or devdocs.toml, else the default, `builtin`.
+      options:
+        - builtin
+        - chrome
+        - weasyprint
+
+  - type: textarea
+    id: explain
+    attributes:
+      label: The file's line in devdocs estimate --explain
+      description: Optional. Run `devdocs estimate --explain` with the run's settings and paste the line for this file, which gives its plan and the reason.
+      render: text
+
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Before you submit
+      options:
+        - label: The excerpts above hold no secret, and no code I may not share.
+          required: true
