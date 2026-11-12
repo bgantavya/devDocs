@@ -1,0 +1,123 @@
+name: Bug report
+description: devdocs crashes, prints an error you did not expect, exits with the wrong status, or a command does not do what its documentation says. For a page devdocs wrote that is wrong or unclear, use "Generated docs problem".
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when devdocs itself misbehaves: a crash or an `internal error`, an error message that is wrong, a wrong exit status, or a command or flag that does not do what [the command reference](https://github.com/bgantavya/devDocs/blob/v4/docs/commands.md) says. For a page devdocs wrote that is wrong, incomplete or unclear, open a **Generated docs problem** instead.
+
+        Do not report a vulnerability here: follow the [security policy](https://github.com/bgantavya/devDocs/blob/v4/SECURITY.md). Remove API keys and anything private from what you paste.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What devdocs did, including any error message and the exit status (`echo $?` in a POSIX shell, `$LASTEXITCODE` in PowerShell).
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order, with any API key removed, and what about the project matters, such as its languages, its size or its devdocs.toml.
+      placeholder: |
+        1. devdocs estimate --explain
+        2. devdocs generate --format html
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: What devdocs printed, on both stdout and stderr. Paste it as text rather than a screenshot. For an `internal error`, run the command again with `DEVDOCS_DEBUG=1` set, and paste the traceback it adds.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: devdocs version
+      description: What `devdocs --version` prints.
+      placeholder: devdocs 4.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed devdocs
+      options:
+        - pipx
+        - uv
+        - pip in a virtual environment
+        - Installer script (install.sh or install.ps1)
+        - npm (@bgantavya/devdocs)
+        - Docker image or compose
+        - From source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: The version devdocs runs on, as the first line of `devdocs doctor --offline` shows it.
+      placeholder: "3.13"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: The provider the command used, which is its `--provider` if it had one, else the one that the `config` line of `devdocs doctor --offline` shows. Pick "No model call" for a command that calls no model, such as estimate or export.
+      options:
+        - gemini
+        - anthropic
+        - anthropic-sdk
+        - No model call
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of devdocs doctor --offline
+      description: |
+        Run `devdocs doctor --offline` in the project directory, with the command's `--provider` if it had one, and paste what it prints. It checks Python, SQLite, TLS and the CA certificates, lists the PDF engines it finds, shows the configuration in effect (provider, quality, context, limits and formats), and says where the API key comes from: the flag, the variable's name or the config file's path, never the key itself. `--offline` skips the provider check, so it sends nothing. It shows local paths, such as those of the PDF engines; edit them if you prefer. If devdocs does not start at all, paste the error instead.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Anything else that helps, such as your devdocs.toml without its api_key, or whether an earlier version behaved differently.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed API keys and anything private from what I pasted.
+          required: true
+        - label: I searched the existing issues for this problem.
