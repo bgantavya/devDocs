@@ -1,6 +1,6 @@
 {
   "name": "@bgantavya/devdocs",
-  "version": "4.0.0-dev.0",
+  "version": "4.0.0",
   "description": "Documentation from source code: exact facts from parsers, model prose only where it adds something, on a hard budget. Runs the bundled devdocs with your Python 3.11+.",
   "keywords": [
     "cli",
