@@ -8,6 +8,6 @@ nothing else in.
 change without a major version bump.
 """
 
-__version__ = "4.0.0.dev0"
+__version__ = "4.0.0"
 
 __all__ = ["__version__"]

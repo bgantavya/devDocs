@@ -6,6 +6,8 @@ This file sums up what changed for users. From 4.0.0, the full notes of each rel
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-13
+
 devdocs 4.0.0 is a rewrite of the 3.x line from the ground up. It needs Python 3.11 or later and installs no dependencies. Parsers supply the exact facts, such as signatures, structure and docstrings, and a model, Google Gemini or Anthropic Claude, writes prose only where it adds something, within a cost limit checked before every call. It writes Markdown, an HTML site and PDF, caches the answers it pays for, and resumes a run that stopped. It ships on PyPI as `devDocs`, on npm as `@bgantavya/devdocs`, and as the container image `ghcr.io/bgantavya/devdocs`.
 
 Upgrading from 3.x is a breaking change: the command, its command line, what gets documented and the pages written all differ. Breaking changes are marked **Breaking** below, and [docs/migration.md](docs/migration.md) explains each one and what to do.
@@ -140,7 +142,8 @@ These are defects of 3.0.0 that 4.0.0 fixes.
 
 - The `devDocs` command, as the repository's first commit has it. It walks a project and writes a Markdown README for each file and folder that its name filters keep, and one for the project, with Google Gemini (`gemini-2.0-flash-lite`), waiting a second before each call and asking for the API key at a prompt. Its flags are `-p`/`--path`, `--name`, `--description`, `--authors`, `--keywords`, `--overwrite`, `--output`, `--exclude` and `--include`. It declares Python 3.8 or later.
 
-[Unreleased]: https://github.com/bgantavya/devDocs/compare/v3.0.0...v4
+[Unreleased]: https://github.com/bgantavya/devDocs/compare/v4.0.0...v4
+[4.0.0]: https://github.com/bgantavya/devDocs/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/bgantavya/devDocs/compare/v2.0.7...v3.0.0
 [2.0.7]: https://github.com/bgantavya/devDocs/compare/v2.0.6...v2.0.7
 [2.0.6]: https://github.com/bgantavya/devDocs/compare/03d2b15879b092e0469b7f21abd9181d0c417d22...v2.0.6
