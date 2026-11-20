@@ -1,0 +1,1253 @@
+"""A run: scan, parse, plan, ask, compose, render — resumably and on budget.
+
+`Pipeline.prepare` does everything that costs nothing: the scan, parsing,
+the import graph, git history, the plan, the known-issue sweep and the
+retrieval indexes that give each prompt its cross-file context. `price`
+builds every prompt the plan implies, quotes it against the catalog and the
+response cache, and cuts the plan to the budget. `estimate` stops there;
+`run` goes on to send exactly what was priced, so an estimate describes the
+run that would follow it. Both steps only read the index, so an estimate
+changes nothing stored there.
+
+Calls go out on a thread pool in three waves — files, then modules (which
+read the files' purposes), then the architecture overview (which reads the
+modules') — most valuable first, so a budget or quota stop cuts the least
+useful work. Every paid answer is cached the moment it lands, so an interrupted
+run writes what it has, stubs the rest, and resumes next time without paying
+twice. The run ledger records how each run ended.
+
+Embedding comes first, in semantic mode, and is retried like any call. If it
+still fails the run goes on: a file with no vector gets the standard context.
+
+A stop request (the client's `stop` set, as the CLI does on Ctrl-C or
+SIGTERM) sends nothing more, but the waves still run through: calls already
+sent finish and are kept, and every other prompt gets the answer an earlier
+run paid for, from the cache, or a stub. So a stop never costs a page that
+was already bought, and the run is recorded as interrupted, to resume.
+
+Rendering comes last and costs nothing: one renderer per configured format
+turns the composed documents into files. A format whose renderer fails, such
+as an external PDF engine, costs only itself: the others and the manifest
+are still written. `export` renders the documents of the last run again,
+read back from its manifest, so another format, or one that failed, needs
+neither a key nor a model.
+
+Which files a run writes depends on its documents, not on their prose. So
+before the first paid call, `check` renders the documents with the prose the
+cache holds, a placeholder for what the budget lets the run buy, and has the
+writer refuse now what it would refuse once paid for: a file devdocs did not
+write in the way, a name the file system cannot hold, an out dir it cannot
+write.
+"""
+
+from __future__ import annotations
+
+import builtins
+import contextlib
+import hashlib
+import json
+import os
+import posixpath
+import shlex
+import sys
+import time
+import tomllib
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from pathlib import Path
+
+from devdocs import __version__
+from devdocs.compose import Composer, Prose, docstring_summary, first_sentence
+from devdocs.config import Config
+from devdocs.context import StructuralContext
+from devdocs.errors import (
+    AuthError,
+    BudgetExceeded,
+    ConfigError,
+    DevDocsError,
+    Interrupted,
+    ProviderError,
+    QuotaExhausted,
+)
+from devdocs.graph import GraphBuilder, ProjectGraph
+from devdocs.history import FileHistory, GitHistory
+from devdocs.index.chunk import Chunk, ChunkStore, chunk_file
+from devdocs.index.db import Database
+from devdocs.index.embed import Embeddings
+from devdocs.index.ledger import RunLedger, config_fingerprint
+from devdocs.index.search import LexicalIndex, VectorIndex
+from devdocs.issues import Issue, find_issues
+from devdocs.llm import Completion, Embedder
+from devdocs.llm.catalog import assume, find
+from devdocs.llm.client import CallEvent, LLMClient
+from devdocs.llm.providers import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
+from devdocs.llm.stop import leave_signals
+from devdocs.parse import Confidence, FileFacts, get_parser
+from devdocs.plan import Plan, Planner, PlannerOptions, fit_to_budget
+from devdocs.prompting import Prompt, PromptBuilder
+from devdocs.render import (
+    MANIFEST,
+    OutputWriter,
+    Renderer,
+    WriteReport,
+    generated_files,
+    read_manifest,
+    renderer_for,
+)
+from devdocs.render.model import DocSet, Layout, Mode, RunInfo
+from devdocs.render.style import Reply, StyleGuard, acceptable, parse_reply
+from devdocs.render.text import counted
+from devdocs.retrieve import Retriever
+from devdocs.scan import Scanner, ScanResult, SourceFile
+
+__all__ = [
+    "Estimate",
+    "ExportSummary",
+    "Pipeline",
+    "Prepared",
+    "PricedItem",
+    "RunSummary",
+    "project_name",
+]
+
+_QUALITY = {
+    "cheap": PlannerOptions(),
+    "balanced": PlannerOptions(coverage=0.35, min_prose_files=40),
+    "high": PlannerOptions(coverage=0.6, min_prose_files=60, include_documented=True),
+}
+
+# Semantic context may claim at most this share of either limit.
+_EMBED_SHARE = 0.5
+
+# Stops after which nothing can be asked; after "interrupted" the cache can.
+_EXHAUSTED = frozenset({"budget", "quota"})
+
+# The check's stand-in for prose still to buy: a purpose no reply has, as the
+# guard strips control characters from every one.
+_UNBOUGHT = Prose(reply=Reply(purpose="\x00Prose still to buy.\x00"), model="", tier="")
+
+# On Windows a Ctrl-C may not wake a lock wait; waking this often lets its
+# handler run.
+_TICK: float | None = 0.5 if sys.platform == "win32" else None
+
+_SHOWN_WARNINGS = 10     # per renderer in the log; summaries keep them all
+# What a format's warnings mean, and how to avoid them.
+_WARNINGS = {
+    "pdf": ("characters outside the built-in fonts were printed as '?'",
+            "for all of Unicode, use --pdf-engine chrome or --pdf-engine weasyprint"),
+}
+
+_JS_GLOBALS = frozenset({
+    "Array", "ArrayBuffer", "Boolean", "Date", "Error", "JSON", "Map", "Math",
+    "Number", "Object", "Promise", "Proxy", "Reflect", "RegExp", "Set",
+    "String", "Symbol", "TypeError", "URL", "WeakMap", "WeakSet", "console",
+    "document", "fetch", "globalThis", "process", "require", "window",
+    "undefined", "null", "true", "false", "this", "async", "await",
+})
+
+
+@dataclass
+class Prepared:
+    """Everything a run knows before spending anything."""
+
+    root: Path
+    files: dict[str, SourceFile]            # documentable files
+    sources: dict[str, str]
+    facts: dict[str, FileFacts]
+    hashes: dict[str, str]
+    graph: ProjectGraph
+    plan: Plan
+    issues: dict[str, list[Issue]]
+    head: str
+    skipped: dict[str, str]
+    languages: dict[str, int]
+    prompts: dict[tuple[str, str], Prompt] = field(default_factory=dict)
+    chunks: dict[str, list[Chunk]] = field(default_factory=dict)   # by file
+    retriever: Retriever | None = None
+    cut: list[tuple[str, str]] = field(default_factory=list)   # by `price`, to fit
+
+
+@dataclass(frozen=True)
+class PricedItem:
+    kind: str
+    key: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost: float          # worst case: the full output cap is used
+    cached: bool
+    requests: int = 1
+
+
+@dataclass
+class Estimate:
+    items: list[PricedItem] = field(default_factory=list)
+    # each item cut to fit, with the limit that cut it; see `fit_to_budget`
+    demoted: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    @property
+    def demoted_by(self) -> list[str]:
+        """The limits that cut the plan, as the config names them: none,
+        either or both."""
+        return [name for name in ("max_cost", "max_requests")
+                if name in self.demoted.values()]
+
+    @property
+    def requests(self) -> int:
+        return sum(item.requests for item in self.items if not item.cached)
+
+    @property
+    def cached(self) -> int:
+        return sum(1 for item in self.items if item.cached)
+
+    @property
+    def cost(self) -> float:
+        return sum(item.cost for item in self.items if not item.cached)
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(item.input_tokens for item in self.items if not item.cached)
+
+    @property
+    def output_tokens(self) -> int:
+        return sum(item.output_tokens for item in self.items if not item.cached)
+
+
+@dataclass
+class RunSummary:
+    run_id: str = ""
+    resumed: bool = False
+    documents: int = 0
+    prose: int = 0
+    stubs: int = 0
+    requests: int = 0
+    cache_hits: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+    stopped: str = ""        # "" | "budget" | "quota" | "interrupted"
+    failed: list[tuple[str, str, str]] = field(default_factory=list)
+    degraded: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    written: WriteReport = field(default_factory=WriteReport)
+    semantic_fallback: str = ""   # why embedding failed, leaving standard context
+
+
+@dataclass
+class ExportSummary:
+    """What `Pipeline.export` rendered, from which run, and where."""
+
+    documents: int = 0
+    formats: list[str] = field(default_factory=list)
+    out: str = ""
+    generated_at: str = ""   # when the exported run wrote its documents
+    warnings: list[str] = field(default_factory=list)
+    written: WriteReport = field(default_factory=WriteReport)
+
+
+def project_name(root: Path) -> str:
+    """The project's own name for itself, from its manifest, else the folder."""
+    try:
+        data = tomllib.loads((root / "pyproject.toml").read_text("utf-8"))
+        name = (data.get("project") or {}).get("name") or (
+            (data.get("tool") or {}).get("poetry") or {}
+        ).get("name")
+        if isinstance(name, str) and name:
+            return name
+    except (OSError, ValueError):
+        pass
+    try:
+        data = json.loads((root / "package.json").read_text("utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("name"), str):
+            return str(data["name"])
+    except (OSError, ValueError):
+        pass
+    try:
+        data = tomllib.loads((root / "Cargo.toml").read_text("utf-8"))
+        name = (data.get("package") or {}).get("name")
+        if isinstance(name, str) and name:
+            return name
+    except (OSError, ValueError):
+        pass
+    return root.resolve().name
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _still_there(path: Path) -> bool:
+    """False only for a path nothing is at. `os.path.lexists` says that too of
+    a file in a directory this run cannot read, which is merely left out."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _retry(fmt: str, err: DevDocsError, config: Config) -> str:
+    """A failed format's error, as a run reports it: with how to make that
+    format later without a key, from the manifest the run still wrote. The
+    command names the project, the out dir and a PDF's options as this run's
+    did, when only its command line gave them; the file and the environment
+    tell `export` as they told this run."""
+    project = (f" {shlex.quote(str(config.path))}"
+               if config.origin_of("path") == "flag" else "")
+    flags = (f" --out {shlex.quote(str(config.out))}"
+             if config.origin_of("out") == "flag" else "")
+    if fmt == "pdf":
+        given = {"pdf_engine": f" --pdf-engine {config.pdf_engine}",
+                 "page_size": f" --page-size {config.page_size}",
+                 "pdf_split": " --split" if config.pdf_split else " --no-split"}
+        flags += "".join(flag for name, flag in given.items()
+                         if config.origin_of(name) == "flag")
+    retry = (f"`devdocs export{project} --format {fmt}{flags}` makes it from the "
+             "manifest, with no key")
+    hint = f"{err.hint}; {retry}" if err.hint else retry
+    return f"{err.message}\n  hint: {hint}"
+
+
+def _again(summary: RunSummary, cut: int, answers: int, vectors: int) -> str:
+    """What running again costs, said when a run's write is refused, which
+    leaves its summary unshown: nothing once every item is answered and every
+    chunk embedded, else the rest; and why that is left. `cut` items were over
+    budget, which the answers now cached make room for. `answers` is how many
+    the run holds, bought now or earlier: with none, none are cached to speak
+    of. `vectors` is how many chunks the next run would embed."""
+    failed = len(summary.failed)
+    why = (f"stopped early ({summary.stopped})" if summary.stopped
+           else f"{failed:,} item{'' if failed == 1 else 's'} failed" if failed
+           else f"{cut:,} item{'' if cut == 1 else 's'} over budget" if cut
+           else "")
+    if not why:
+        held = "the answers are cached" if answers else "no answers were needed"
+        if vectors:
+            chunks = f"{vectors:,} chunk{'' if vectors == 1 else 's'}"
+            return f"{held}, so running again pays only to embed {chunks}"
+        return f"{held}, so running again costs nothing"
+    if not answers:
+        return f"{why} and no answer was bought, so running again has them all to buy"
+    return (f"{why}: the answers bought are cached, so running again pays only "
+            "for the rest")
+
+
+class Pipeline:
+    """One configured run over one project.
+
+    `client` is required for `price`, `estimate` and `run`; `prepare`,
+    `check`, `write` and `export` need none. `log` receives one-line progress
+    messages for the CLI, and `warn` what must be said even with progress
+    silenced; without it, that goes to `log`, marked as a warning. Without
+    `renderers`, there is one per configured format, built now so that a
+    missing PDF engine fails before any call. `warnings` and `failures`
+    describe the last write.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        client: LLMClient | None = None,
+        db: Database | None = None,
+        renderers: Sequence[Renderer] | None = None,
+        log: Callable[[str], None] | None = None,
+        warn: Callable[[str], None] | None = None,
+        project: str = "",
+        description: str = "",
+    ) -> None:
+        self.config = config
+        self.client = client
+        self.db = db
+        self.root = Path(config.path).resolve()
+        self.renderers = list(renderers) if renderers is not None else [
+            renderer_for(fmt, split=config.pdf_split, page_size=config.page_size,
+                         pdf_engine=config.pdf_engine)
+            for fmt in dict.fromkeys(config.formats)
+        ]
+        self.warnings: list[str] = []
+        self.failures: list[tuple[str, DevDocsError]] = []   # (format, error)
+        self.log = log or (lambda message: None)
+        self.warn = warn or (lambda message: self.log(f"warning: {message}"))
+        self.project = project or project_name(self.root)
+        self.description = description
+        self.builder = PromptBuilder(project=self.project, description=description)
+
+    # -- preparation (free) ------------------------------------------------
+
+    def prepare(self) -> Prepared:
+        started = time.monotonic()
+        scan = Scanner(
+            self.root, include=self.config.include, exclude=self.config.exclude
+        ).scan()
+        made = self._made(scan)
+        for item in scan.files:
+            if item.relpath in made:
+                scan.skipped[item.relpath] = "written by devdocs"
+        scan.files = [f for f in scan.files if f.relpath not in made]
+        coded = [f for f in scan.files if f.language]
+        documentable = {f.relpath: f for f in coded if f.is_documentable}
+
+        sources: dict[str, str] = {}
+        facts: dict[str, FileFacts] = {}
+        for item in coded:
+            text = self._read(item)
+            sources[item.relpath] = text
+            parser = get_parser(item.language)
+            if parser is None:
+                continue
+            try:
+                facts[item.relpath] = parser.parse(item.path, text)
+            except Exception as err:   # a parser bug must not end the run
+                facts[item.relpath] = FileFacts(
+                    path=item.path, language=item.language, loc=item.lines,
+                    confidence=Confidence.FAILED,
+                    notes=[f"parser error: {type(err).__name__}: {err}"],
+                )
+
+        graph = GraphBuilder(self.root, scan.files, facts, sources).build()
+        git = GitHistory(self.root)
+        history: Mapping[str, FileHistory] = git.recent() if git.available else {}
+        options = _QUALITY.get(self.config.quality, PlannerOptions())
+        plan = Planner(options).plan(list(documentable.values()), facts, graph, history)
+
+        languages: dict[str, int] = {}
+        for item in documentable.values():
+            languages[item.language] = languages.get(item.language, 0) + 1
+
+        prepared = Prepared(
+            root=self.root,
+            files=documentable,
+            sources=sources,
+            facts=facts,
+            hashes={rel: _sha(sources.get(rel, "")) for rel in documentable},
+            graph=graph,
+            plan=plan,
+            issues={
+                rel: found
+                for rel, item in documentable.items()
+                if (found := find_issues(sources.get(rel, ""), item.language))
+            },
+            head=git.head() if git.available else "",
+            skipped=scan.skipped,
+            languages=languages,
+        )
+        prepared.retriever = self._retriever(prepared)
+        self.log(
+            f"scanned {counted(len(scan.files), 'file')}, {len(documentable):,} "
+            f"documentable, {counted(plan.calls(), 'model call')} planned "
+            f"({time.monotonic() - started:.1f}s)"
+        )
+        return prepared
+
+    def _made(self, scan: ScanResult) -> set[str]:
+        """What devdocs wrote inside the project, by relpath: each manifest
+        the scan met and every file it lists, and the out dir's, so no HTML
+        site's scripts are taken for source to document, wherever an earlier
+        run wrote them. Hand-written files beside them are scanned as usual."""
+        found = {posixpath.dirname(item.relpath) for item in scan.files
+                 if posixpath.basename(item.relpath) == MANIFEST}
+        # not resolve(): before 3.13 it raises on a symlink loop
+        out = Path(os.path.realpath(self.out))
+        if out.is_relative_to(self.root):
+            base = out.relative_to(self.root).as_posix()
+            found.add("" if base == "." else base)
+        made: set[str] = set()
+        for base in found:
+            listed = generated_files(self.root / base)
+            if listed:
+                made.update(posixpath.join(base, path) for path in (MANIFEST, *listed))
+        return made
+
+    @staticmethod
+    def _read(item: SourceFile) -> str:
+        try:
+            return item.path.read_text("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    # -- retrieval ---------------------------------------------------------
+
+    def _retriever(self, prepared: Prepared) -> Retriever | None:
+        """Structural and lexical retrieval, both free. In semantic mode the
+        vectors stored for these chunks are used, as a vector paid for once
+        stays valid until its chunk changes. Nothing is written: only a run
+        changes the store; see `_embed`."""
+        if self.config.context == "off":
+            return None
+        prepared.chunks = {
+            rel: chunk_file(rel, prepared.sources.get(rel, ""), prepared.facts.get(rel))
+            for rel in sorted(prepared.files)
+        }
+        chunks = [chunk for group in prepared.chunks.values() for chunk in group]
+        retriever = Retriever(
+            StructuralContext(prepared.graph, prepared.facts, prepared.sources),
+            chunks=chunks,
+            lexical=LexicalIndex(chunks),
+        )
+        embeddings = self._embeddings(prepared)
+        if embeddings is not None:
+            self._attach(retriever, embeddings)
+        return retriever
+
+    def _embeddings(self, prepared: Prepared) -> Embeddings | None:
+        if self.config.context != "semantic" or self.db is None:
+            return None
+        info = find(EMBEDDING_MODEL) or assume(EMBEDDING_MODEL, "gemini")
+        chunks = [chunk for group in prepared.chunks.values() for chunk in group]
+        embeddings = Embeddings(
+            ChunkStore(self.db), chunks, model=info, dims=EMBEDDING_DIMENSIONS
+        )
+        client = self.client
+        if client is not None:
+            embeddings.budget = client.budget
+            embeddings.stop = client.stop
+            embeddings.retry = client.retry
+            embeddings.usage = client.usage
+            embeddings.max_requests = int(self.config.max_requests * _EMBED_SHARE)
+            if isinstance(client.model, Embedder):
+                embeddings.embedder = client.model
+                embeddings.dims = client.model.dimensions
+                embeddings.limiter = client.limiter(info)
+                embeddings.on_retry = client.retried(info.id, "embeddings")
+        return embeddings
+
+    @staticmethod
+    def _attach(retriever: Retriever, embeddings: Embeddings) -> None:
+        ids, vectors = embeddings.vectors()
+        if ids:
+            retriever.vectors = VectorIndex(ids, vectors)
+            retriever.vector_of = dict(zip(ids, vectors, strict=True))
+
+    def _embedding_over(self, requests: int, cost: float) -> list[str]:
+        """The flags of the limits embedding would take over half of, as the
+        documents get most of each; none if it fits."""
+        config = self.config
+        over = []
+        if config.max_cost and cost > config.max_cost * _EMBED_SHARE:
+            over.append("--max-cost")
+        if config.max_requests and requests > config.max_requests * _EMBED_SHARE:
+            over.append("--max-requests")
+        return over
+
+    def _vectors_to_buy(self, prepared: Prepared) -> int:
+        """How many chunks the next run would embed: those still without a
+        vector, unless they are over the limits, when it would skip them too."""
+        embeddings = self._embeddings(prepared)
+        if embeddings is None:
+            return 0
+        quote = embeddings.quote()
+        return 0 if self._embedding_over(quote.requests, quote.cost) else quote.chunks
+
+    def _embed(self, prepared: Prepared) -> str:
+        """Bring the store up to date with this run's files and embed the
+        chunks that lack a vector, if that fits the limits. Returns why
+        embedding failed; "" if it did not.
+
+        Only the chunks of a file that changed or is gone lose their vectors.
+        A file this run merely leaves out or cannot reach keeps them: they stay
+        valid, they cost money, and widening the selection again must not pay
+        twice. It costs a few rows, which retrieval and quotes, working on this
+        run's chunks, do not see.
+
+        A stop on budget or quota costs only semantic hits: the vectors
+        stored so far are used and the run goes on. So does a stop request,
+        after which the run goes on with what is free. So does a failure the
+        retries did not cure, warned of once: the prompt of a file with no
+        vector then carries standard context, and the next run tries again.
+        It may be a bad key, but the first paid call says so if it is.
+        """
+        embeddings = self._embeddings(prepared)
+        if embeddings is None or prepared.retriever is None:
+            return ""
+        for rel, group in prepared.chunks.items():
+            embeddings.store.replace(rel, group)
+        embeddings.store.prune(lambda source: _still_there(self.root / source))
+        quote = embeddings.quote()
+        if not quote.chunks:
+            return ""
+        over = " and ".join(self._embedding_over(quote.requests, quote.cost))
+        if over:
+            self.log(
+                f"semantic context skipped: embedding {counted(quote.chunks, 'chunk')} "
+                f"could take {counted(quote.requests, 'request')} and "
+                f"${quote.cost:.4f}, over half of {over}; raise that or use "
+                "--context standard"
+            )
+            return ""
+        failure = ""
+        try:
+            done, spent = embeddings.update()
+        except (BudgetExceeded, QuotaExhausted, Interrupted) as err:
+            self.log(f"semantic context: {err.message}; using the vectors stored")
+        except (ProviderError, AuthError) as err:
+            failure = err.message
+            self.warn(f"semantic context: embedding failed ({failure}); files "
+                      "without vectors get standard context, and the next run tries "
+                      "again")
+        else:
+            self.log(f"embedded {counted(done, 'chunk')} (${spent:.4f})")
+        self._attach(prepared.retriever, embeddings)
+        return failure
+
+    # -- prompts and prices ------------------------------------------------
+
+    def _file_prompts(self, prepared: Prepared) -> Iterator[Prompt]:
+        retriever = prepared.retriever
+        for plan in prepared.plan.prose_files():
+            facts = prepared.facts.get(plan.relpath)
+            if facts is None:
+                continue
+            yield self.builder.file(
+                plan, facts, prepared.sources.get(plan.relpath, ""),
+                prepared.graph.file(plan.relpath),
+                retriever.for_file(plan.relpath, facts) if retriever else (),
+            )
+
+    def _module_prompts(
+        self, prepared: Prepared, summaries: Mapping[str, str]
+    ) -> Iterator[Prompt]:
+        retriever = prepared.retriever
+        for plan in prepared.plan.prose_modules():
+            yield self.builder.module(
+                plan, prepared.graph, summaries, prepared.facts,
+                retriever.for_module(plan.files, prepared.facts) if retriever else (),
+            )
+
+    def _architecture_prompt(
+        self, prepared: Prepared, summaries: Mapping[str, str]
+    ) -> Prompt | None:
+        if prepared.plan.architecture is not Mode.PROSE:
+            return None
+        retriever = prepared.retriever
+        return self.builder.architecture(
+            prepared.graph, summaries, prepared.languages,
+            retriever.for_architecture() if retriever else (),
+        )
+
+    def _docstring_summaries(self, prepared: Prepared) -> dict[str, str]:
+        return {
+            rel: first_sentence(docstring_summary(facts.module_docstring))
+            for rel, facts in prepared.facts.items()
+            if rel in prepared.files and facts.module_docstring
+        }
+
+    def _walk(
+        self, prepared: Prepared, answer: Callable[[Prompt], Prose | None]
+    ) -> None:
+        """Build every planned prompt as a run would: files, then modules,
+        with the purposes `answer` gives the files', then the overview, with
+        the modules'. Docstrings stand in where `answer` gives no prose."""
+        summaries = self._docstring_summaries(prepared)
+        for prompt in list(self._file_prompts(prepared)):
+            prose = answer(prompt)
+            if prose is not None and prose.reply.purpose:
+                summaries[prompt.key] = first_sentence(prose.reply.purpose)
+        module_summaries: dict[str, str] = {}
+        for prompt in list(self._module_prompts(prepared, summaries)):
+            prose = answer(prompt)
+            if prose is not None and prose.reply.purpose:
+                module_summaries[prompt.key] = first_sentence(prose.reply.purpose)
+        overview = self._architecture_prompt(prepared, module_summaries)
+        if overview is not None:
+            answer(overview)
+
+    def _foreseen(self, prepared: Prepared) -> dict[tuple[str, str], Prose]:
+        """The prose a run will have, as far as can be told before it buys
+        any: none for an item the budget cuts, as `price` finds on a copy of
+        the plan, with nothing yet spent on embedding; for the rest what the
+        cache holds, as a run would take it, else `_UNBOUGHT`. That stands in
+        for the purposes it sums up too, so a prompt built on one is unbought
+        as well. Without a client every item is. Those prompts are built
+        without retrieved context, which only the price depends on, as no
+        cache key holds it, so they cost little."""
+        plan = replace(prepared.plan, files=[*prepared.plan.files],
+                       modules=[*prepared.plan.modules])
+        fitted = replace(prepared, plan=plan, prompts={}, cut=[])
+        if self.client is not None:
+            self.price(fitted, embedding=False)
+        guard = StyleGuard(known=self._known(prepared))
+        describe = {p.relpath: p.describe for p in prepared.plan.files}
+        foreseen: dict[tuple[str, str], Prose] = {}
+
+        def answer(prompt: Prompt) -> Prose:
+            allowed = describe.get(prompt.key, ()) if prompt.kind == "file" else ()
+            cached = (self._cached_prose(prompt, guard, allowed)
+                      if self.client is not None else None)
+            prose = foreseen[(prompt.kind, prompt.key)] = cached or _UNBOUGHT
+            return prose
+
+        self._walk(replace(fitted, retriever=None), answer)
+        return foreseen
+
+    def price(self, prepared: Prepared, *, embedding: bool = True) -> Estimate:
+        """Quote every planned call and cut the plan to the budget.
+
+        Prompts are built as a run would build them. Module prompts carry the
+        file purposes a run would have by then, read back from the cache where
+        those answers exist and taken from docstrings where they do not yet;
+        the architecture prompt likewise. So an estimate after a run is free
+        exactly when the run would be. With `embedding`, the vectors semantic
+        context still needs are quoted too, and their cost held back. The cut
+        counts only the calls a run would make: an answer the cache holds is
+        free and never cut, but an overview of an answer the plan buys is
+        asked again, at its price as a call; see `fit_to_budget`. If no model
+        is left to ask it, that ConfigError is raised here, before anything
+        is bought, rather than by the run once it has paid for the rest.
+        """
+        client = self._client()
+        guard = StyleGuard(known=self._known(prepared))
+        describe = {p.relpath: p.describe for p in prepared.plan.files}
+        estimate = Estimate()
+        costs: dict[tuple[str, str], float] = {}
+        again: dict[tuple[str, str], PricedItem] = {}   # cached overviews, as calls
+        unaskable: dict[tuple[str, str], ConfigError] = {}   # no model left for those
+        uncached = LLMClient(client.model, router=client.router)   # quotes a call
+
+        def quote(prompt: Prompt) -> Prose | None:
+            item = (prompt.kind, prompt.key)
+            result = client.quote(
+                prompt.tier, prompt.system, prompt.user,
+                max_output_tokens=prompt.max_output_tokens,
+                identity=prompt.cache_text,
+            )
+            priced = PricedItem(
+                prompt.kind, prompt.key, result.model, result.input_tokens,
+                result.output_tokens, result.cost, result.cached,
+            )
+            estimate.items.append(priced)
+            costs[item] = priced.cost
+            if result.cached and prompt.kind != "file":
+                try:
+                    again[item] = self._as_call(uncached, prompt)
+                except ConfigError as err:   # an error only if the plan asks it again
+                    again[item] = replace(priced, cached=False)
+                    unaskable[item] = err
+                costs[item] = again[item].cost
+            prepared.prompts[item] = prompt
+            if not result.cached:
+                return None
+            allowed = describe.get(prompt.key, ()) if prompt.kind == "file" else ()
+            return self._cached_prose(prompt, guard, allowed)
+
+        self._walk(prepared, quote)
+
+        embeddings = self._embeddings(prepared) if embedding else None
+        if embeddings is not None:
+            need = embeddings.quote()
+            if need.chunks and not self._embedding_over(need.requests, need.cost):
+                estimate.items.insert(0, PricedItem(
+                    "embed", "", embeddings.model.id, need.tokens, 0, need.cost,
+                    False, requests=need.requests,
+                ))
+
+        # What is already spent or held back for embedding is not the plan's.
+        held = [i for i in estimate.items if i.kind == "embed"]
+        held_cost = client.budget.spent + sum(i.cost for i in held)
+        held_requests = client.budget.requests + sum(i.requests for i in held)
+        max_cost = self.config.max_cost
+        if max_cost:
+            max_cost = max(max_cost - held_cost, 1e-9)
+        limit = 0
+        if self.config.max_requests:
+            limit = max(self.config.max_requests - held_requests, 1)
+        fit = fit_to_budget(
+            prepared.plan, costs, max_cost=max_cost, max_requests=limit,
+            cached={(i.kind, i.key) for i in estimate.items if i.cached},
+        )
+        for item in sorted(fit.rebuilt & unaskable.keys()):
+            raise unaskable[item]
+        estimate.demoted = fit.cut
+        estimate.items = [
+            again[(i.kind, i.key)] if (i.kind, i.key) in fit.rebuilt else i
+            for i in estimate.items if (i.kind, i.key) not in fit.cut
+        ]
+        prepared.cut += fit.cut
+        for item in fit.cut:
+            prepared.prompts.pop(item, None)
+        return estimate
+
+    @staticmethod
+    def _as_call(uncached: LLMClient, prompt: Prompt) -> PricedItem:
+        """A cached overview priced as the call the run makes to ask `prompt`
+        again. ConfigError if no model is left to ask it: `price` raises that
+        only once the plan would ask, so before anything is bought."""
+        quote = uncached.quote(prompt.tier, prompt.system, prompt.user,
+                               max_output_tokens=prompt.max_output_tokens)
+        return PricedItem(prompt.kind, prompt.key, quote.model, quote.input_tokens,
+                          quote.output_tokens, quote.cost, cached=False)
+
+    def estimate(self, prepared: Prepared) -> Estimate:
+        return self.price(prepared)
+
+    def _client(self) -> LLMClient:
+        if self.client is None:
+            raise ConfigError("no model client configured for this run")
+        return self.client
+
+    # -- the run -----------------------------------------------------------
+
+    def run(
+        self,
+        prepared: Prepared,
+        *,
+        resume: bool = True,
+        force: bool = False,
+        checked: bool = False,
+    ) -> RunSummary:
+        """Send the priced plan, then compose and write every document.
+
+        Documents are written even when the run stops early on budget, quota
+        or a stop request: whatever was paid for is kept, the rest is
+        stubbed, and the next run buys only that. A stop request,
+        `client.stop` set before the waves end, makes `stopped`
+        "interrupted". A KeyboardInterrupt in a wave, as Python raises on Ctrl-C
+        when no handler sets the stop instead, is raised again once the documents
+        are written. A format that fails to render is reported in `failed`,
+        the others written. An embedding endpoint that stays down costs only
+        semantic context, as `semantic_fallback` then says; see `_embed`.
+
+        A write that would be refused, see `check`, raises ConfigError
+        before anything is bought, and a KeyboardInterrupt while that is
+        checked ends the run there, writing nothing. With `checked`, the
+        caller has made that check itself: the CLI does, outside the part of
+        the run a Ctrl-C stops gracefully. A write refused later all the
+        same, as for a file that appeared meanwhile, raises ConfigError once
+        the answers bought are cached, its hint saying what running again
+        costs.
+        """
+        client = self._client()
+        if not checked:
+            self.check(prepared, force=force)
+        fallback = self._embed(prepared)
+        self.price(prepared, embedding=False)
+        summary = RunSummary(semantic_fallback=fallback)
+        ledger = RunLedger(self.db) if self.db is not None else None
+        if ledger is not None:
+            fingerprint = config_fingerprint(
+                self.root, self.config.provider, self.config.quality,
+                self.config.include, self.config.exclude,
+            )
+            summary.run_id, summary.resumed = ledger.start(fingerprint, resume=resume)
+
+        guard = StyleGuard(known=self._known(prepared))
+        prose: dict[tuple[str, str], Prose] = {}
+        interrupted: KeyboardInterrupt | None = None
+        hits = [0]
+        previous = client.on_event
+
+        def count(event: CallEvent) -> None:
+            if event.kind == "cache-hit":
+                hits[0] += 1
+            if previous is not None:
+                previous(event)
+
+        client.on_event = count
+        try:
+            self._waves(prepared, prose, guard, summary)
+        except KeyboardInterrupt as err:
+            summary.stopped = "interrupted"
+            interrupted = err
+        finally:
+            client.on_event = previous
+        if client.stop.is_set():
+            summary.stopped = summary.stopped or "interrupted"
+
+        docset = self._compose(prepared, prose)
+        budget = client.budget
+        docset.run = replace(
+            self._run_info(prepared),
+            generated_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+            requests=budget.requests,
+            cache_hits=hits[0],
+            input_tokens=sum(p.input_tokens for p in prose.values()),
+            output_tokens=sum(p.output_tokens for p in prose.values()),
+            cost_usd=round(budget.spent, 6),
+        )
+        try:
+            summary.written = self.write(docset, force=force)
+        except ConfigError as err:   # so the summary goes unshown
+            if client.cache is None:
+                raise   # nothing bought is kept, so no cost to speak of
+            again = _again(summary, len(prepared.cut), len(prose),
+                           self._vectors_to_buy(prepared))
+            hint = f"{err.hint}; {again}" if err.hint else again
+            raise ConfigError(err.message, hint=hint) from err
+        summary.failed += [("format", fmt, _retry(fmt, err, self.config))
+                           for fmt, err in self.failures]
+        summary.warnings = list(self.warnings)
+        summary.documents = len(docset.documents)
+        summary.prose = sum(1 for d in docset.documents if d.meta.mode is Mode.PROSE)
+        summary.stubs = summary.documents - summary.prose
+        summary.requests = budget.requests
+        summary.cache_hits = hits[0]
+        summary.cost = budget.spent
+        summary.input_tokens = docset.run.input_tokens
+        summary.output_tokens = docset.run.output_tokens
+        summary.degraded = sorted(
+            rel for rel, facts in prepared.facts.items()
+            if rel in prepared.files
+            and facts.confidence in (Confidence.DEGRADED, Confidence.FAILED)
+        )
+        if ledger is not None and summary.run_id:
+            complete = not summary.stopped and not summary.failed
+            ledger.finish(summary.run_id, "finished" if complete else "interrupted")
+        if interrupted is not None:
+            raise interrupted
+        return summary
+
+    def _waves(
+        self,
+        prepared: Prepared,
+        prose: dict[tuple[str, str], Prose],
+        guard: StyleGuard,
+        summary: RunSummary,
+    ) -> None:
+        files = [p for p in self._file_prompts(prepared)
+                 if ("file", p.key) in prepared.prompts]
+        self._wave(files, prose, guard, prepared, summary)
+
+        summaries = self._docstring_summaries(prepared)
+        for (kind, key), result in prose.items():
+            if kind == "file" and result.reply.purpose:
+                summaries[key] = first_sentence(result.reply.purpose)
+        modules = [p for p in self._module_prompts(prepared, summaries)
+                   if ("module", p.key) in prepared.prompts]
+        self._wave(modules, prose, guard, prepared, summary)
+
+        module_summaries = {
+            key: first_sentence(result.reply.purpose)
+            for (kind, key), result in prose.items()
+            if kind == "module" and result.reply.purpose
+        }
+        overview = self._architecture_prompt(prepared, module_summaries)
+        if overview is not None and ("architecture", "") in prepared.prompts:
+            self._wave([overview], prose, guard, prepared, summary)
+
+    def _wave(
+        self,
+        prompts: Sequence[Prompt],
+        prose: dict[tuple[str, str], Prose],
+        guard: StyleGuard,
+        prepared: Prepared,
+        summary: RunSummary,
+    ) -> None:
+        """Send one wave of calls, most valuable first, recording each outcome
+        as it lands.
+
+        A budget or quota stop ends the asking. A stop request does not: the
+        client then sends nothing, so the wave runs on through the cache
+        while the calls on the wire finish. A KeyboardInterrupt, which no
+        handler turned into a stop request, sets the stop for the workers'
+        sake on its way up.
+        """
+        if not prompts or summary.stopped in _EXHAUSTED:
+            return
+        stop = self._client().stop
+        describe = {p.relpath: p.describe for p in prepared.plan.files}
+        workers = max(1, min(self.config.concurrency, len(prompts)))
+        pool = ThreadPoolExecutor(max_workers=workers, initializer=leave_signals)
+        futures: dict[Future[Prose | None], Prompt] = {}
+        pending = list(prompts)
+        try:
+            while pending or futures:
+                if stop.is_set() and not summary.stopped:
+                    summary.stopped = "interrupted"
+                if summary.stopped in _EXHAUSTED:
+                    pending.clear()
+                while pending and len(futures) < workers:
+                    prompt = pending.pop(0)
+                    allowed = describe.get(prompt.key, ())
+                    if prompt.kind != "file":
+                        allowed = ()
+                    futures[pool.submit(self._ask, prompt, guard, allowed)] = prompt
+                if not futures:
+                    break
+                done, _ = wait(list(futures), timeout=_TICK,
+                               return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda f: futures[f].key):
+                    self._settle(future, futures.pop(future), prose, summary)
+        except KeyboardInterrupt:
+            stop.set()
+            raise
+        finally:
+            # In-flight calls finish and are cached; queued ones never start.
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _settle(
+        self,
+        future: Future[Prose | None],
+        prompt: Prompt,
+        prose: dict[tuple[str, str], Prose],
+        summary: RunSummary,
+    ) -> None:
+        try:
+            result = future.result()
+        except Interrupted:
+            return   # refused for a stop request: for the next run to buy
+        except BudgetExceeded as err:
+            summary.stopped = summary.stopped or "budget"
+            self.log(f"stopped: {err.message}")
+            return
+        except QuotaExhausted as err:
+            summary.stopped = summary.stopped or "quota"
+            self.log(f"stopped: {err.message}")
+            return
+        except (AuthError, ConfigError):
+            raise
+        except DevDocsError as err:
+            summary.failed.append((prompt.kind, prompt.key, err.message))
+            self.log(f"failed {prompt.kind} {prompt.key or prompt.kind}: {err.message}")
+            return
+
+        if result is None:
+            summary.failed.append((prompt.kind, prompt.key, "no usable reply"))
+            return
+        prose[(prompt.kind, prompt.key)] = result
+
+    def _ask(
+        self, prompt: Prompt, guard: StyleGuard, allowed: tuple[str, ...]
+    ) -> Prose | None:
+        """One call. The reply is parsed and guarded before it is accepted, so
+        an unusable answer escalates instead of being cached."""
+        completion = self._client().complete(
+            prompt.tier, prompt.system, prompt.user,
+            max_output_tokens=prompt.max_output_tokens,
+            tag=prompt.key or prompt.kind,
+            accept=self._acceptor(prompt, guard, allowed),
+            identity=prompt.cache_text,
+        )
+        return self._prose(prompt, guard, allowed, completion)
+
+    def _cached_prose(
+        self, prompt: Prompt, guard: StyleGuard, allowed: tuple[str, ...]
+    ) -> Prose | None:
+        """The prose `_ask` would return from the cache alone, without sending."""
+        completion = self._client().cached(
+            prompt.tier, prompt.system, prompt.user,
+            max_output_tokens=prompt.max_output_tokens,
+            accept=self._acceptor(prompt, guard, allowed),
+            identity=prompt.cache_text,
+        )
+        return self._prose(prompt, guard, allowed, completion)
+
+    @staticmethod
+    def _acceptor(
+        prompt: Prompt, guard: StyleGuard, allowed: tuple[str, ...]
+    ) -> Callable[[str], bool]:
+        def accept(text: str) -> bool:
+            reply = guard.apply(parse_reply(text, prompt.kind), prompt.kind,
+                                allowed_symbols=allowed)
+            return acceptable(reply, prompt.kind)
+
+        return accept
+
+    @staticmethod
+    def _prose(
+        prompt: Prompt,
+        guard: StyleGuard,
+        allowed: tuple[str, ...],
+        completion: Completion | None,
+    ) -> Prose | None:
+        if completion is None or not completion.ok or completion.text is None:
+            return None
+        reply = guard.apply(parse_reply(completion.text, prompt.kind), prompt.kind,
+                            allowed_symbols=allowed)
+        if not acceptable(reply, prompt.kind):
+            return None
+        return Prose(
+            reply=reply,
+            model=completion.model,
+            tier=prompt.tier.value,
+            input_tokens=completion.usage.input_tokens,
+            output_tokens=completion.usage.output_tokens,
+        )
+
+    def _known(self, prepared: Prepared) -> Callable[[str], bool]:
+        """Identifiers a model may cite: everything the project defines or
+        imports, file names, and the languages' builtins."""
+        names: set[str] = set(dir(builtins)) | _JS_GLOBALS
+        for relpath, facts in prepared.facts.items():
+            base = posixpath.basename(relpath)
+            names.update((relpath, base, base.rpartition(".")[0]))
+            for symbol in facts.all_symbols:
+                names.add(symbol.name)
+            for symbol in facts.symbols:
+                for child in symbol.children:
+                    names.add(f"{symbol.name}.{child.name}")
+            for module in facts.imports:
+                for part in module.replace("::", ".").replace("/", ".").split("."):
+                    if part:
+                        names.add(part)
+                names.add(module)
+        return names.__contains__
+
+    # -- output ------------------------------------------------------------
+
+    def _compose(
+        self, prepared: Prepared, prose: Mapping[tuple[str, str], Prose]
+    ) -> DocSet:
+        modules = [m.path for m in prepared.plan.modules]
+        composer = Composer(
+            project=self.project,
+            files=prepared.files,
+            facts=prepared.facts,
+            graph=prepared.graph,
+            hashes=prepared.hashes,
+            modules=modules,
+            layout=Layout(per_file=self.config.per_file),
+        )
+        docset = DocSet(project=self.project, description=self.description)
+        file_summaries: dict[str, str] = {}
+        for plan in sorted(prepared.plan.files, key=lambda p: p.relpath):
+            document = composer.file(
+                plan, prose.get(("file", plan.relpath)),
+                prepared.issues.get(plan.relpath, ()),
+            )
+            docset.add(document)
+            file_summaries[plan.relpath] = document.summary
+
+        module_summaries: dict[str, str] = {}
+        for module in sorted(prepared.plan.modules, key=lambda m: m.path):
+            document = composer.module(
+                module, prose.get(("module", module.path)), file_summaries
+            )
+            docset.add(document)
+            module_summaries[module.path] = document.summary
+
+        if prepared.files:
+            docset.add(composer.architecture(
+                prose.get(("architecture", "")), module_summaries, prepared.languages
+            ))
+        return docset
+
+    def _run_info(self, prepared: Prepared) -> RunInfo:
+        """The run's record before it counts anything: all that its
+        documents show of it, the generator and the commit, and the provider."""
+        return RunInfo(generator=f"devdocs {__version__}", git_commit=prepared.head,
+                       provider=self.config.provider)
+
+    @property
+    def out(self) -> Path:
+        """The output directory: `config.out`, under the root when relative."""
+        return self.root / self.config.out
+
+    def write(self, docset: DocSet, *, force: bool = False) -> WriteReport:
+        """Render `docset` in every format and write the files to `out`.
+
+        Rendering never calls a model. What a renderer could not show is
+        logged and kept in `warnings`. A renderer that fails is skipped and
+        its error kept in `failures`; the other formats are still written,
+        pruning nothing, so the failed format's earlier files stay and stay
+        listed.
+
+        Raises ConfigError, before anything is written, for an output a file
+        devdocs did not write is in the way of, unless `force` replaces it;
+        see `OutputWriter`.
+        """
+        files = self._render(docset)
+        return OutputWriter(self.out).write(
+            files, docset, prune=not self.failures, force=force
+        )
+
+    def check(self, prepared: Prepared, *, force: bool = False) -> None:
+        """Raise what writing this run's documents would raise, but before
+        anything is bought, and write nothing: ConfigError for a file devdocs
+        has no record of writing where an output goes, unless `force`; for
+        a name the file system cannot hold; for an out dir devdocs cannot
+        write. See `OutputWriter.check`.
+
+        The documents are composed with the prose the cache already holds,
+        and a placeholder no page holds for prose still to buy; see
+        `_foreseen`. Their paths are the run's, as paths depend on the
+        documents alone. A page the run would write exactly as it is passes,
+        as it will then: one the cache makes so, or a stub the budget keeps a
+        stub. One that holds or sums up prose to buy counts as replaced, as it
+        is once that prose is bought. A format that fails to render is left to
+        the write, which reports it.
+        """
+        docset = self._compose(prepared, self._foreseen(prepared))
+        docset.run = self._run_info(prepared)
+        files: dict[str, bytes] = {}
+        for renderer in self._stand_ins():
+            with contextlib.suppress(DevDocsError):
+                files.update(renderer.render(docset))
+        OutputWriter(self.out).check(files, docset, force=force)
+
+    def _stand_ins(self) -> list[Renderer]:
+        """The renderers, but the builtin engine for an external PDF one: it
+        names the book alike, in a fraction of the time."""
+        return [
+            renderer_for("pdf")
+            if renderer.format == "pdf"
+            and getattr(renderer, "engine", "builtin") != "builtin"
+            else renderer
+            for renderer in self.renderers
+        ]
+
+    def export(self, *, force: bool = False) -> ExportSummary:
+        """Render the last run's documents again, in the configured formats.
+
+        The DocSet comes back from the manifest in `out`, so nothing is
+        scanned, priced or sent. Export adds files and never prunes: what
+        the last write listed stays, and stays listed beside the new files,
+        and the manifest keeps the run's record exactly as it was.
+        Exporting PDF so keeps every Markdown page, and an HTML site that
+        `generate --format html` wrote; rendering the configured formats
+        beside the requested ones would not, as a format passed by flag is
+        not configured. The complete list lets the next `generate` prune
+        exports with whatever else it does not write again, since they then
+        describe an older run.
+
+        Raises ConfigError when `out` holds no manifest that can be read, and
+        as `write` does; and a failed format's own error once the other
+        formats are written.
+        """
+        docset = read_manifest(self.out)
+        run = docset.run
+        self.log(f"read {counted(len(docset.documents), 'document')} from "
+                 f"{self.out / MANIFEST}")
+        written = OutputWriter(self.out).add(self._render(docset), force=force)
+        if self.failures:
+            raise self.failures[0][1]
+        return ExportSummary(
+            documents=len(docset.documents),
+            formats=[renderer.format for renderer in self.renderers],
+            out=str(self.out),
+            generated_at=run.generated_at if run is not None else "",
+            warnings=list(self.warnings),
+            written=written,
+        )
+
+    def _render(self, docset: DocSet) -> dict[str, bytes]:
+        """Every format's files; refills `warnings` and `failures`."""
+        files: dict[str, bytes] = {}
+        self.warnings, self.failures = [], []
+        for renderer in self.renderers:
+            try:
+                files.update(renderer.render(docset))
+            except DevDocsError as err:
+                self.failures.append((renderer.format, err))
+                continue
+            self.warnings += self._logged_warnings(renderer)
+        return files
+
+    def _logged_warnings(self, renderer: Renderer) -> list[str]:
+        """`renderer`'s warnings from its last render, logged in one message:
+        what they mean, the first few, and how to avoid them."""
+        warnings = [str(warning) for warning in getattr(renderer, "warnings", ())]
+        if not warnings:
+            return []
+        meaning, remedy = _WARNINGS.get(renderer.format, ("warnings", ""))
+        lines = [f"{renderer.format}: {meaning} ({len(warnings):,}):"]
+        lines += [f"  {warning}" for warning in warnings[:_SHOWN_WARNINGS]]
+        if len(warnings) > _SHOWN_WARNINGS:
+            lines.append(f"  and {len(warnings) - _SHOWN_WARNINGS:,} more")
+        if remedy:
+            lines.append(f"  {remedy}")
+        self.log("\n".join(lines))
+        return warnings

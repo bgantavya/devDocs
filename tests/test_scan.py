@@ -1,0 +1,492 @@
+"""Scanner behaviour, including the files v3 silently dropped."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from devdocs.generate import Pipeline
+from devdocs.ignore import GitignoreMatcher
+from devdocs.parse import get_parser
+from devdocs.scan import _HEAD_BYTES, Role, Scanner
+
+# Every one of these was skipped by v3's substring filter.
+V3_CASUALTIES = (
+    "src/app/routes.py",
+    "src/app/layout.tsx",
+    "src/app/checkout.tsx",
+    "src/library.ts",
+    "src/__init__.py",
+    "src/components/Button.tsx",
+    "src/environment.py",
+    "src/binary_search.py",
+    "src/utils.py",
+    "src/config.py",
+    "src/debugger.py",
+)
+
+
+class ScanCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / ".git").mkdir()   # work-tree boundary, whatever holds tempdir
+
+    def write(self, relative: str, text: str = "x = 1\n") -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def relpaths(self, **kwargs: object) -> set[str]:
+        return {f.relpath for f in Scanner(self.root, **kwargs).scan().files}  # type: ignore[arg-type]
+
+    def symlink(self, target: str | Path, relative: str) -> None:
+        try:
+            os.symlink(target, self.root / relative)
+        except (OSError, NotImplementedError) as err:
+            self.skipTest(f"symlinks unavailable: {err}")
+
+
+class TestRegression(ScanCase):
+    def test_v3_casualties_are_all_found(self) -> None:
+        for relative in V3_CASUALTIES:
+            self.write(relative)
+        found = self.relpaths()
+        self.assertEqual(set(V3_CASUALTIES) - found, set())
+
+    def test_cwd_is_never_changed(self) -> None:
+        self.write("a/b/c/deep.py")
+        before = os.getcwd()
+        Scanner(self.root).scan()
+        self.assertEqual(os.getcwd(), before)
+
+
+class TestIgnoring(ScanCase):
+    def test_default_noise_directories_are_pruned(self) -> None:
+        noise = ("node_modules/x/i.js", "dist/b.js", ".git/h", "__pycache__/c.pyc")
+        for relative in noise:
+            self.write(relative)
+        self.write("src/main.py")
+        self.assertEqual(self.relpaths(), {"src/main.py"})
+
+    def test_project_gitignore_is_respected(self) -> None:
+        self.write(".gitignore", "generated/\n*.secret\n")
+        self.write("generated/api.py")
+        self.write("keys.secret")
+        self.write("src/app.py")
+        self.assertEqual(self.relpaths(), {"src/app.py"})
+
+    def test_ignored_directory_is_reported_once(self) -> None:
+        self.write("node_modules/a/b/c.js")
+        result = Scanner(self.root).scan()
+        self.assertIn("node_modules/", result.skipped)
+        self.assertFalse(any(k.startswith("node_modules/a") for k in result.skipped))
+
+    def test_exclude_adds_rules(self) -> None:
+        self.write("legacy/old.py")
+        self.write("src/new.py")
+        self.assertEqual(self.relpaths(exclude=("legacy/",)), {"src/new.py"})
+
+    def test_include_forces_an_ignored_directory_back(self) -> None:
+        self.write("vendor/lib.py")
+        self.assertIn("vendor/lib.py", self.relpaths(include=("vendor",)))
+
+
+class TestFiltering(ScanCase):
+    def test_empty_files_are_skipped(self) -> None:
+        self.write("empty.py", "")
+        result = Scanner(self.root).scan()
+        self.assertEqual(result.skipped.get("empty.py"), "empty")
+
+    def test_oversized_files_are_skipped_with_reason(self) -> None:
+        self.write("big.py", "x" * 2000)
+        result = Scanner(self.root, max_bytes=1000).scan()
+        self.assertIn("too large", result.skipped["big.py"])
+
+    def test_unknown_binary_like_files_are_skipped(self) -> None:
+        self.write("image.bin", "data")
+        self.assertNotIn("image.bin", self.relpaths())
+
+
+class TestClassification(ScanCase):
+    def classify(self, relative: str, text: str = "x = 1\n") -> Role:
+        self.write(relative, text)
+        result = Scanner(self.root).scan()
+        return next(f.role for f in result.files if f.relpath == relative)
+
+    def test_source(self) -> None:
+        self.assertIs(self.classify("src/app.py"), Role.SOURCE)
+
+    def test_tests_by_directory_and_by_name(self) -> None:
+        self.assertIs(self.classify("tests/test_a.py"), Role.TEST)
+        self.assertIs(self.classify("src/b_test.go"), Role.TEST)
+        self.assertIs(self.classify("src/c.spec.ts"), Role.TEST)
+        self.assertIs(self.classify("src/__tests__/d.js"), Role.TEST)
+
+    def test_similar_names_are_not_tests(self) -> None:
+        self.assertIs(self.classify("src/contest.py"), Role.SOURCE)
+        self.assertIs(self.classify("src/latest.py"), Role.SOURCE)
+
+    def test_generated_by_name_and_by_header(self) -> None:
+        by_header_py = "# @generated by protoc\nX = 1\n"
+        by_header_go = "// Code generated by tool. DO NOT EDIT.\n"
+        self.assertIs(self.classify("api_pb2.py"), Role.GENERATED)
+        self.assertIs(self.classify("x.py", by_header_py), Role.GENERATED)
+        self.assertIs(self.classify("y.go", by_header_go), Role.GENERATED)
+
+    def test_config_and_docs(self) -> None:
+        self.assertIs(self.classify("pyproject.toml", "[x]\n"), Role.CONFIG)
+        self.assertIs(self.classify("guide.md", "# hi\n"), Role.DOCS)
+
+    def test_vendored_when_forced_in(self) -> None:
+        self.write("third_party/lib.py")
+        result = Scanner(self.root, include=("third_party",)).scan()
+        role = next(f.role for f in result.files if f.relpath == "third_party/lib.py")
+        self.assertIs(role, Role.VENDORED)
+
+    def test_documentable_excludes_tests_generated_and_docs(self) -> None:
+        self.write("src/a.py")
+        self.write("tests/test_a.py")
+        self.write("gen_pb2.py")
+        self.write("readme.md", "# x\n")
+        documentable = {f.relpath for f in Scanner(self.root).scan().documentable}
+        self.assertEqual(documentable, {"src/a.py"})
+
+
+class TestResult(ScanCase):
+    def test_files_are_sorted_and_line_counted(self) -> None:
+        self.write("b.py", "1\n2\n3\n")
+        self.write("a.py", "1\n")
+        result = Scanner(self.root).scan()
+        self.assertEqual([f.relpath for f in result.files], ["a.py", "b.py"])
+        self.assertEqual(result.files[1].lines, 3)
+
+    def test_lines_are_counted_as_the_parsers_count_them(self) -> None:
+        # Pages and scores use either count, so a file must not have two.
+        for text in ("x = 1", "x = 1\n", "x = 1\ny = 2\n", "x = 1\n\n", "\n",
+                     "x = 1\r\ny = 2\r\n", "x = 1\ry = 2\r", "x = 1\ry = 2", "\r",
+                     "\r\n", "\r\r", "\n\r", "x = 1\r\ny = 2\rz = 3\n", "x = 1\r\r\n"):
+            for name in ("a.py", "a.go"):
+                with self.subTest(text=text, name=name):
+                    path = self.root / name
+                    path.write_bytes(text.encode("utf-8"))
+                    found = next(f for f in Scanner(self.root).scan().files
+                                 if f.relpath == name)
+                    parser = get_parser(found.language)
+                    assert parser is not None
+                    read = Pipeline._read(found)
+                    self.assertEqual(parser.parse(path, read).loc, found.lines)
+
+    def test_classic_mac_lines_are_counted(self) -> None:
+        # Regression: a file ending its lines in CR alone counted as one line.
+        self.write("a.go")
+        (self.root / "a.go").write_bytes(b"a()\rb()\rc()\r")
+        self.assertEqual(Scanner(self.root).scan().files[0].lines, 3)
+
+    def test_a_line_end_across_two_reads_is_one(self) -> None:
+        second = _HEAD_BYTES + (1 << 20)   # where the second read after the head starts
+        for at in (_HEAD_BYTES, second):
+            before = b"x" * (at - 1)
+            for tail, lines in ((b"\r\ny\r\n", 2), (b"\r\n", 1), (b"\ry", 2),
+                                (b"\r", 1), (b"\r\r\n", 2), (b"\n\n", 2)):
+                with self.subTest(at=at, tail=tail):
+                    path = self.root / "a.py"
+                    path.write_bytes(before + tail)
+                    found = Scanner(self.root, max_bytes=2 * second).scan().files[0]
+                    self.assertEqual(found.lines, lines)
+                    parser = get_parser(found.language)
+                    assert parser is not None
+                    read = Pipeline._read(found)
+                    self.assertEqual(parser.parse(path, read).loc, lines)
+
+    def test_grouping_helpers(self) -> None:
+        self.write("a.py")
+        self.write("b.ts", "export const x = 1;\n")
+        by_language = Scanner(self.root).scan().by_language()
+        self.assertEqual(set(by_language), {"python", "typescript"})
+
+
+class TestDotDirectories(ScanCase):
+    """Regression: top-level dot directories were walked and their files kept."""
+
+    def test_top_level_dot_directories_are_pruned(self) -> None:
+        self.write("src/app.py", "def main(): pass\n")
+        self.write(".tox/py311/lib/python3.11/site-packages/requests/api.py")
+        self.write(".next/server/pages/index.js", "module.exports = 1;\n")
+        self.write(".git/hooks/pre-commit.py")
+        self.write(".mypy_cache/3.11/os.meta.json", "{}\n")
+        self.write(".github/workflows/ci.yml", "on: push\n")
+        self.write(".gitignore", ".github\n")
+        result = Scanner(self.root).scan()
+        self.assertEqual([f.relpath for f in result.files], ["src/app.py"])
+        self.assertEqual(
+            sorted(k for k in result.skipped if k.endswith("/")),
+            [".git/", ".github/", ".mypy_cache/", ".next/", ".tox/"],
+        )
+
+
+class TestDefaults(ScanCase):
+    def test_build_output_is_ignored_only_at_the_root(self) -> None:
+        self.write(".gitignore", "/build/\n/dist/\n")
+        self.write("src/pip/_internal/operations/build/wheel.py")
+        self.write("src/pip/_internal/operations/install.py")
+        self.write("src/app/target/selector.py")
+        self.write("build/lib/pip/__init__.py")
+        self.write("target/debug/main.rs", "fn main() {}\n")
+        self.assertEqual(
+            self.relpaths(),
+            {
+                "src/pip/_internal/operations/build/wheel.py",
+                "src/pip/_internal/operations/install.py",
+                "src/app/target/selector.py",
+            },
+        )
+
+    def test_noise_is_pruned_at_any_depth_even_with_a_gitignore(self) -> None:
+        self.write(".gitignore", "*.log\n")
+        self.write("pkg/node_modules/x/i.js")
+        self.write("pkg/sub/__pycache__/c.py")
+        self.write("pkg/a.py")
+        self.assertEqual(self.relpaths(), {"pkg/a.py"})
+
+    def test_repository_cannot_re_include_default_noise(self) -> None:
+        self.write(".gitignore", "*\n!*/\n!*.js\n")
+        self.write("node_modules/x/i.js")
+        self.write("src/app.js", "export const a = 1;\n")
+        self.assertEqual(self.relpaths(), {"src/app.js"})
+
+
+class TestRepositoryContext(ScanCase):
+    def test_subdirectory_scan_applies_the_repository_gitignore(self) -> None:
+        self.write(".git/info/exclude", "*.secret\n")
+        self.write(".gitignore", "coverage/\n*.local.ts\n")
+        self.write("packages/app/src/index.ts", "export const a = 1;\n")
+        self.write("packages/app/src/keys.local.ts", "export const KEY = 'k';\n")
+        self.write("packages/app/coverage/lcov-report/sorter.js", "var x = 1;\n")
+        self.write("packages/app/token.secret", "x\n")
+        files = Scanner(self.root / "packages" / "app").scan().files
+        self.assertEqual([f.relpath for f in files], ["src/index.ts"])
+
+    def test_nested_gitignore_is_read_only_where_the_walk_goes(self) -> None:
+        self.write("src/a.py")
+        self.write("node_modules/pkg7/lib/.gitignore", "*.log\n")
+        self.write("pkg/.gitignore", "*.tmp\n")
+        scanner = Scanner(self.root)
+        self.assertEqual({r.base for r in scanner.ignore.rules}, set())
+        scanner.scan()
+        self.assertEqual({r.base for r in scanner.ignore.rules}, {"pkg"})
+
+
+class TestIgnoreArgument(ScanCase):
+    def setUp(self) -> None:
+        super().setUp()
+        for relative in ("src/a.py", "dist/bundle.js", "legacy/old.py", "tmp/x.py"):
+            self.write(relative)
+
+    def test_an_empty_matcher_is_used_as_given(self) -> None:
+        empty = GitignoreMatcher()
+        scanner = Scanner(self.root, ignore=empty)
+        self.assertIs(scanner.ignore, empty)
+        self.assertEqual(
+            {f.relpath for f in scanner.scan().files},
+            {"dist/bundle.js", "legacy/old.py", "src/a.py", "tmp/x.py"},
+        )
+
+    def test_exclude_applies_alongside_a_custom_matcher(self) -> None:
+        custom = GitignoreMatcher.from_lines(["tmp/"])
+        found = self.relpaths(ignore=custom, exclude=("legacy/",))
+        self.assertEqual(found, {"dist/bundle.js", "src/a.py"})
+
+
+class TestInclude(ScanCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.write(".gitignore", "generated/\n")
+        for relative in (
+            "src/app.py", "generated/api.py", "generated/other.py",
+            "generated/sub/deep.py", "vendor/lib.py",
+        ):
+            self.write(relative)
+
+    def test_a_path_under_an_ignored_directory_is_forced_back_alone(self) -> None:
+        result = Scanner(self.root, include=("generated/api.py",)).scan()
+        self.assertEqual([f.relpath for f in result.files],
+                         ["generated/api.py", "src/app.py"])
+        self.assertEqual(result.skipped["generated/other.py"], "ignored")
+        self.assertEqual(result.skipped["generated/sub/"], "ignored")
+
+    def test_directory_spellings(self) -> None:
+        for item in ("vendor/", "./vendor", "VENDOR"):
+            with self.subTest(item=item):
+                self.assertIn("vendor/lib.py", self.relpaths(include=(item,)))
+
+    def test_a_forced_directory_path_brings_its_contents(self) -> None:
+        found = self.relpaths(include=("generated/sub",))
+        self.assertEqual(found, {"generated/sub/deep.py", "src/app.py"})
+
+
+class TestSymlinks(ScanCase):
+    def test_links_are_skipped_unless_followed(self) -> None:
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "credentials.py").write_text("SECRET = 'abc'\n", encoding="utf-8")
+        (outside / "lib").mkdir()
+        (outside / "lib" / "x.py").write_text("x = 1\n", encoding="utf-8")
+        self.write("src/app.py", "def main(): pass\n")
+        self.symlink(outside / "credentials.py", "src/settings_local.py")
+        self.symlink(self.root / "src" / "app.py", "src/alias.py")
+        self.symlink(outside / "lib", "src/lib")
+
+        result = Scanner(self.root).scan()
+        self.assertEqual([f.relpath for f in result.files], ["src/app.py"])
+        self.assertEqual(result.skipped["src/settings_local.py"], "symlink")
+        self.assertEqual(result.skipped["src/alias.py"], "symlink")
+        self.assertEqual(result.skipped["src/lib/"], "symlink")
+
+        result = Scanner(self.root, follow_symlinks=True).scan()
+        self.assertEqual([f.relpath for f in result.files],
+                         ["src/alias.py", "src/app.py"])
+        self.assertEqual(result.skipped["src/settings_local.py"],
+                         "symlink outside root")
+        self.assertEqual(result.skipped["src/lib/"], "symlink outside root")
+
+    def test_followed_loops_are_walked_once(self) -> None:
+        self.write("pkg/m.py")
+        self.symlink(".", "pkg/here")
+        self.symlink("..", "pkg/up")
+        result = Scanner(self.root, follow_symlinks=True).scan()
+        self.assertEqual([f.relpath for f in result.files], ["pkg/m.py"])
+        self.assertEqual(result.skipped["pkg/here/"], "symlink loop")
+        self.assertEqual(result.skipped["pkg/up/"], "symlink loop")
+
+    def test_a_real_path_wins_over_a_link_to_it(self) -> None:
+        self.write("z/m.py")
+        (self.root / "a").mkdir()
+        self.symlink("../z", "a/link")
+        result = Scanner(self.root, follow_symlinks=True).scan()
+        self.assertEqual([f.relpath for f in result.files], ["z/m.py"])
+        self.assertEqual(result.skipped["a/link/"], "symlink loop")
+
+
+@unittest.skipIf(sys.platform == "win32" or os.geteuid() == 0,
+                 "needs POSIX permissions")
+class TestUnreadable(ScanCase):
+    def test_unreadable_files_and_directories_are_reported(self) -> None:
+        self.write("src/ok.py", "x = 1\ny = 2\n")
+        locked = self.write("src/locked.py")
+        private = self.write("src/private/mod.py").parent
+        os.chmod(locked, 0)
+        os.chmod(private, 0)
+        try:
+            result = Scanner(self.root).scan()
+        finally:
+            os.chmod(locked, 0o644)
+            os.chmod(private, 0o755)
+        self.assertEqual([(f.relpath, f.lines) for f in result.files],
+                         [("src/ok.py", 2)])
+        denied = "unreadable: Permission denied"
+        self.assertEqual(result.skipped["src/locked.py"], denied)
+        self.assertEqual(result.skipped["src/private/"], denied)
+
+    def test_a_fifo_is_never_opened(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        os.mkfifo(self.root / "pipe.py")
+        result = Scanner(self.root).scan()
+        self.assertEqual(result.skipped["pipe.py"], "not a regular file")
+
+
+class TestGeneratedHeader(ScanCase):
+    def classify(self, relative: str, text: str) -> Role:
+        self.write(relative, text)
+        result = Scanner(self.root).scan()
+        return next(f.role for f in result.files if f.relpath == relative)
+
+    def test_markers_outside_the_header_do_not_count(self) -> None:
+        codegen = (
+            '"""Emit Go bindings from the schema."""\n'
+            'HEADER = "// Code generated by codegen.py. DO NOT EDIT.\\n"\n'
+        )
+        models = "class User:\n    id = 1  # autogenerated by the database\n"
+        settings = "DEBUG = False\n# Do not modify the order of MIDDLEWARE.\n"
+        check = "def test_marker():\n    assert '@generated' in header()\n"
+        self.assertIs(self.classify("tools/codegen.py", codegen), Role.SOURCE)
+        self.assertIs(self.classify("app/models.py", models), Role.SOURCE)
+        self.assertIs(self.classify("app/settings.py", settings), Role.SOURCE)
+        self.assertIs(self.classify("app/checks.py", check), Role.SOURCE)
+
+    def test_header_conventions(self) -> None:
+        go = ("// Copyright 2024 The Authors.\n\n"
+              "// Code generated by stringer. DO NOT EDIT.\n\npackage x\n")
+        thrift = ("/**\n * Autogenerated by Thrift Compiler (0.9.3)\n *\n"
+                  " * DO NOT EDIT\n */\nclass A {}\n")
+        openapi = ("/**\n * NOTE: This class is auto generated by OpenAPI Generator.\n"
+                   " * Do not edit the class manually.\n */\n")
+        meta = "#!/usr/bin/env python\n# @generated SignedSource<<abc>>\nX = 1\n"
+        self.assertIs(self.classify("x.go", go), Role.GENERATED)
+        self.assertIs(self.classify("A.java", thrift), Role.GENERATED)
+        self.assertIs(self.classify("api.ts", openapi), Role.GENERATED)
+        self.assertIs(self.classify("m.py", meta), Role.GENERATED)
+
+    def test_auto_generated_needs_do_not_edit(self) -> None:
+        note = "# Helpers for auto-generated clients.\nX = 1\n"
+        self.assertIs(self.classify("helpers.py", note), Role.SOURCE)
+
+
+class TestPythonRoles(ScanCase):
+    def classify(self, relative: str, text: str = "x = 1\n") -> Role:
+        self.write(relative, text)
+        result = Scanner(self.root).scan()
+        return next(f.role for f in result.files if f.relpath == relative)
+
+    def test_django_and_alembic_migrations_are_generated(self) -> None:
+        header = "# Generated by Django 4.2.7 on 2024-01-15 10:22\n\nX = 1\n"
+        self.assertIs(self.classify("shop/migrations/0001_initial.py", header),
+                      Role.GENERATED)
+        self.assertIs(self.classify("alembic/versions/1a2b_add.py"), Role.GENERATED)
+
+    def test_python_test_conventions(self) -> None:
+        for relative in ("shop/tests.py", "conftest.py", "pkg/util_tests.py", "test.py",
+                         "pkg/tests/helpers.py", "pkg/testing/helpers.py",
+                         "pkg/test/helpers.py", "test_cart.py", "pkg/test_cart.py",
+                         "pkg/tests_cart.py", "pkg/cart_test.py", "pkg/sub/conftest.py",
+                         "Test_Loud.PY", "deep/Tests/er/util.py"):
+            with self.subTest(relative=relative):
+                self.assertIs(self.classify(relative), Role.TEST)
+
+    def test_a_name_that_only_starts_with_test_is_no_test(self) -> None:
+        # Regression: every .py name starting `test` was a test, so undocumented.
+        # testing.py holds public helpers too, as click's CliRunner.
+        names = {"testament.py", "pkg/testing.py", "pkg/testing_utils.py",
+                 "pkg/tester.py", "pkg/testbed.py", "pkg/testimony.py"}
+        for relative in sorted(names):
+            with self.subTest(relative=relative):
+                self.assertIs(self.classify(relative), Role.SOURCE)
+        documentable = {f.relpath for f in Scanner(self.root).scan().documentable}
+        self.assertEqual(documentable, names)
+
+    def test_python_test_names_mark_only_python(self) -> None:
+        # Regression: `tests_` took other files' roles too, leaving source undocumented.
+        for relative, role in {"tests_api.js": Role.SOURCE,
+                               "tests_runner.go": Role.SOURCE,
+                               "tests_plan.md": Role.DOCS, "tests_notes.txt": Role.DOCS,
+                               "tests_settings.yaml": Role.CONFIG,
+                               "conftest.js": Role.SOURCE, "TESTS.md": Role.DOCS,
+                               "test.yaml": Role.CONFIG}.items():
+            with self.subTest(relative=relative):
+                self.assertIs(self.classify(relative), role)
+        self.write("tests_results.csv", "a,b\n")
+        result = Scanner(self.root).scan()
+        self.assertEqual(result.skipped["tests_results.csv"],
+                         "not a recognised source or config file")
+        self.assertEqual({f.relpath for f in result.documentable},
+                         {"tests_api.js", "tests_runner.go", "conftest.js"})
+
+
+if __name__ == "__main__":
+    unittest.main()

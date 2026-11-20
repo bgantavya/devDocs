@@ -1,56 +1,97 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# 77+ for PEP 639 license expressions.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "devDocs"
-version = "2.0.7"
-description = "AI-powered CLI tool that builds professional '*.md' documentation files of a project for internal teams using the Google Gemini API."
+dynamic = ["version"]
+description = "Documentation from source code: exact facts from parsers, model prose only where it adds something, on a hard budget. No dependencies."
 readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "MIT" }
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 
 authors = [
   { name = "Gantavya Bansal", email = "gantavyaoo@gmail.com" }
 ]
 
 keywords = [
-  "cli", "documentation", "readme", "generator", 
-  "google-gemini", "ai", "markdown", "docs-generator", 
-  "auto-readme", "open-source"
+  "cli", "documentation", "docs-generator", "llm", "gemini", "claude",
+  "markdown", "static-analysis", "code-documentation", "zero-dependency",
 ]
 
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Intended Audience :: Information Technology",
-  "Topic :: Documentation",
-  "Topic :: Software Development :: Code Generators",
-  "Topic :: Software Development :: Documentation",
-  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.11",
-  "Operating System :: OS Independent"
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Topic :: Documentation",
+  "Topic :: Software Development :: Documentation",
+  "Typing :: Typed",
 ]
 
-dependencies = [
-  "google-genai",
-  "httpx"
+# None, by design: everything runs on the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Anthropic's official SDK, as an alternative to the built-in raw-HTTP client.
+anthropic = ["anthropic>=1.0"]
+dev = [
+  "ruff>=0.16",
+  "mypy>=1.19",
+  "bandit>=1.8",
+  "pip-audit>=2.9",
+  "coverage>=7.10",
 ]
 
 [project.urls]
 Homepage = "https://github.com/bgantavya/devDocs"
 Repository = "https://github.com/bgantavya/devDocs"
 Issues = "https://github.com/bgantavya/devDocs/issues"
-Documentation = "https://github.com/bgantavya/devDocs#readme"
+Documentation = "https://github.com/bgantavya/devDocs/tree/v4/docs"
 
 [project.scripts]
-devDocs = "devDocs.cli:y"
+devdocs = "devdocs.cli:main"
 
-[tool.setuptools]
-packages = ["devDocs"]
-include-package-data = true
+[tool.setuptools.dynamic]
+version = { attr = "devdocs.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["devdocs*"]
+
+[tool.setuptools.package-data]
+devdocs = ["py.typed", "prompts/*.md", "render/assets/*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["devdocs", "scripts/release.py"]
+
+# Optional extra: type-checked as Any when it is not installed.
+[[tool.mypy.overrides]]
+module = ["anthropic", "anthropic.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["devdocs"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true

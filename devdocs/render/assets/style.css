@@ -1,0 +1,794 @@
+/* devdocs: one stylesheet for every page of the site, inlined in book.html.
+   Colours are tokens, redefined for dark mode and for print. The page source
+   puts the content before the sidebar, so a phone shows the content first;
+   wide screens place the sidebar left and "On this page" right.
+   No page scrolls sideways, whatever names a project has: a word too long
+   for its line breaks (one rule, on body); flex items holding text may
+   shrink below their longest word; and table columns after the first, which
+   hold prose, may break a word anywhere, so a table needs no more room than
+   its names, which stay whole where they fit. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --border: #d1d9e0;
+  --subtle: #f6f8fa;
+  --link: #0550ae;
+  --accent: #0969da;
+  --current: #ddf4ff;
+  --target: #fff8c5;
+  --node: #f6f8fa;
+  --node-border: #818b98;
+  --edge: #59636e;
+  --control-border: #818b98;
+  --shadow: 0 8px 24px rgb(66 74 83 / 18%);
+  --sans: system-ui, -apple-system, "Segoe UI", "Noto Sans", Helvetica, Arial,
+    sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  --measure: 46rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --border: #3d444d;
+    --subtle: #151b23;
+    --link: #4493f8;
+    --accent: #4493f8;
+    --current: #122d4f;
+    --target: #2f2609;
+    --node: #151b23;
+    --node-border: #768390;
+    --edge: #9198a1;
+    --control-border: #768390;
+    --shadow: 0 8px 24px rgb(1 4 9 / 60%);
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 1rem/1.6 var(--sans);
+  overflow-wrap: break-word;
+}
+
+a {
+  color: var(--link);
+  text-underline-offset: 0.15em;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+main:focus {
+  outline: none;
+}
+
+.skip-link {
+  position: absolute;
+  top: -4rem;
+  left: 0.75rem;
+  z-index: 20;
+  padding: 0.5rem 0.75rem;
+  border: 2px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.skip-link:focus {
+  top: 0.75rem;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Masthead and the filter the script adds to it */
+
+.masthead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.625rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--subtle);
+}
+
+.brand {
+  min-width: 0;
+  color: var(--fg);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.menu-link {
+  margin-left: auto;
+}
+
+.filter {
+  position: relative;
+  flex: 1 1 100%;
+}
+
+.filter input {
+  width: 100%;
+  padding: 0.375rem 0.625rem;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.9375rem;
+}
+
+.filter input::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.filter-results {
+  position: absolute;
+  top: calc(100% + 0.375rem);
+  right: 0;
+  z-index: 10;
+  width: min(30rem, calc(100vw - 2rem));
+  max-height: 70vh;
+  margin: 0;
+  padding: 0.375rem;
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  box-shadow: var(--shadow);
+}
+
+.filter-results a {
+  display: block;
+  padding: 0.375rem 0.625rem;
+  border-radius: 6px;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.filter-results a:hover,
+.filter-results a:focus-visible {
+  background: var(--subtle);
+}
+
+.filter-title {
+  display: block;
+  font-weight: 600;
+}
+
+.filter-summary {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.filter-empty {
+  padding: 0.375rem 0.625rem;
+  color: var(--muted);
+}
+
+/* Layout: one column on a phone; sidebar from 52rem; "On this page" from 80rem */
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+main {
+  min-width: 0;
+  padding: 1.5rem 1rem 4rem;
+}
+
+.intro,
+.body {
+  max-width: var(--measure);
+}
+
+.sidebar {
+  padding: 1rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.9375rem;
+}
+
+@media (min-width: 52rem) {
+  .masthead {
+    padding: 0.625rem 1.5rem;
+  }
+
+  .menu-link {
+    display: none;
+  }
+
+  .filter {
+    flex: 0 1 22rem;
+    margin-left: auto;
+  }
+
+  .layout {
+    grid-template-columns: 17rem minmax(0, 1fr);
+    grid-template-areas: "nav main";
+  }
+
+  .layout > main {
+    grid-area: main;
+    padding: 2rem 2.5rem 5rem;
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 0;
+    grid-area: nav;
+    align-self: start;
+    max-height: 100vh;
+    padding: 1.25rem 0.75rem 2rem;
+    overflow-y: auto;
+    border-top: 0;
+    border-right: 1px solid var(--border);
+  }
+}
+
+@media (min-width: 80rem) {
+  main.has-toc {
+    display: grid;
+    grid-template-columns: minmax(0, var(--measure)) 15rem;
+    grid-template-rows: auto 1fr;
+    grid-template-areas: "intro toc" "body toc";
+    column-gap: 3rem;
+  }
+
+  .intro {
+    grid-area: intro;
+  }
+
+  .body {
+    grid-area: body;
+  }
+
+  main.has-toc .toc {
+    position: sticky;
+    top: 1.5rem;
+    grid-area: toc;
+    align-self: start;
+    max-height: calc(100vh - 3rem);
+    margin: 0;
+    padding: 0 0 0 1rem;
+    overflow-y: auto;
+    border: 0;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+  }
+
+  main.has-toc .toc ul ul {
+    display: block;
+  }
+}
+
+/* Sidebar */
+
+.sidebar ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sidebar a {
+  display: block;
+  padding: 0.3rem 0.625rem;
+  border-radius: 6px;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.sidebar a:hover {
+  background: var(--subtle);
+}
+
+.sidebar a[aria-current="page"] {
+  background: var(--current);
+  box-shadow: inset 3px 0 0 var(--accent);
+  font-weight: 600;
+}
+
+.sidebar .open > a {
+  font-weight: 600;
+}
+
+.sidebar ul ul {
+  margin: 0.125rem 0 0.375rem 0.75rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid var(--border);
+}
+
+.sidebar ul ul a {
+  font-weight: 400;
+}
+
+.nav-label {
+  margin: 1.25rem 0 0.375rem;
+  padding: 0 0.625rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* Breadcrumbs, title and provenance */
+
+.crumbs ol {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.crumbs li {
+  min-width: 0;
+}
+
+.crumbs li + li::before {
+  content: "";
+  display: inline-block;
+  width: 0.4em;
+  height: 0.4em;
+  margin: 0 0.6em 0.12em 0.4em;
+  border: solid currentColor;
+  border-width: 1px 1px 0 0;
+  transform: rotate(45deg);
+}
+
+.crumbs a {
+  color: var(--muted);
+}
+
+.crumbs [aria-current] {
+  color: var(--fg);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  line-height: 1.25;
+}
+
+h1 {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 1.875rem;
+  font-weight: 650;
+}
+
+h2 {
+  margin: 2.5rem 0 1rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.375rem;
+  font-weight: 600;
+}
+
+h3 {
+  margin: 2rem 0 0.75rem;
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+
+h4,
+h5,
+h6 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.provenance {
+  margin: 0 0 1.25rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* "On this page" */
+
+.toc {
+  margin: 0 0 1.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.875rem;
+}
+
+.toc-title {
+  margin: 0 0 0.375rem;
+  font-weight: 600;
+}
+
+.toc ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.toc li {
+  margin: 0.2rem 0;
+}
+
+.toc ul ul {
+  display: none;
+  padding-left: 0.75rem;
+}
+
+.toc a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.toc a:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+
+.toc code {
+  padding: 0;
+  background: none;
+}
+
+/* Content */
+
+p,
+ul,
+ol,
+table,
+pre,
+figure {
+  margin: 0 0 1rem;
+}
+
+ul,
+ol {
+  padding-left: 1.5rem;
+}
+
+:is(section, .intro) > :is(ul, ol) > li + li {
+  margin-top: 0.25rem;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+}
+
+code {
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--subtle);
+  font-size: 0.875em;
+}
+
+pre {
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--subtle);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+pre code,
+h1 code,
+h2 code,
+h3 code,
+h4 code {
+  padding: 0;
+  background: none;
+  font-size: inherit;
+}
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  row-gap: 0.25rem;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.facts li {
+  min-width: 0;
+  margin: 0;
+}
+
+/* Before, not after: a fact that fills its line pushed a trailing dot onto
+   a line of its own. */
+.facts li + li::before {
+  content: "";
+  display: inline-block;
+  width: 0.25rem;
+  height: 0.25rem;
+  margin: 0 0.6rem 0.2rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.facts strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+}
+
+th,
+td {
+  padding: 0.45rem 0.75rem 0.45rem 0;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+td + td {
+  overflow-wrap: anywhere;
+}
+
+thead th {
+  border-bottom-width: 2px;
+  font-weight: 600;
+}
+
+.symbol {
+  margin: 0 0 2rem;
+}
+
+.async {
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 400;
+}
+
+.detail {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.members {
+  padding: 0;
+  list-style: none;
+}
+
+.members li {
+  margin: 0;
+  padding: 0.3rem 0 0.3rem 0.75rem;
+  border-left: 2px solid var(--border);
+}
+
+.members .members {
+  margin: 0.3rem 0 0;
+}
+
+:target {
+  scroll-margin-top: 1rem;
+}
+
+h3:target,
+h4:target,
+li:target,
+tr:target {
+  background: var(--target);
+}
+
+.colophon {
+  margin-top: 2.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* Diagrams: colours from the tokens, so one SVG suits both themes. On screen
+   a drawing keeps its size, so its labels stay legible, and scrolls sideways
+   when wider than the column; print fits it to the page. */
+
+.figure {
+  margin: 0 0 1.25rem;
+  overflow-x: auto;
+}
+
+svg.diagram {
+  display: block;
+  height: auto;
+  color: var(--edge);
+}
+
+svg.diagram .node rect {
+  fill: var(--node);
+  stroke: var(--node-border);
+}
+
+svg.diagram .node text {
+  fill: var(--fg);
+}
+
+@media (max-width: 40rem) {
+  table {
+    table-layout: fixed;
+  }
+}
+
+/* The book: one page holding every document, for an external PDF engine */
+
+.book main {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+
+.book .document {
+  margin-top: 3rem;
+  padding-top: 2rem;
+  border-top: 2px solid var(--border);
+  break-before: page;
+}
+
+.book .document > h2 {
+  margin: 0 0 0.5rem;
+  padding: 0;
+  border: 0;
+  font-size: 1.875rem;
+  font-weight: 650;
+}
+
+.book .document h3 {
+  margin: 2.5rem 0 1rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.375rem;
+}
+
+.book .document .symbol > h3,
+.book .document h4 {
+  margin: 2rem 0 0.75rem;
+  padding: 0;
+  border: 0;
+  font-size: 1.125rem;
+}
+
+/* Print, for a single page or the book */
+
+@page {
+  margin: 18mm 16mm 20mm;
+}
+
+/* The book's folio, as the built-in PDF engine sets it; the named page keeps
+   it off a site page printed alone. */
+@page book {
+  @bottom-center {
+    content: "Page " counter(page) " of " counter(pages);
+    color: #6b737d;
+    font-family: var(--sans);
+    font-size: 7.5pt;
+  }
+}
+
+.book {
+  page: book;
+}
+
+@media print {
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --fg: #000000;
+    --muted: #444444;
+    --border: #bbbbbb;
+    --subtle: #f3f3f3;
+    --link: #000000;
+    --target: transparent;
+    --node: #ffffff;
+    --node-border: #555555;
+    --edge: #333333;
+  }
+
+  html {
+    font-size: 10.5pt;
+  }
+
+  .skip-link,
+  .masthead,
+  .sidebar,
+  .toc,
+  .crumbs {
+    display: none;
+  }
+
+  .layout,
+  main.has-toc {
+    display: block;
+  }
+
+  main,
+  .layout > main,
+  .book main {
+    max-width: none;
+    padding: 0;
+  }
+
+  .intro,
+  .body {
+    max-width: none;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .book .document {
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    break-after: avoid;
+  }
+
+  pre,
+  figure,
+  tr,
+  .members li {
+    break-inside: avoid;
+  }
+
+  .figure {
+    overflow: visible;
+  }
+
+  svg.diagram {
+    max-width: 100%;
+  }
+}

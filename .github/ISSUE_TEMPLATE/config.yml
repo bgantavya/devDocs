@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security policy
+    url: https://github.com/bgantavya/devDocs/blob/v4/SECURITY.md
+    about: Report a vulnerability privately, as the policy describes. Do not open a public issue for it.
+  - name: Documentation
+    url: https://github.com/bgantavya/devDocs/tree/v4/docs
+    about: Installing devdocs, its commands and settings, costs, and troubleshooting.

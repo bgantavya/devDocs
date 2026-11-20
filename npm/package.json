@@ -1,0 +1,52 @@
+{
+  "name": "@bgantavya/devdocs",
+  "version": "4.0.0",
+  "description": "Documentation from source code: exact facts from parsers, model prose only where it adds something, on a hard budget. Runs the bundled devdocs with your Python 3.11+.",
+  "keywords": [
+    "cli",
+    "documentation",
+    "docs-generator",
+    "llm",
+    "gemini",
+    "claude",
+    "markdown",
+    "static-analysis",
+    "code-documentation",
+    "zero-dependency"
+  ],
+  "homepage": "https://github.com/bgantavya/devDocs/tree/v4/npm#readme",
+  "bugs": {
+    "url": "https://github.com/bgantavya/devDocs/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgantavya/devDocs.git",
+    "directory": "npm"
+  },
+  "license": "MIT",
+  "author": "Gantavya Bansal",
+  "type": "commonjs",
+  "bin": {
+    "devdocs": "bin/devdocs.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "scripts/postinstall.js",
+    "python",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "prepack": "node scripts/bundle.js",
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": "^20.17.0 || >=22.9.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

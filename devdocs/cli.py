@@ -1,0 +1,1063 @@
+"""The `devdocs` command line.
+
+    devdocs generate [PATH]   write docs for a project
+    devdocs estimate [PATH]   price a run without sending anything
+    devdocs export [PATH]     render the last run again, in other formats, free
+    devdocs doctor            check interpreter, configuration, key, provider
+    devdocs init [PATH]       write a starter devdocs.toml
+    devdocs models            models your key can use, with tier and price
+    devdocs cache stats|clear the local response cache
+
+Every failure maps to a stable exit code from `devdocs.errors`, so CI can tell
+a bad key (3) from a budget stop (7) from a spent daily quota (10). One that
+ends a command says `devdocs: error:`, as argparse's own do. Progress goes to
+stderr and results to stdout; `--json` makes stdout machine-readable.
+A v3-style invocation is translated by `devdocs.legacy`, with one notice; a
+command line that starts with a v4 command never is. Either way an argument
+error masks an API key that the line names, however it is spelled, as the
+notice does; and a key that `--` would make the project's path is refused,
+masked, for later errors would name that path.
+
+Ctrl-C and SIGTERM stop a paid run gracefully, and a second one at once; see
+`_Interrupts`. Anything else they end at once, saying what that leaves behind.
+Either way the exit status is 130 for SIGINT, 143 for SIGTERM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import importlib
+import json
+import os
+import queue
+import shlex
+import signal
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import asdict
+from datetime import date
+from pathlib import Path, PureWindowsPath
+from stat import S_ISLNK, S_ISREG
+from types import FrameType
+from typing import TYPE_CHECKING, Any, TextIO
+
+from devdocs import __version__
+from devdocs.config import (
+    CONFIG_FILENAME,
+    Config,
+    KeySource,
+    find_config_file,
+    key_variables,
+    load_config,
+    resolve_api_key,
+    search_start,
+)
+from devdocs.errors import ConfigError, DevDocsError, exit_code_for
+from devdocs.index.cache import ResponseCache
+from devdocs.index.db import Database
+from devdocs.index.ledger import DailyUsage
+from devdocs.legacy import (
+    KeyMaskingParser,
+    holds_key,
+    is_v3_invocation,
+    notice,
+    translate,
+)
+from devdocs.llm.budget import Budget, Router
+from devdocs.llm.catalog import CATALOG, PRICES_CHECKED, catalogued, find
+from devdocs.llm.client import CallEvent, LLMClient
+from devdocs.llm.factory import PROVIDERS, OfflineModel, make_provider
+from devdocs.llm.stop import Interrupted, leave_signals
+from devdocs.render import PDF_ENGINES
+
+if TYPE_CHECKING:
+    from devdocs.capabilities import Capability
+    from devdocs.generate import Estimate
+
+__all__ = ["build_parser", "main"]
+
+COMMANDS = ("generate", "estimate", "export", "doctor", "init", "models", "cache")
+STATE_DIR = ".devdocs"
+_LISTED = 10             # written files an export names; --json lists them all
+# Deliveries of a stop signal this close together are one request: one sent to
+# the process group reaches devdocs and npm/bin/devdocs.js, which may pass it on.
+_SAME_REQUEST = 1.0
+
+
+def _write(stream: TextIO, line: str) -> None:
+    """Print `line` and flush it, at best. What the stream cannot encode, as a
+    name in another script or one that is no text at all, it shows as an escape,
+    as stderr does. A stream that refuses the line, as one whose reader has gone
+    does (`| tee` ended by the same Ctrl-C), is pointed at os.devnull, as the
+    Python docs advise: no later line, nor Python's flush at exit, fails, so
+    unread output never ends a run or sets its status."""
+    try:
+        try:
+            print(line, file=stream, flush=True)
+        except UnicodeEncodeError:   # raised before any of `line` was written
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            print(line.encode(encoding, "backslashreplace").decode(encoding),
+                  file=stream, flush=True)
+    except OSError:
+        with contextlib.suppress(OSError, ValueError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, stream.fileno())
+            finally:
+                os.close(devnull)
+
+
+class _Output:
+    """stderr for progress, stdout for results; `--json` and `--quiet` aware."""
+
+    def __init__(self, *, as_json: bool = False, quiet: bool = False,
+                 stdout: TextIO | None = None, stderr: TextIO | None = None) -> None:
+        self.as_json = as_json
+        self.quiet = quiet
+        self.stdout = stdout or sys.stdout
+        self.stderr = stderr or sys.stderr
+
+    def info(self, message: str) -> None:
+        if not self.quiet:
+            _write(self.stderr, message)
+
+    def warn(self, message: str) -> None:
+        _write(self.stderr, f"warning: {message}")
+
+    def error(self, message: str) -> None:
+        """A failure that ends the command, in the form argparse gives its own."""
+        _write(self.stderr, f"devdocs: error: {message}")
+
+    def result(self, text: str, data: dict[str, Any]) -> None:
+        if self.as_json:
+            _write(self.stdout, json.dumps(data, indent=2, default=str))
+        else:
+            _write(self.stdout, text)
+
+    def event(self, event: CallEvent) -> None:
+        if self.quiet:
+            return
+        cost = f"  ${event.cost:.5f}" if event.cost else ""
+        detail = f"  ({event.detail})" if event.detail and event.kind != "call" else ""
+        self.info(f"  {event.kind:<9} {event.model:<24} {event.tag}{cost}{detail}")
+
+
+def _exit_now(code: int) -> None:
+    """End the process at once. Returning would not: Python joins the run's
+    worker threads before it exits, and those may be waiting on the wire."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(code)
+
+
+class _Interrupts:
+    """What SIGINT and SIGTERM do to a command, once `handling` installs this.
+
+    Outside `paying`, the first one stops the command at once, as Ctrl-C
+    always has: nothing bought is in flight. Inside, it sets `event`, the
+    run's stop signal: nothing more is sent, calls on the wire finish and
+    are kept, and the pages are written. A second delivery within
+    `_SAME_REQUEST` seconds of the first is the same request. A later one
+    ends the process at once, leaving the calls on the wire behind; the
+    answers received are cached, so the next run writes their pages free.
+
+    A stop exits with 128 plus the signal's number: 130 for SIGINT, 143 for
+    SIGTERM. 143 is what a shell, the npm wrapper, Docker and Kubernetes
+    report for a process SIGTERM ended, as it ended devdocs before this
+    handler; it stays, and tells a run its environment cancelled (`kill`,
+    timeout(1), a service manager's stop) from one stopped at the keyboard.
+    Stopping devdocs' own container gives 130: the image's STOPSIGNAL and
+    compose.yaml's stop_signal are SIGINT, which `docker stop`, compose and
+    the runtimes that honour STOPSIGNAL send.
+    """
+
+    def __init__(
+        self,
+        out: _Output,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        halt: Callable[[int], object] = _exit_now,
+    ) -> None:
+        self.event = threading.Event()
+        self.signum = 0          # the signal that asked to stop; 0 before one
+        self.paid = False        # `paying` has begun: answers may have been bought
+        self.writing = False     # `init` has begun on its files
+        self._asked = 0.0        # when, by `clock`
+        self._paying = False
+        self._requests: queue.SimpleQueue[int] = queue.SimpleQueue()  # for `_relay`
+        self._out = out
+        self._clock = clock
+        self._halt = halt
+
+    @property
+    def code(self) -> int:
+        """The exit status of a stop: 130, or 143 when SIGTERM asked for it."""
+        return 128 + (self.signum or signal.SIGINT)
+
+    @contextlib.contextmanager
+    def paying(self) -> Iterator[None]:
+        """While this lasts, a stop request lets the run end gracefully."""
+        relay = threading.Thread(target=self._relay, name="devdocs-stop", daemon=True)
+        relay.start()
+        try:
+            self.paid = self._paying = True
+            yield
+        finally:
+            self._paying = False
+            self._requests.put(0)
+            relay.join()
+
+    def _relay(self) -> None:
+        """Set `event` for each stop request `handle` queues, until a 0.
+        `handle` cannot: it may interrupt a wait on `event`, such as the
+        embedding limiter's on the main thread, where the wait holds the lock
+        `Event.set` takes. `SimpleQueue.put` is safe there."""
+        leave_signals()
+        while self._requests.get():
+            self.event.set()
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
+        """The handler of SIGINT and SIGTERM. It runs on the main thread
+        between two bytecodes, so it takes no lock that thread may hold, and
+        a line it cannot print never keeps it from acting."""
+        now = self._clock()
+        if self.signum:
+            if now - self._asked < _SAME_REQUEST:
+                return
+            try:
+                self._say("stopped at once; the answers received are cached, so "
+                          "the next run writes their pages for free"
+                          if self.paid else "stopped at once", warn=True)
+            finally:
+                self._halt(128 + signum)
+            return
+        self.signum, self._asked = signum, now
+        if not self._paying:
+            raise KeyboardInterrupt
+        self._requests.put(signum)
+        self._say("stopping: requests already sent finish and are kept, then the "
+                  "pages are written; interrupt again to stop at once")
+
+    def _say(self, message: str, *, warn: bool = False) -> None:
+        """Print from the handler, at best. If the main thread was itself
+        printing to stderr, the stream refuses a second writer: write to its
+        fd instead."""
+        try:
+            (self._out.warn if warn else self._out.info)(message)
+        except Exception:
+            line = f"{'warning: ' if warn else ''}{message}\n"
+            with contextlib.suppress(Exception):
+                os.write(self._out.stderr.fileno(), line.encode(errors="replace"))
+
+    @contextlib.contextmanager
+    def handling(self) -> Iterator[None]:
+        """Install `handle` for SIGINT and SIGTERM while the command runs,
+        then restore the handlers found. A signal the platform lacks, one
+        ignored when devdocs started (as for a background job), or one
+        handled outside Python is left alone."""
+        found: list[tuple[int, Any]] = []
+        for name in ("SIGINT", "SIGTERM"):
+            signum: int | None = getattr(signal, name, None)
+            if signum is None:
+                continue
+            previous = signal.getsignal(signum)
+            if previous is None or previous == signal.SIG_IGN:
+                continue
+            try:
+                signal.signal(signum, self.handle)
+            except ValueError:   # not the main thread: none can be installed
+                break
+            found.append((signum, previous))
+        try:
+            yield
+        finally:
+            for signum, previous in found:
+                signal.signal(signum, previous)
+
+
+# -- arguments -------------------------------------------------------------------
+
+
+_PATH_HELP = ("project root; else $DEVDOCS_PATH, the path in "
+              f"{CONFIG_FILENAME}, or the current directory")
+_INIT_PATH_HELP = "project root; else $DEVDOCS_PATH or the current directory"
+_JSON_HELP = "JSON on stdout"
+_KEY_HELP = "API key; else $GEMINI_API_KEY etc., or the config file"
+_PROVIDER_HELP = ("whose models write the prose; anthropic-sdk needs the anthropic "
+                  f"extra (default: {Config.provider})")
+
+
+def _csv(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _output_options(parser: argparse.ArgumentParser) -> None:
+    """The project, where its documents go, and in which formats."""
+    parser.add_argument("path", nargs="?", default=None, help=_PATH_HELP)
+    parser.add_argument("--out", help="output directory, relative to the project")
+    parser.add_argument("--format", action="append", type=_csv, default=None,
+                        dest="formats", metavar="FORMAT",
+                        help="markdown, html or pdf; repeat or comma-separate "
+                             "(default: markdown)")
+    parser.add_argument("--pdf-engine", choices=PDF_ENGINES,
+                        help="builtin (default), or chrome or weasyprint "
+                             "for all of Unicode")
+    parser.add_argument("--page-size", metavar="SIZE",
+                        help="PDF paper: A4 (default) or Letter")
+    parser.add_argument("--split", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="one PDF per document instead of one book")
+
+
+def _force_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--force", action="store_true",
+                        help="replace files in the output directory that "
+                             "devdocs has no record of writing")
+
+
+def _quiet_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="no progress lines on stderr")
+
+
+def _run_options(parser: argparse.ArgumentParser) -> None:
+    """What a run does, whether it sends it (generate) or prices it (estimate)."""
+    _output_options(parser)
+    parser.add_argument("--provider", choices=PROVIDERS, help=_PROVIDER_HELP)
+    parser.add_argument("--model", help="use this one model for every call")
+    parser.add_argument("--quality", choices=("cheap", "balanced", "high"),
+                        help="how much prose, from how strong a model "
+                             f"(default: {Config.quality})")
+    parser.add_argument("--context", choices=("off", "standard", "semantic"),
+                        help="retrieved cross-file context (default: standard, free)")
+    parser.add_argument("--max-cost", type=float, metavar="USD",
+                        help="stop before spending more than this "
+                             f"(0: no limit; default: {Config.max_cost:g})")
+    parser.add_argument("--max-requests", type=int, metavar="N",
+                        help="stop before sending more than this many requests to "
+                             "a model, retries included (0, the default: no limit)")
+    parser.add_argument("--concurrency", type=int, metavar="N",
+                        help="requests to a model at one time "
+                             f"(default: {Config.concurrency})")
+    parser.add_argument("--include", action="append", type=_csv, default=None,
+                        metavar="PATH",
+                        help="take in source files that ignores, --exclude or the "
+                             "size limit leave out; tests, vendored and generated "
+                             "code and files that are not source stay out. Literal "
+                             "text in any case, not a glob: a path from the project "
+                             "root, which also reaches inside an ignored directory; "
+                             "a file or directory name at any depth; or the end of "
+                             "a path, such as .sql. Repeat or comma-separate")
+    parser.add_argument("--exclude", action="append", type=_csv, default=None,
+                        metavar="PATTERN",
+                        help="leave these out, each read as a line of a .gitignore: "
+                             "globs (* ? [...] **), a trailing / for directories "
+                             "only, any other / to anchor it at the project root. "
+                             "Repeat or comma-separate. What --include takes in stays")
+    parser.add_argument("--per-file", action="store_true", default=None,
+                        help="v3 layout: docs/<dir>/<name>.md")
+    parser.add_argument("--paid", action="store_true",
+                        help="pace to paid-tier rate limits instead of free-tier")
+    parser.add_argument("--name", help="project name for the docs")
+    parser.add_argument("--description", help="one-line project description")
+    parser.add_argument("--json", action="store_true", help=_JSON_HELP)
+    _quiet_option(parser)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = KeyMaskingParser(
+        prog="devdocs",
+        description="Documentation from source code: exact facts, cheap prose.",
+    )
+    parser.add_argument("--version", action="version", version=f"devdocs {__version__}")
+    commands = parser.add_subparsers(dest="command", metavar="command")
+
+    generate = commands.add_parser("generate", help="write docs for a project")
+    _run_options(generate)
+    generate.add_argument("--api-key", default="", help=_KEY_HELP)
+    _force_option(generate)
+    generate.add_argument("--no-resume", action="store_true",
+                          help="start a fresh run instead of resuming")
+
+    estimate = commands.add_parser("estimate", help="price a run, send nothing")
+    _run_options(estimate)
+    estimate.add_argument("--explain", action="store_true",
+                          help="list every file with its plan and reason")
+
+    export = commands.add_parser(
+        "export", help="render the last run again, in other formats; no key, no cost"
+    )
+    _output_options(export)
+    _force_option(export)
+    export.add_argument("--json", action="store_true", help=_JSON_HELP)
+    _quiet_option(export)
+
+    doctor = commands.add_parser("doctor", help="check that a run can work")
+    doctor.add_argument("path", nargs="?", default=None, help=_PATH_HELP)
+    doctor.add_argument("--provider", choices=PROVIDERS, help=_PROVIDER_HELP)
+    doctor.add_argument("--api-key", default="", help=_KEY_HELP)
+    doctor.add_argument("--offline", action="store_true",
+                        help="skip the provider check")
+    doctor.add_argument("--json", action="store_true", help=_JSON_HELP)
+
+    init = commands.add_parser("init", help=f"write a starter {CONFIG_FILENAME}")
+    init.add_argument("path", nargs="?", default=None, help=_INIT_PATH_HELP)
+    init.add_argument("--provider", choices=PROVIDERS, default=Config.provider,
+                      help=_PROVIDER_HELP)
+    init.add_argument("--force", action="store_true", help="overwrite an existing file")
+
+    models = commands.add_parser("models", help="models your key can use")
+    models.add_argument("--provider", choices=PROVIDERS, help=_PROVIDER_HELP)
+    models.add_argument("--api-key", default="", help=_KEY_HELP)
+    models.add_argument("--json", action="store_true", help=_JSON_HELP)
+
+    cache = commands.add_parser("cache", help="inspect or clear the response cache")
+    cache.add_argument("action", choices=("stats", "clear"),
+                       help="what it holds and cost, or empty it")
+    cache.add_argument("path", nargs="?", default=None, help=_PATH_HELP)
+    cache.add_argument("--json", action="store_true", help=_JSON_HELP)
+    return parser
+
+
+def _flatten(values: list[list[str]] | None) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    return tuple(item for group in values for item in group)
+
+
+def _config(args: argparse.Namespace) -> Config:
+    overrides: dict[str, Any] = {
+        "path": getattr(args, "path", None),
+        "out": getattr(args, "out", None),
+        "provider": getattr(args, "provider", None),
+        "model": getattr(args, "model", None),
+        "quality": getattr(args, "quality", None),
+        "context": getattr(args, "context", None),
+        "max_cost": getattr(args, "max_cost", None),
+        "max_requests": getattr(args, "max_requests", None),
+        "concurrency": getattr(args, "concurrency", None),
+        "include": _flatten(getattr(args, "include", None)),
+        "exclude": _flatten(getattr(args, "exclude", None)),
+        "formats": _flatten(getattr(args, "formats", None)),
+        "pdf_engine": getattr(args, "pdf_engine", None),
+        "pdf_split": getattr(args, "split", None),
+        "page_size": getattr(args, "page_size", None),
+        "per_file": getattr(args, "per_file", None),
+        "name": getattr(args, "name", None),
+        "description": getattr(args, "description", None),
+    }
+    if getattr(args, "paid", False):
+        overrides["free_tier"] = False
+    config = load_config(overrides)
+    flags = _pdf_flags(config)
+    if flags and "pdf" not in config.formats:
+        raise ConfigError(
+            f"{', '.join(flags)} {'applies' if len(flags) == 1 else 'apply'} only "
+            f"to PDF output, which is not among the formats: "
+            f"{', '.join(config.formats)}",
+            hint="add --format pdf",
+        )
+    return config
+
+
+def _pdf_flags(config: Config) -> list[str]:
+    """The PDF options given on the command line, as typed. The file and the
+    environment may set them for every PDF a project makes; a flag is meant
+    for this one."""
+    named = {"pdf_engine": "--pdf-engine", "page_size": "--page-size",
+             "pdf_split": "--split" if config.pdf_split else "--no-split"}
+    return [flag for name, flag in named.items() if config.origin_of(name) == "flag"]
+
+
+def _state(config: Config, *, create: bool = True) -> Database:
+    """The project's state. With `create=False` none is made where there is
+    none yet, and the database is an empty one in memory: only generate,
+    which buys answers, makes .devdocs/."""
+    return Database(Path(config.path).resolve() / STATE_DIR / "devdocs.db",
+                    create=create)
+
+
+def _key(config: Config, explicit: str, out: _Output) -> str:
+    from devdocs.demo import DEMO_KEY
+
+    demo = DEMO_KEY if config.provider == "gemini" and DEMO_KEY else None
+    key, source = resolve_api_key(config, explicit=explicit, demo_key=demo)
+    config.key_source = source
+    if source.shared:
+        *others, last = key_variables(config.provider)
+        out.warn(
+            "using the shared demo key, whose free quota everyone shares. To use "
+            f"your own, pass --api-key, set {', '.join(others)} or {last}, or set "
+            f"api_key in {CONFIG_FILENAME}."
+        )
+    return key
+
+
+def _client(
+    config: Config,
+    db: Database,
+    out: _Output,
+    *,
+    key: str | None,
+    stop: threading.Event | None = None,
+) -> LLMClient:
+    """The model client. With `key=None` it is offline: it can quote prices
+    and read the cache, and refuses to send anything. `stop` is the run's
+    stop signal."""
+    model = make_provider(config.provider, key) if key is not None else OfflineModel(
+        "anthropic" if config.provider.startswith("anthropic") else config.provider
+    )
+    return LLMClient(
+        model,
+        router=Router(model.provider, quality=config.quality,
+                      pinned=config.model or None, free_only=config.free_tier),
+        budget=Budget(config.max_cost, config.max_requests),
+        cache=ResponseCache(db),
+        usage=DailyUsage(db),
+        free_tier=config.free_tier,
+        on_event=out.event,
+        stop=stop,
+    )
+
+
+# -- commands --------------------------------------------------------------------
+
+
+def _count(number: int, noun: str) -> str:
+    """`number` of `noun`, in the plural unless it is one."""
+    return f"{number:,} {noun}{'' if number == 1 else 's'}"
+
+
+def _generate(
+    args: argparse.Namespace, out: _Output, interrupts: _Interrupts
+) -> int:
+    from devdocs.generate import Pipeline
+
+    config = _config(args)
+    key = _key(config, args.api_key, out)
+    with _state(config) as db:
+        client = _client(config, db, out, key=key, stop=interrupts.event)
+        pipeline = Pipeline(config, client=client, db=db, log=out.info, warn=out.warn,
+                            project=config.name, description=config.description)
+        available = client.discover()
+        out.info(f"{config.provider}: {_count(len(available), 'model')} "
+                 "available to this key")
+        prepared = pipeline.prepare()
+        pipeline.check(prepared, force=args.force)   # buys nothing: a stop is at once
+        with interrupts.paying():
+            summary = pipeline.run(prepared, resume=not args.no_resume,
+                                   force=args.force, checked=True)
+
+    lines = [
+        f"{_count(summary.documents, 'document')} ({summary.prose:,} with prose, "
+        f"{summary.stubs:,} from facts alone) in {config.out}",
+        f"{_count(summary.requests, 'model call')}, "
+        f"{_count(summary.cache_hits, 'cache hit')}, {summary.input_tokens:,} input / "
+        f"{_count(summary.output_tokens, 'output token')}, ${summary.cost:.4f}",
+    ]
+    if summary.resumed:
+        lines.append(f"resumed run {summary.run_id}")
+    if summary.stopped:
+        lines.append(f"stopped early ({summary.stopped}); run again to resume")
+    for kind, item, error in summary.failed:
+        lines.append(f"failed {kind} {item or '(project)'}: {error}")
+    if summary.degraded:
+        lines.append(f"partial symbol tables: {', '.join(summary.degraded[:10])}")
+    lines.extend(_warnings(summary.warnings))
+    data = asdict(summary)
+    out.result("\n".join(lines), data)
+
+    if interrupts.signum or summary.stopped == "interrupted":
+        return interrupts.code   # asked to stop, even with nothing left to cut
+    if summary.stopped == "budget":
+        return 7
+    if summary.stopped == "quota":
+        return 10
+    return 4 if summary.failed else 0
+
+
+def _warnings(warnings: Sequence[str]) -> list[str]:
+    """A result line counting rendering warnings, which the log details."""
+    if not warnings:
+        return []
+    them = "it" if len(warnings) == 1 else "them all"
+    return [f"{_count(len(warnings), 'rendering warning')}; --json lists {them}"]
+
+
+def _export(args: argparse.Namespace, out: _Output) -> int:
+    from devdocs.generate import Pipeline
+
+    config = _config(args)
+    summary = Pipeline(config, log=out.info).export(force=args.force)
+    report = summary.written
+    run = f" (run of {summary.generated_at})" if summary.generated_at else ""
+    lines = [
+        f"{_count(summary.documents, 'document')}{run} as "
+        f"{', '.join(summary.formats)} in {config.out}: "
+        f"{_count(len(report.written), 'file')} written, "
+        f"{len(report.unchanged):,} unchanged",
+    ]
+    if len(report.written) <= _LISTED:
+        lines += [f"  {Path(config.out, path).as_posix()}" for path in report.written]
+    lines.extend(_warnings(summary.warnings))
+    out.result("\n".join(lines), asdict(summary))
+    return 0
+
+
+def _estimate(args: argparse.Namespace, out: _Output) -> int:
+    from devdocs.generate import Pipeline
+
+    config = _config(args)
+    with _state(config, create=False) as db:   # none yet: an empty one in memory
+        client = _client(config, db, out, key=None)
+        pipeline = Pipeline(config, client=client, db=db, log=out.info,
+                            project=config.name, description=config.description)
+        prepared = pipeline.prepare()
+        estimate = pipeline.estimate(prepared)
+
+    plan = prepared.plan
+    by_kind: dict[str, int] = {}
+    for item in estimate.items:
+        if not item.cached:
+            by_kind[item.kind] = by_kind.get(item.kind, 0) + item.requests
+    lines = [
+        f"{_count(len(plan.files), 'file')}: {len(plan.prose_files()):,} with prose, "
+        f"{len(plan.files) - len(plan.prose_files()):,} from facts alone",
+        f"{_count(estimate.requests, 'model call')} "
+        f"({', '.join(_count(n, k) for k, n in sorted(by_kind.items())) or 'none'}), "
+        f"{estimate.cached:,} already cached",
+        f"at most {estimate.input_tokens:,} input / "
+        f"{_count(estimate.output_tokens, 'output token')}, "
+        f"at most ${estimate.cost:.4f}",
+    ]
+    if config.free_tier and estimate.requests:
+        days = _free_days(estimate)
+        if days > 1:
+            lines.append(f"free tier: up to {days:,} days of daily quota, fewer if "
+                         "other models can take over; runs resume where they stop")
+    if estimate.demoted:
+        stubs = "a stub" if len(estimate.demoted) == 1 else "stubs"
+        flags = {"max_cost": f"--max-cost ${config.max_cost:g}",
+                 "max_requests": f"--max-requests {config.max_requests}"}
+        lines.append(f"{_count(len(estimate.demoted), 'item')} left as {stubs} to fit "
+                     + " and ".join(flags[name] for name in estimate.demoted_by))
+    if args.explain:
+        lines.append("")
+        for entry in plan.files:
+            lines.append(f"  {entry.mode.value:<5} {entry.score:7.2f}  {entry.relpath}"
+                         f"  ({entry.reason})")
+    out.result("\n".join(lines), {
+        "files": len(plan.files),
+        "prose_files": len(plan.prose_files()),
+        "requests": estimate.requests,
+        "cached": estimate.cached,
+        "input_tokens": estimate.input_tokens,
+        "output_tokens": estimate.output_tokens,
+        "worst_case_cost_usd": round(estimate.cost, 6),
+        "cost_limit_usd": config.max_cost or None,
+        "request_limit": config.max_requests or None,
+        "demoted": [list(item) for item in estimate.demoted],
+        "demoted_by": estimate.demoted_by,
+        "items": [asdict(item) for item in estimate.items],
+    })
+    return 0
+
+
+def _free_days(estimate: Estimate) -> int:
+    """The most days of free-tier quota the plan's calls take, by the daily
+    limit of the model each is priced at, as each has its own; 0 if one has none.
+
+    A run asks tier by tier, so each tier starts on the day the one before it
+    ends: their days add up, less those they share. That is the worst case.
+    Once a model's quota is spent the next model a key reaches takes over, so
+    a run may end sooner, even in one go; which it reaches, `estimate`, having
+    no key, cannot know. A pinned model has none to take over, nor has a tier
+    whose next models the free tier leaves out, so the line says "if".
+    """
+    needed: dict[str, int] = {}
+    for item in estimate.items:
+        if not item.cached:
+            needed[item.model] = needed.get(item.model, 0) + item.requests
+    days = 1
+    for model, requests in needed.items():
+        info = find(model)
+        if info is None or not info.free_rpd:
+            return 0
+        days += (requests - 1) // info.free_rpd
+    return days
+
+
+def _key_where(args: argparse.Namespace, source: KeySource) -> str:
+    """Where a key came from, never the key: the flag, the variable's name, or
+    the config file's path, looked for as `load_config` did, since `source`
+    holds only its name."""
+    if source.origin == "flag":
+        return "--api-key"
+    if source.origin == "file":
+        found = find_config_file(search_start(args.path, os.environ))
+        return str(found or source.detail)
+    return source.detail
+
+
+def _anthropic_sdk() -> Capability:
+    """Whether the `anthropic` package imports and has the client that provider
+    anthropic-sdk starts, with or without a key. Finding it would not do: a
+    broken install is found, and fails when the run starts. Nor would importing
+    it: so does a stray anthropic.py, or a folder of that name in the current
+    directory, which `python -m devdocs` puts on the path."""
+    from devdocs.capabilities import Capability
+    from devdocs.llm.anthropic_sdk import SDK_HINT
+
+    try:
+        sdk = importlib.import_module("anthropic")
+    except Exception as err:
+        return Capability("anthropic-sdk", False,
+                          f"cannot import anthropic: {type(err).__name__}: {err}",
+                          SDK_HINT)
+    if not callable(getattr(sdk, "Anthropic", None)):
+        found = (getattr(sdk, "__file__", None)
+                 or ", ".join(getattr(sdk, "__path__", ())))
+        return Capability("anthropic-sdk", False,
+                          f"no Anthropic client in the anthropic found at {found}",
+                          SDK_HINT)
+    version = str(getattr(sdk, "__version__", "imported"))
+    return Capability("anthropic-sdk", True, version)
+
+
+def _doctor(args: argparse.Namespace, out: _Output) -> int:
+    from devdocs.capabilities import Capability, probe_all
+    from devdocs.render.pdf.external import available_engines
+
+    report = probe_all()
+    engines = available_engines()   # builtin always among them
+    found = ", ".join(name if name == "builtin" else f"{name} ({path})"
+                      for name, path in engines.items())
+    lines = [str(report), str(Capability("pdf-engines", True, found)), ""]
+    data: dict[str, Any] = {"capabilities": [asdict(c) for c in report.capabilities],
+                            "pdf_engines": engines}
+    blocking = not report.ok
+
+    try:
+        config = _config(args)
+    except ConfigError as err:
+        lines.append(f"!! config               {err}")
+        out.result("\n".join(lines), {**data, "config": str(err)})
+        return 2
+    max_cost = f"${config.max_cost:g}" if config.max_cost else "no limit"
+    max_requests = config.max_requests or "no limit"
+    lines.append(f"ok config               provider={config.provider} "
+                 f"quality={config.quality} context={config.context} "
+                 f"max_cost={max_cost} max_requests={max_requests} "
+                 f"formats={','.join(config.formats)}")
+    data["formats"] = list(config.formats)
+    data["pdf_engine"] = {"configured": config.pdf_engine,
+                          "path": engines.get(config.pdf_engine)}
+    if "pdf" in config.formats and config.pdf_engine not in engines:
+        lines.append(f"!! pdf engine           {config.pdf_engine} is configured "
+                     "but not installed; PDF output will fail")
+        blocking = True
+    age = (date.today() - date.fromisoformat(PRICES_CHECKED)).days
+    if age > 180:
+        lines.append(f"!! prices               checked {PRICES_CHECKED}, {age:,} days "
+                     "ago; verify against the vendor's pricing page")
+
+    sdk = _anthropic_sdk() if config.provider == "anthropic-sdk" else None
+    if sdk is not None:
+        lines.append(str(sdk))
+        data["anthropic_sdk"] = asdict(sdk)
+        blocking = blocking or not sdk.ok
+
+    data["api_key"] = {"found": False, "origin": None, "where": None, "shared": False}
+    try:
+        key = _key(config, args.api_key, out)
+    except ConfigError as err:
+        lines.append(f"!! api key              {err}")
+        key = ""
+        blocking = True
+    else:
+        source = config.key_source
+        assert source is not None   # `_key` set it
+        where = _key_where(args, source)
+        data["api_key"] = {"found": True, "origin": source.origin, "where": where,
+                           "shared": source.shared}
+        lines.append(f"ok api key              from {source.origin} {where}".rstrip()
+                     + (" (shared demo key)" if source.shared else ""))
+
+    skipped = ("--offline" if args.offline
+               else "no API key" if not key
+               else "the anthropic SDK is not usable" if sdk and not sdk.ok
+               else "")
+    check = {"provider": config.provider, "status": "skipped", "detail": skipped}
+    if not skipped:
+        try:
+            model = make_provider(config.provider, key)
+            available = set(model.list_models())
+            reachable = catalogued(available)
+            known = [m.id for m in CATALOG
+                     if m.provider == model.provider and m.id in reachable]
+            detail = (f"{_count(len(available), 'model')}; "
+                      f"catalogued: {', '.join(known) or 'none'}")
+            lines.append(f"ok provider             {detail}")
+            data["models"] = sorted(available)
+            check.update(status="ok", detail=detail)
+        except DevDocsError as err:
+            lines.append(f"!! provider             {err}")
+            check.update(status="failed", detail=str(err))
+            blocking = True
+    data["provider_check"] = check
+
+    out.result("\n".join(lines), data)
+    return 1 if blocking else 0
+
+
+_TEMPLATE = """\
+# devdocs configuration. Command-line flags override this file.
+[devdocs]
+provider = "{provider}"       # gemini | anthropic | anthropic-sdk
+quality = "cheap"            # cheap | balanced | high
+# context = "standard"       # off | standard | semantic (Gemini embeddings)
+max_cost = 0.50              # USD ceiling per run; 0 disables it
+out = "docs"
+# formats = ["markdown"]     # any of markdown, html, pdf
+# pdf_engine = "builtin"     # builtin, or chrome | weasyprint for all of Unicode
+# pdf_split = false          # one PDF per document instead of one book
+# page_size = "A4"           # A4 | Letter
+# model = ""                 # pin one model for every call
+# include = ["scripts"]      # take source in despite ignores
+# exclude = ["examples/"]    # extra gitignore-style excludes
+# free_tier = true           # pace requests to free-tier limits
+"""
+
+
+def _ignore_entry(data: bytes) -> bytes:
+    """What to append to a .gitignore holding `data` to list the state
+    directory: nothing when a word of it, split as `str.split` splits, already
+    is that entry, even in a comment. It ends as most of the file's lines do,
+    in CRLF or LF. A last line without a break gets one first, and a last CR
+    just its LF: git reads CRLF as one break, a lone CR as none."""
+    entry = f"{STATE_DIR}/"
+    if entry in data.decode("utf-8", errors="replace").split():
+        return b""
+    crlf = data.count(b"\r\n")
+    ending = b"\r\n" if crlf and 2 * crlf >= data.count(b"\n") else b"\n"
+    if not data or data.endswith(b"\n"):
+        lead = b""
+    else:
+        lead = b"\n" if data.endswith(b"\r") else ending
+    return lead + entry.encode() + ending
+
+
+def _ignore_unfit(ignore: Path) -> str | None:
+    """Why `ignore`, which is there, can take no entry; None if it can. Only a
+    regular file can: since 2.32 git reads no .gitignore that is a link, nor
+    does devdocs' scan, and reading a FIFO would block. os.lstat follows no
+    link, so every Python says the same."""
+    info = os.lstat(ignore)
+    if S_ISLNK(info.st_mode):
+        return "it is a symbolic link, which git does not read"
+    return None if S_ISREG(info.st_mode) else "it is not a regular file"
+
+
+def _ignore_state(ignore: Path, written: Path, out: _Output) -> None:
+    """List the state directory in `ignore`, if that file lacks it; where
+    nothing has the name, make none. Only ever appends, so every byte, and the
+    file itself and its mode, stay as they were. Anything else by the name is
+    refused, as a file it cannot read is; see `_ignore_unfit`. `written` is
+    what the hint of a refusal says is done already."""
+    def refused(reason: str) -> ConfigError:
+        return ConfigError(
+            f"cannot add {STATE_DIR}/ to {ignore}: {reason}",
+            hint=f"{written} is written; add {STATE_DIR}/ to {ignore.name} yourself",
+        )
+
+    if not os.path.lexists(ignore):
+        return
+    try:
+        unfit = _ignore_unfit(ignore)
+        if unfit:
+            raise refused(unfit)
+        entry = _ignore_entry(ignore.read_bytes())
+        if not entry:
+            return
+        with ignore.open("ab") as stream:
+            stream.write(entry)
+    except OSError as err:
+        raise refused(err.strerror or str(err)) from err
+    out.info(f"added {STATE_DIR}/ to .gitignore (local cache and run ledger)")
+
+
+def _next_step(path: str | None, *, windows: bool = os.name == "nt") -> str:
+    """The command to run after init, to paste into a shell: quoted, after `--`
+    if it starts with a dash, and on Windows with `/` for `\\`, whose quotes
+    cmd.exe would keep. With no path given, DEVDOCS_PATH's: one set for init
+    alone (`DEVDOCS_PATH=app devdocs init`) is gone by the next command."""
+    if path is None:
+        path = os.environ.get("DEVDOCS_PATH", "").strip() or None
+    words = ["devdocs", "estimate"]
+    if path is not None:
+        if windows:
+            path = PureWindowsPath(path).as_posix()
+        words += ["--", path] if path.startswith("-") else [path]
+    return f"next: {shlex.join(words)}"
+
+
+def _link_to_nothing(path: Path) -> str | None:
+    """What `path` links to, if it is a link that leads nowhere: `exists` says
+    False of it, and writing through it would make that file, perhaps outside
+    the project. What else os.stat raises, the write would too."""
+    if not os.path.islink(path):
+        return None
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return os.readlink(path)
+    return None
+
+
+def _init(args: argparse.Namespace, out: _Output, interrupts: _Interrupts) -> int:
+    root = search_start(args.path, os.environ)   # before anything is written
+    target = root / CONFIG_FILENAME
+    try:
+        linked = _link_to_nothing(target)
+        if linked is not None:   # with --force too: it would make a file elsewhere
+            raise ConfigError(
+                f"cannot write {target}: it links to {linked}, which leads nowhere",
+                hint="remove the link, or make the file it names and pass --force",
+            )
+        if target.exists() and not args.force:
+            raise ConfigError(f"{target} already exists",
+                              hint="pass --force to replace it")
+        interrupts.writing = True
+        target.write_text(_TEMPLATE.format(provider=args.provider), "utf-8")
+    except OSError as err:
+        raise ConfigError(f"cannot write {target}: {err.strerror or err}") from err
+    out.info(f"wrote {target}")
+    _ignore_state(root / ".gitignore", target, out)
+    out.result(_next_step(args.path), {"config": str(target)})
+    return 0
+
+
+def _models(args: argparse.Namespace, out: _Output) -> int:
+    config = _config(args)
+    key = _key(config, args.api_key, out)
+    model = make_provider(config.provider, key)
+    available = set(model.list_models())
+    reachable = catalogued(available)
+    rows: list[dict[str, Any]] = []
+    for info in CATALOG:
+        if info.provider != model.provider:
+            continue
+        rows.append({
+            "id": info.id, "tier": info.tier.value, "available": info.id in reachable,
+            "input_per_mtok": info.input_per_mtok,
+            "output_per_mtok": info.output_per_mtok,
+            "free_rpm": info.free_rpm, "free_rpd": info.free_rpd,
+        })
+    lines = [f"{'model':<26} {'tier':<13} {'access':<7} {'$/Mtok in':>9} {'out':>7}"]
+    for row in rows:
+        lines.append(
+            f"{row['id']:<26} {row['tier']:<13} "
+            f"{'yes' if row['available'] else 'no':<7} "
+            f"{row['input_per_mtok']:>9.2f} {row['output_per_mtok']:>7.2f}"
+        )
+    others = len([m for m in available if not catalogued({m})])
+    lines.append(f"(+{_count(others, 'other model')}; pin one with --model)")
+    out.result("\n".join(lines), {"catalogued": rows, "available": sorted(available)})
+    return 0
+
+
+def _cache(args: argparse.Namespace, out: _Output) -> int:
+    config = load_config({"path": args.path})
+    with _state(config, create=False) as db:   # none yet: an empty one in memory
+        cache = ResponseCache(db)
+        if args.action == "clear":
+            removed = cache.clear()
+            text = f"removed {_count(removed, 'cached response')}"
+            if not os.path.exists(db.path):   # in memory: there was none
+                root = Path(config.path).resolve()
+                text = f"nothing to clear: {root} has no cache yet"
+            out.result(text, {"removed": removed})
+            return 0
+        entries, cost = cache.stats()
+    out.result(
+        f"{_count(entries, 'cached response')}, bought for ${cost:.4f} in total",
+        {"entries": entries, "cost_usd": cost},
+    )
+    return 0
+
+
+_HANDLERS = {   # and generate and init, which also take the interrupts
+    "estimate": _estimate,
+    "export": _export,
+    "doctor": _doctor,
+    "models": _models,
+    "cache": _cache,
+}
+
+_LEFT_BY_A_STOP = {   # and generate, init and cache; see `_left_by_a_stop`
+    "estimate": "nothing was sent, so nothing was spent",
+    "export": "each file written so far is whole; export again for the rest, for free",
+    "doctor": "the checks did not finish; nothing was changed",
+    "models": "nothing was changed",
+}
+
+
+def _left_by_a_stop(args: argparse.Namespace, interrupts: _Interrupts) -> str:
+    """What a stop that ended the command left behind, true wherever in the
+    command it came. For generate that turns on whether its paid part began.
+    For init, on whether it began on its files: only then may --force be
+    advised, which before that would replace a config it never touched. For
+    cache, on the action: a clear is one transaction, and stats only reads."""
+    if args.command == "generate":
+        if interrupts.paid:
+            return "documents written so far are kept, run again to resume"
+        return "nothing was bought and no documents were written"
+    if args.command == "init":
+        return ("its files may be unfinished; run it again with --force to finish "
+                "them" if interrupts.writing else "nothing was written")
+    if args.command == "cache":
+        return ("the cache is empty or as it was; `devdocs cache stats` tells which"
+                if args.action == "clear" else "the cache is as it was")
+    return _LEFT_BY_A_STOP[args.command]
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point for the `devdocs` script. Returns the process exit code."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if is_v3_invocation(arguments):
+        print(notice(arguments), file=sys.stderr)
+        arguments = translate(arguments)
+
+    parser = build_parser()
+    args = parser.parse_args(arguments)
+    if holds_key(getattr(args, "path", None) or ""):   # later refusals would show it
+        parser.error(f"argument path: expected a directory, got {args.path}")
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    out = _Output(as_json=getattr(args, "json", False),
+                  quiet=getattr(args, "quiet", False))
+    interrupts = _Interrupts(out)
+    with interrupts.handling():
+        try:
+            if args.command == "generate":
+                return _generate(args, out, interrupts)
+            if args.command == "init":
+                return _init(args, out, interrupts)
+            return _HANDLERS[args.command](args, out)
+        except (KeyboardInterrupt, Interrupted):
+            out.warn(f"interrupted; {_left_by_a_stop(args, interrupts)}")
+            return interrupts.code
+        except DevDocsError as err:
+            out.error(str(err))
+            return err.exit_code
+        except Exception as err:   # a bug: say so plainly, never as a clean stop
+            _write(out.stderr, f"devdocs: internal error: {type(err).__name__}: {err}")
+            if os.environ.get("DEVDOCS_DEBUG"):
+                raise
+            return exit_code_for(err)

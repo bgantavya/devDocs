@@ -1,0 +1,59 @@
+# Dependabot: weekly grouped updates for the pinned actions, the uv lock, the npm
+# wrapper and the container base image, proposing only versions a week old.
+# Subjects are ci(deps): or build(deps): (deps-dev for development dependencies),
+# types that never trigger a release. Dependabot reads this file only from the
+# default branch and updates that branch's manifests, so it takes effect once
+# v4 (later main) is the default; no target-branch, so it follows that switch.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+      include: scope
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: build
+      include: scope
+
+  - package-ecosystem: npm
+    directory: /npm
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        patterns: ["*"]
+    commit-message:
+      prefix: build
+      include: scope
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]
+    commit-message:
+      prefix: build
+      include: scope

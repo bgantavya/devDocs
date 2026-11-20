@@ -1,0 +1,55 @@
+# Editor/IDE
+.vscode
+.code
+.idea
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+.installed.cfg
+
+# Testing and tools
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging
+.env
+.env.local
+.env.*.local
+
+# npm wrapper: prepack copies these in
+node_modules/
+npm/python/
+npm/LICENSE
+npm/*.tgz
+
+# devdocs: its own state, and its output for this repository (devdocs.toml)
+.devdocs/
+/site/

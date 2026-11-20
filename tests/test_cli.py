@@ -1,0 +1,2705 @@
+"""The command line end to end: commands, output, exit codes. No network: the
+provider factory is replaced by the scripted model the pipeline tests use."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import errno
+import importlib
+import io
+import json
+import os
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import types
+import unittest
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import FrameType
+from typing import Any, TextIO
+from unittest import mock
+
+from devdocs import __version__, capabilities, cli, demo
+from devdocs import generate as generate_module
+from devdocs.capabilities import Capability, Report
+from devdocs.config import load_config
+from devdocs.errors import (
+    AuthError,
+    ConfigError,
+    DevDocsError,
+    ModelNotFound,
+    ProviderError,
+    QuotaExhausted,
+    RateLimited,
+    StorageError,
+)
+from devdocs.generate import Estimate, ExportSummary, PricedItem, RunSummary
+from devdocs.index import ledger
+from devdocs.index.db import Database
+from devdocs.llm import Completion, Request, catalog
+from devdocs.llm.client import LLMClient
+from devdocs.render import WriteReport
+from devdocs.render.markdown import MarkdownRenderer
+from devdocs.render.model import DocSet
+from devdocs.render.pdf import external
+from devdocs.render.pdf.check import PdfFile, check
+from tests.test_generate import MORE, PROJECT, PROSE, TaggedModel
+
+_KEYS = ("DEVDOCS_", "GEMINI_", "GOOGLE_", "ANTHROPIC_")
+
+
+@contextlib.contextmanager
+def clean_env(**extra: str) -> Iterator[None]:
+    """The process environment without any key or DEVDOCS_* setting."""
+    kept = {k: v for k, v in os.environ.items() if not k.startswith(_KEYS)}
+    with mock.patch.dict(os.environ, {**kept, **extra}, clear=True):
+        yield
+
+
+class CliCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        for relpath, text in PROJECT.items():
+            path = self.root / relpath
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        self.model = TaggedModel()
+
+    def run_cli(self, *argv: str, model: Any = None,
+                env: dict[str, str] | None = None) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        fake = model if model is not None else self.model
+        with clean_env(**(env or {})), \
+                mock.patch.object(cli, "make_provider", return_value=fake), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+
+class TestBasics(CliCase):
+    def test_no_command_prints_help(self) -> None:
+        code, out, _ = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertIn("generate", out)
+
+    def test_version(self) -> None:
+        with self.assertRaises(SystemExit) as caught, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.main(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn(__version__, out.getvalue())
+
+
+class TestArgumentErrors(unittest.TestCase):
+    """No argument error shows an API key, however the line spells it."""
+
+    KEY = "AIza-SECRET-0123"  # gitleaks:allow (a fake key)
+
+    def refused(self, *argv: str) -> str:
+        """The stderr of a command line argparse refuses, exiting 2."""
+        err = io.StringIO()
+        with clean_env(), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as caught:
+            cli.main(list(argv))
+        self.assertEqual(caught.exception.code, 2)
+        return err.getvalue()
+
+    def test_the_key_is_masked_however_it_is_spelled(self) -> None:
+        # Regression: argparse echoed the arguments it did not take, and a
+        # value it refused, as typed.
+        key = self.KEY
+        for argv, shown in (
+            (["generate", ".", "--", "--api-key", key],
+             "unrecognized arguments: --api-key ***\n"),
+            (["generate", ".", "--", f"--api-key={key}"],
+             "unrecognized arguments: --api-key=***\n"),
+            (["generate", ".", "--", f"--api={key}"],
+             "unrecognized arguments: --api=***\n"),
+            (["generate", ".", "--", "--a", key], "unrecognized arguments: --a ***\n"),
+            (["export", ".", "--api-key", key],
+             "unrecognized arguments: --api-key ***\n"),
+            (["estimate", ".", "--api-key", key],      # it sends nothing
+             "unrecognized arguments: --api-key ***\n"),
+            (["estimate", ".", f"--api-key={key}"],
+             "unrecognized arguments: --api-key=***\n"),
+            ([f"--api-key={key}", "generate", "."],
+             "unrecognized arguments: --api-key=***\n"),
+            (["--api-key", key, "generate", "."],
+             "argument command: invalid choice: '***'"),
+            (["--ap", key, "generate", "."], "argument command: invalid choice: '***'"),
+            (["cache", "--api-key", key, "stats"],
+             "devdocs cache: error: argument action: invalid choice: '***'"),
+            (["-p", ".", "--", "--api-key", key],                # v3, then v4
+             "unrecognized arguments: -- --api-key ***\n"),
+            (["-p", ".", "--", f"--api-key={key}"],
+             "unrecognized arguments: -- --api-key=***\n"),
+        ):
+            with self.subTest(argv=argv):
+                err = self.refused(*argv)
+                self.assertNotIn(key, err)
+                self.assertIn(shown, err)
+        # 3.11 takes `--` itself for the command; later versions what follows
+        self.assertNotIn(key, self.refused("--", f"--api-key={key}"))
+
+    def test_the_key_is_masked_behind_a_flag_argparse_does_not_know(self) -> None:
+        # Regression: only what argparse takes for --api-key was masked, so a
+        # key after a mistyped flag was shown whole, on a v3 line twice.
+        key = self.KEY
+        for flag in ("-api-key", "--api_key", "-api_key", "--apikey", "--API-KEY",
+                     "---api-key", "--api.key", "--api-keys", "--gemini-api-key",
+                     "--GEMINI_API_KEY", "--token", "--secret"):
+            for line in (["generate", "."], ["-p", "."]):
+                with self.subTest(flag=flag, line=line):
+                    err = self.refused(*line, flag, key)
+                    self.assertNotIn(key, err)
+                    self.assertIn(f"unrecognized arguments: {flag} ***\n", err)
+                    err = self.refused(*line, f"{flag}={key}")
+                    self.assertNotIn(key, err)
+                    self.assertIn(f"unrecognized arguments: {flag}=***\n", err)
+        err = self.refused("generate", ".", "--key", key)   # in v3, --keywords
+        self.assertNotIn(key, err)
+        self.assertIn("unrecognized arguments: --key ***\n", err)
+        for line in (["generate", "."], ["-p", "."]):
+            with self.subTest(line=line):
+                err = self.refused(*line, f"GEMINI_API_KEY={key}")   # as in a shell
+                self.assertNotIn(key, err)
+                self.assertIn("unrecognized arguments: GEMINI_API_KEY=***\n", err)
+
+    def test_a_double_dash_does_not_part_the_key_from_its_flag(self) -> None:
+        # Regression: the `--` was masked in the key's place, and the key shown.
+        key = self.KEY
+        for argv, shown in (
+            (["export", ".", "--api-key", "--", key], "--api-key -- ***"),
+            (["generate", ".", "--apikey", "--", key], "--apikey -- ***"),
+            (["generate", ".", "--", "--api-key", "--", key], "--api-key -- ***"),
+            (["-p", ".", "--api_key", "--", key], "--api_key -- ***"),
+        ):
+            with self.subTest(argv=argv):
+                err = self.refused(*argv)
+                self.assertNotIn(key, err)
+                self.assertIn(f"unrecognized arguments: {shown}\n", err)
+
+    def test_a_key_read_as_the_project_is_refused(self) -> None:
+        # Regression: `--` made it the project's path, which the refusal named,
+        # `doctor` on stdout.
+        key = self.KEY
+        for line in (["generate"], ["estimate"], ["export"], ["doctor"], ["init"],
+                     ["cache", "stats"]):
+            for flag in ("--api-key", "--api_key"):
+                with self.subTest(line=line, flag=flag):
+                    err = self.refused(*line, "--", f"{flag}={key}")
+                    self.assertNotIn(key, err)
+                    self.assertIn("argument path: expected a directory, got "
+                                  f"{flag}=***\n", err)
+        err = self.refused("generate", f"GEMINI_API_KEY={key}")   # as in a shell
+        self.assertNotIn(key, err)
+        self.assertIn("got GEMINI_API_KEY=***\n", err)
+
+    def test_a_path_with_an_equals_sign_is_still_a_path(self) -> None:
+        for path in ("a=b", "api=v2", "./key=1", "--out=docs"):
+            with self.subTest(path=path):
+                err = io.StringIO()
+                with clean_env(), contextlib.redirect_stderr(err):
+                    self.assertEqual(cli.main(["generate", "--", path]), 2)
+                self.assertIn(f"{Path(path).name} does not exist", err.getvalue())
+
+    def test_the_rest_of_the_message_stays_as_it_was(self) -> None:
+        err = self.refused("generate", ".", "--api-key", "k", "--bogus", "keep")
+        self.assertIn("devdocs: error: unrecognized arguments: --bogus keep\n", err)
+
+
+class TestGenerate(CliCase):
+    def test_generate_writes_docs_and_reports_json(self) -> None:
+        code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--json", "--quiet")
+        self.assertEqual(code, 0)
+        summary = json.loads(out)
+        self.assertGreater(summary["prose"], 0)
+        self.assertEqual(summary["failed"], [])
+        self.assertTrue((self.root / "docs" / "README.md").is_file())
+        self.assertTrue((self.root / ".devdocs" / "devdocs.db").is_file())
+
+    def test_no_key_is_a_config_error(self) -> None:
+        code, _, err = self.run_cli("generate", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("no API key", err)
+
+    def test_a_rejected_key_exits_3(self) -> None:
+        class Rejecting(TaggedModel):
+            def list_models(self) -> list[str]:
+                raise AuthError("Gemini rejected the API key")
+
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "bad",
+                                    model=Rejecting())
+        self.assertEqual(code, 3)
+        self.assertIn("rejected", err)
+
+    def test_v3_flags_are_translated(self) -> None:
+        # v3 wrote under --output in the current directory
+        with contextlib.chdir(self.root):
+            code, _, err = self.run_cli("-p", str(self.root), "--output", "manual",
+                                        "--include", "tests", "--api-key", "k")
+        self.assertEqual(code, 0)
+        self.assertIn("deprecated", err)
+        self.assertTrue((self.root / "manual" / "shop" / "cart.md").is_file())
+
+    def test_a_v3_key_reaches_the_provider(self) -> None:
+        err = io.StringIO()
+        with contextlib.chdir(self.root), clean_env(), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err), \
+                mock.patch.object(cli, "make_provider",
+                                  return_value=self.model) as made:
+            code = cli.main(["-p", ".", "--api-key", "AIza-SECRET"])
+        self.assertEqual(code, 0, err.getvalue())
+        made.assert_called_once_with("gemini", "AIza-SECRET")
+
+    def test_the_v3_notice_masks_the_key(self) -> None:
+        for spelling in (["--api-key", "AIza-SECRET"], ["--api-key=AIza-SECRET"],
+                         ["--api", "AIza-SECRET"]):
+            with self.subTest(spelling=spelling), contextlib.chdir(self.root):
+                code, _, err = self.run_cli("-p", ".", *spelling)
+                self.assertEqual(code, 0)
+                self.assertIn("deprecated; running `devdocs generate . ", err)
+                self.assertNotIn("AIza-SECRET", err)
+
+    def test_a_v3_line_v3_rejects_masks_the_key_too(self) -> None:
+        # --a abbreviates v3's --authors and --api-key alike
+        err = io.StringIO()
+        with contextlib.chdir(self.root), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as caught:
+            cli.main(["-p", ".", "--a=AIza-SECRET"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("ambiguous option: --a=*** could match", err.getvalue())
+        self.assertNotIn("AIza-SECRET", err.getvalue())
+        self.assertEqual(self.model.calls, [])
+
+    def test_a_v4_command_line_is_never_translated(self) -> None:
+        # `--output` is a v3 flag; read as v3, this would run a paid generate.
+        with self.assertRaises(SystemExit) as caught, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli("export", str(self.root), "--output", "manual")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.model.calls, [])
+        self.assertFalse((self.root / "manual").exists())
+
+    def test_formats_reach_the_pipeline(self) -> None:
+        code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--format", "html", "--format", "markdown,pdf",
+                                    "--page-size", "letter", "--json", "--quiet")
+        self.assertEqual(code, 0)
+        docs = self.root / "docs"
+        for page in ("README.md", "index.html", "assets/style.css", "shop.pdf"):
+            self.assertTrue((docs / page).is_file(), page)
+        book = (docs / "shop.pdf").read_bytes()
+        self.assertEqual(check(book), [])
+        self.assertEqual(PdfFile(book).page(0)["MediaBox"], [0, 0, 612, 792])
+        self.assertEqual(json.loads(out)["warnings"], [])
+
+    def test_only_the_formats_asked_for_are_written(self) -> None:
+        code, _, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                  "--format", "pdf", "--split", "--quiet")
+        self.assertEqual(code, 0)
+        docs = self.root / "docs"
+        self.assertTrue((docs / "pdf" / "index.pdf").is_file())
+        self.assertTrue((docs / "pdf" / "shop" / "cart.py.pdf").is_file())
+        self.assertFalse((docs / "README.md").exists())
+
+    def test_impossible_pdf_options_are_config_errors(self) -> None:
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--format", "pdf", "--pdf-engine", "chrome",
+                                    "--split")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot split", err)
+        with mock.patch.object(external, "find", return_value=None):
+            code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                        "--format", "pdf", "--pdf-engine", "chrome")
+        self.assertEqual(code, 2)
+        self.assertIn("chrome PDF engine is not installed", err)
+        self.assertEqual(self.model.calls, [])
+
+    def test_no_split_overrides_the_file(self) -> None:
+        # Regression: --split could only say yes, so the file always won.
+        (self.root / "devdocs.toml").write_text("pdf_split = true\n", "utf-8")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--format", "pdf", "--no-split", "--quiet")
+        self.assertEqual(code, 0, err)
+        docs = self.root / "docs"
+        self.assertTrue((docs / "shop.pdf").is_file())
+        self.assertFalse((docs / "pdf").exists())
+
+    def test_a_split_file_does_not_break_commands_without_pdf(self) -> None:
+        (self.root / "devdocs.toml").write_text("pdf_split = true\n", "utf-8")
+        chrome = {"DEVDOCS_PDF_ENGINE": "chrome"}
+        code, _, err = self.run_cli("cache", "stats", str(self.root), env=chrome)
+        self.assertEqual(code, 0, err)
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", env=chrome)
+        self.assertEqual(code, 0, err)
+
+    def test_pdf_options_without_pdf_output_are_config_errors(self) -> None:
+        # Regression: they were ignored, and the run wrote Markdown alone.
+        for flags in (["--pdf-engine", "chrome"], ["--split"], ["--no-split"],
+                      ["--page-size", "letter", "--format", "html"]):
+            with self.subTest(flags):
+                code, _, err = self.run_cli("generate", str(self.root), "--api-key",
+                                            "k", *flags)
+                self.assertEqual(code, 2)
+                self.assertIn(f"{flags[0]} applies only to PDF output", err)
+                self.assertIn("add --format pdf", err)
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--page-size", "letter", "--split")
+        self.assertEqual(code, 2)
+        self.assertIn("--page-size, --split apply only to PDF output", err)
+        self.assertEqual(self.model.calls, [])
+
+    def test_an_empty_format_list_is_refused_before_anything_is_bought(self) -> None:
+        self.run_cli("generate", str(self.root), "--api-key", "k", "--quiet")
+        docs = sorted(p.name for p in (self.root / "docs").iterdir())
+        calls = len(self.model.calls)
+        for argv, env in ((["--format", ""], None), ([], {"DEVDOCS_FORMATS": ","})):
+            with self.subTest(argv=argv, env=env):
+                code, _, err = self.run_cli("generate", str(self.root), "--api-key",
+                                            "k", *argv, env=env)
+                self.assertEqual(code, 2)
+                self.assertIn("no output format configured", err)
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertEqual(sorted(p.name for p in (self.root / "docs").iterdir()), docs)
+
+    def test_a_hand_written_page_in_the_way_is_kept(self) -> None:
+        # Regression: the run paid for every call first, then refused.
+        readme = self.root / "docs" / "README.md"
+        readme.parent.mkdir()
+        readme.write_text("# Our documentation\n", "utf-8")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet")
+        self.assertEqual(code, 2)
+        self.assertIn("has no record of writing: README.md\n"
+                      "  hint: move it away or choose another --out; "
+                      "--force replaces it\n", err)
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(sorted(p.name for p in readme.parent.iterdir()),
+                         ["README.md"])
+        self.assertEqual(readme.read_text("utf-8"), "# Our documentation\n")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertGreater(len(self.model.calls), 0)
+        self.assertIn("Generated by devdocs", readme.read_text("utf-8"))
+
+    def test_an_embedding_failure_is_warned_of_even_under_quiet(self) -> None:
+        # Regression: the warning went to the progress lines --quiet silences.
+        class DownEmbedder(TaggedModel):
+            dimensions = 8
+
+            def embed(self, texts: list[str], *,
+                      query: bool = False) -> list[list[float]]:
+                raise ProviderError("HTTP 500", status=500, retryable=False)
+
+        said = ("warning: semantic context: embedding failed (HTTP 500); files "
+                "without vectors get standard context, and the next run tries again\n")
+        for quiet in (["--quiet"], []):
+            with self.subTest(quiet=quiet):
+                code, _, err = self.run_cli("generate", str(self.root), "--api-key",
+                                            "k", "--context", "semantic", *quiet,
+                                            model=DownEmbedder())
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err.count(said), 1, err)
+                if quiet:
+                    self.assertEqual(err, said)
+
+    def test_a_run_checks_its_output_once(self) -> None:
+        pipeline = generate_module.Pipeline
+        with mock.patch.object(pipeline, "check", autospec=True,
+                               side_effect=pipeline.check) as checked:
+            code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                        "--quiet")
+        self.assertEqual((code, checked.call_count), (0, 1), err)
+
+    def test_a_failing_pdf_engine_costs_only_the_pdf(self) -> None:
+        # Regression: nothing was written, not even the manifest export needs.
+        broken = DevDocsError("chrome could not print the book (exit status 1)",
+                              hint="run chrome by hand to see why")
+        with mock.patch.object(external, "find", return_value="/bin/chrome"), \
+                mock.patch.object(external, "render", side_effect=broken):
+            code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                        "--format", "markdown,pdf", "--pdf-engine",
+                                        "chrome", "--json", "--quiet")
+        self.assertEqual(code, 4)
+        summary = json.loads(out)
+        ((kind, item, error),) = summary["failed"]
+        self.assertEqual((kind, item), ("format", "pdf"))
+        self.assertIn("chrome could not print the book (exit status 1)\n"
+                      "  hint: run chrome by hand to see why; `devdocs export ", error)
+        self.assertIn(" --format pdf --pdf-engine chrome` makes it from the manifest, "
+                      "with no key", error)
+        docs = self.root / "docs"
+        listed = json.loads((docs / "index.json").read_bytes())["files"]
+        self.assertIn("README.md", listed)
+        self.assertGreater(summary["requests"], 0)
+        code, _, err = self.run_cli("export", str(self.root), "--format", "pdf")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(check((docs / "shop.pdf").read_bytes()), [])
+
+
+class TestFatalErrors(CliCase):
+    """A failure that ends a command says `error:`, in argparse's form."""
+
+    def failing(self, failure: Exception) -> tuple[int, str]:
+        """The exit code and stderr of a generate whose model raises `failure`."""
+        class Failing(TaggedModel):
+            def list_models(self) -> list[str]:
+                raise failure
+
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", model=Failing())
+        return code, err
+
+    def test_every_typed_failure_says_error(self) -> None:
+        # Regression: a rejected key said "warning:", and the others neither.
+        for failure, code in ((AuthError("rejected"), 3),
+                              (ConfigError("refused"), 2),
+                              (ProviderError("down"), 4),
+                              (RateLimited("slow down"), 5),
+                              (ModelNotFound("gone"), 6),
+                              (QuotaExhausted("spent"), 10),
+                              (StorageError("damaged"), 9),
+                              (DevDocsError("failed"), 1)):
+            with self.subTest(type(failure).__name__):
+                exit_code, err = self.failing(failure)
+                self.assertEqual(exit_code, code)
+                self.assertIn(f"devdocs: error: {failure.message}", err)
+                self.assertNotIn("warning:", err)
+
+    def test_the_hint_follows_the_error(self) -> None:
+        code, err = self.failing(AuthError("rejected", hint="check the key"))
+        self.assertEqual(code, 3)
+        self.assertEqual(err, "devdocs: error: rejected\n  hint: check the key\n")
+
+    def test_a_config_error_from_the_command_itself_says_error(self) -> None:
+        code, _, err = self.run_cli("generate", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("devdocs: error: no API key for provider 'gemini'\n", err)
+
+    def test_a_bug_says_so(self) -> None:
+        code, err = self.failing(ValueError("oops"))
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "devdocs: internal error: ValueError: oops\n")
+
+
+class OneModel(TaggedModel):
+    """A key that can reach one catalogued model, and one other."""
+
+    def list_models(self) -> list[str]:
+        return ["gemini-2.5-flash-lite", "some-other-model"]
+
+
+class TestCounts(CliCase):
+    """One of anything is singular. Regression: "1 documents", and the like."""
+
+    def lone_file(self) -> str:
+        """A project of one undocumented file, which gets prose."""
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        Path(root, "a.py").write_text("def f():\n    return 1\n", "utf-8")
+        return root
+
+    def test_the_summary_of_a_run(self) -> None:
+        summary = RunSummary(documents=1, prose=1, requests=1, cache_hits=1,
+                             input_tokens=1, output_tokens=1)
+        with mock.patch.object(generate_module.Pipeline, "run", return_value=summary):
+            code, out, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                          model=OneModel())
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 document (1 with prose, 0 from facts alone) in docs\n"
+                      "1 model call, 1 cache hit, 1 input / 1 output token, $0.0000\n",
+                      out)
+        self.assertIn("gemini: 2 models available to this key", err)
+
+    def test_the_summary_of_a_bigger_run(self) -> None:
+        # Regression: 1500 on one line, 1,500 on the next.
+        summary = RunSummary(documents=3000, prose=1500, stubs=1500, requests=2,
+                             cache_hits=2, input_tokens=1500, output_tokens=1500)
+        with mock.patch.object(generate_module.Pipeline, "run", return_value=summary):
+            _, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k")
+        self.assertIn("3,000 documents (1,500 with prose, 1,500 from facts alone) in "
+                      "docs\n2 model calls, 2 cache hits, "
+                      "1,500 input / 1,500 output tokens, ", out)
+
+    def test_a_bigger_estimate(self) -> None:
+        plan = mock.Mock(files=[None] * 3000)
+        plan.prose_files.return_value = [None] * 1500
+        cached = PricedItem("file", "a.py", "gemini-2.5-flash-lite", 0, 0, 0.0, True)
+        with mock.patch.object(generate_module.Pipeline, "prepare",
+                               return_value=mock.Mock(plan=plan)), \
+                mock.patch.object(generate_module.Pipeline, "estimate",
+                                  return_value=Estimate(items=[cached] * 1200)):
+            _, out, err = self.run_cli("estimate", str(self.root))
+        self.assertIn("3,000 files: 1,500 with prose, 1,500 from facts alone\n"
+                      "0 model calls (none), 1,200 already cached\n", out, err)
+
+    def test_a_bigger_export(self) -> None:
+        report = WriteReport(written=["a"] * 1500, unchanged=["b"] * 1500)
+        summary = ExportSummary(documents=3000, formats=["html"], written=report)
+        with mock.patch.object(generate_module.Pipeline, "export",
+                               return_value=summary):
+            _, out, err = self.run_cli("export", str(self.root))
+        self.assertIn("3,000 documents as html in docs: 1,500 files written, "
+                      "1,500 unchanged\n", out, err)
+
+    def test_a_limit_is_named_as_it_is_typed(self) -> None:
+        # A flag's value: --max-requests 1,500 would be refused.
+        kept = PricedItem("file", "a.py", "gemini-2.5-flash-lite", 1, 1, 0.1, False,
+                          requests=1500)
+        over = Estimate(items=[kept], demoted={("file", "b.py"): "max_requests"})
+        plan = mock.Mock(files=[None] * 2)
+        plan.prose_files.return_value = [None]
+        with mock.patch.object(generate_module.Pipeline, "prepare",
+                               return_value=mock.Mock(plan=plan)), \
+                mock.patch.object(generate_module.Pipeline, "estimate",
+                                  return_value=over):
+            _, out, err = self.run_cli("estimate", str(self.root), "--max-cost", "0",
+                                       "--max-requests", "1500")
+        self.assertIn("1 item left as a stub to fit --max-requests 1500\n", out, err)
+
+    def test_a_key_that_reaches_one_model(self) -> None:
+        class Lone(TaggedModel):
+            def list_models(self) -> list[str]:
+                return ["gemini-2.5-flash-lite"]
+
+        _, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                 model=Lone())
+        self.assertIn("gemini: 1 model available to this key", err)
+        _, out, _ = self.run_cli("doctor", str(self.root), "--api-key", "k",
+                                 model=Lone())
+        self.assertIn("ok provider             1 model; catalogued: "
+                      "gemini-2.5-flash-lite", out)
+
+    def test_an_estimate(self) -> None:
+        _, out, _ = self.run_cli("estimate", self.lone_file())
+        self.assertIn("1 file: 1 with prose, 0 from facts alone\n"
+                      "1 model call (1 file), 0 already cached\n", out)
+        _, out, _ = self.run_cli("estimate", str(self.root), "--max-cost", "0",
+                                 "--max-requests", "4")
+        self.assertIn("1 item left as a stub to fit", out)
+        self.assertIn("4 files: 3 with prose, 1 from facts alone\n"
+                      "4 model calls (3 files, 1 module), 0 already cached\n", out)
+        _, out, _ = self.run_cli("estimate", str(self.root), "--max-cost", "0",
+                                 "--max-requests", "3")
+        self.assertIn("2 items left as stubs to fit", out)
+
+    def test_an_estimate_of_one_output_token(self) -> None:
+        priced = Estimate(items=[PricedItem("file", "a.py", "gemini-2.5-flash-lite",
+                                            1, 1, 0.1, False)])
+        with mock.patch.object(generate_module.Pipeline, "estimate",
+                               return_value=priced):
+            _, out, _ = self.run_cli("estimate", str(self.root))
+        self.assertIn("at most 1 input / 1 output token, at most $0.1000\n", out)
+
+    def test_the_cache(self) -> None:
+        root = self.lone_file()
+        self.run_cli("generate", root, "--api-key", "k", "--quiet")
+        _, out, _ = self.run_cli("cache", "stats", root)
+        self.assertIn("1 cached response, bought for $", out)
+        _, out, _ = self.run_cli("cache", "clear", root)
+        self.assertEqual(out, "removed 1 cached response\n")
+        _, out, _ = self.run_cli("cache", "clear", root)
+        self.assertEqual(out, "removed 0 cached responses\n")
+
+    def test_the_models(self) -> None:
+        _, out, _ = self.run_cli("models", "--api-key", "k", model=OneModel())
+        self.assertIn("(+1 other model; pin one with --model)", out)
+        _, out, _ = self.run_cli("models", "--api-key", "k")
+        self.assertIn("(+0 other models; pin one with --model)", out)
+
+    def test_one_rendering_warning(self) -> None:
+        self.assertEqual(cli._warnings(["odd"]),
+                         ["1 rendering warning; --json lists it"])
+        self.assertEqual(cli._warnings(["odd", "odder"]),
+                         ["2 rendering warnings; --json lists them all"])
+        self.assertEqual(cli._warnings([]), [])
+
+
+class TestHelp(unittest.TestCase):
+    """What `--help` says, and that it says something for every option."""
+
+    def setUp(self) -> None:
+        (commands,) = [action.choices for action in cli.build_parser()._actions
+                       if isinstance(action, argparse._SubParsersAction)]
+        self.commands: dict[str, argparse.ArgumentParser] = dict(commands)
+
+    def option(self, command: str, flag: str) -> argparse.Action:
+        return self.commands[command]._option_string_actions[flag]
+
+    def test_every_argument_of_every_command_has_help(self) -> None:
+        # Regression: --max-requests and --concurrency had none, among others.
+        for name, parser in self.commands.items():
+            for action in parser._actions:
+                with self.subTest(command=name, argument=action.dest):
+                    self.assertTrue(action.help)
+            self.assertIn("devdocs", parser.format_help())   # no stray % in a help
+
+    def test_the_run_limits_say_what_they_limit(self) -> None:
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                requests = self.option(command, "--max-requests").help or ""
+                self.assertIn("retries included", requests)
+                self.assertIn("no limit", requests)
+                self.assertIn("default: 4", self.option(command, "--concurrency").help)
+
+    def test_include_is_no_pattern_and_says_so(self) -> None:
+        # Regression: PATTERN promised globs; it matches literal text.
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                option = self.option(command, "--include")
+                self.assertEqual(option.metavar, "PATH")
+                said = " ".join((option.help or "").split())
+                for words in ("not a glob", "path from the project root",
+                              "name at any depth", "end of a path"):
+                    self.assertIn(words, said)
+
+    def test_include_says_what_it_cannot_take_in(self) -> None:
+        # Regression: "force paths in, despite ignores" promised any path; see
+        # TestEstimate.test_include_takes_in_source_alone.
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                said = " ".join((self.option(command, "--include").help or "").split())
+                self.assertIn("take in source files that ignores, --exclude or the "
+                              "size limit leave out", said)
+                self.assertIn("tests, vendored and generated code and files that "
+                              "are not source stay out", said)
+        self.assertIn("# take source in despite ignores", cli._TEMPLATE)
+
+    def test_exclude_says_it_reads_gitignore_lines(self) -> None:
+        for command in ("generate", "estimate"):
+            with self.subTest(command):
+                option = self.option(command, "--exclude")
+                self.assertEqual(option.metavar, "PATTERN")
+                self.assertIn(".gitignore", option.help or "")
+                self.assertIn("globs", option.help or "")
+
+    def test_only_what_can_send_takes_a_key(self) -> None:
+        # Regression: estimate took --api-key and ignored it.
+        self.assertEqual(
+            {name for name, parser in self.commands.items()
+             if "--api-key" in parser._option_string_actions},
+            {"generate", "doctor", "models"},
+        )
+
+    def test_the_path_says_where_it_comes_from_when_left_out(self) -> None:
+        # Regression: "default: current directory", which comes last. Init
+        # reads no devdocs.toml, so its help names none.
+        given = {name: action.help for name, parser in self.commands.items()
+                 for action in parser._actions if action.dest == "path"}
+        self.assertEqual(given.pop("init"),
+                         "project root; else $DEVDOCS_PATH or the current directory")
+        self.assertEqual(given, dict.fromkeys(
+            ("generate", "estimate", "export", "doctor", "cache"),
+            "project root; else $DEVDOCS_PATH, the path in devdocs.toml, or the "
+            "current directory"))
+
+
+class TestEstimate(CliCase):
+    def explained(self, *argv: str) -> str:
+        """The files `estimate --explain` lists, ignoring shop/money.py."""
+        (self.root / ".gitignore").write_text("shop/money.py\n", "utf-8")
+        code, out, err = self.run_cli("estimate", str(self.root), "--explain", *argv)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_include_matches_as_its_help_says(self) -> None:
+        self.assertNotIn("shop/money.py", self.explained())
+        for literal in ("shop/money.py", "./shop/money.py", "SHOP/MONEY.PY",   # a path
+                        "money.py", "shop",                  # a name, at any depth
+                        ".py", "oney.py"):                   # the end of a path
+            with self.subTest(literal):
+                self.assertIn("shop/money.py", self.explained("--include", literal))
+        for glob in ("*.py", "shop/*", "mon*", "?oney.py", "**/money.py"):
+            with self.subTest(glob):
+                self.assertNotIn("shop/money.py", self.explained("--include", glob))
+
+    def test_include_reaches_inside_an_excluded_directory_by_path_alone(self) -> None:
+        out = self.explained("--exclude", "shop/", "--include", "shop/cart.py")
+        self.assertIn("shop/cart.py", out)
+        self.assertNotIn("shop/cli.py", out)
+        out = self.explained("--exclude", "shop/", "--include", "cart.py")
+        self.assertNotIn("shop/cart.py", out)
+
+    def test_include_takes_in_source_alone(self) -> None:
+        # What --help says. The scanner lets any named file through; the plan
+        # keeps only source.
+        for relpath in ("data.xyz", "NOTES.md", "settings.toml", "tests/test_x.py",
+                        "vendor/w.py", "x_pb2.py", "stamped.py"):
+            path = self.root / relpath
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("# @generated\ndef f():\n    return 1\n", "utf-8")
+        for named in ("data.xyz", ".xyz", "NOTES.md", "settings.toml",
+                      "tests/test_x.py", "tests", "vendor/w.py", "vendor", "x_pb2.py",
+                      "stamped.py"):
+            with self.subTest(named):
+                out = self.explained("--include", named)
+                for relpath in ("data.xyz", "NOTES.md", "settings.toml", "test_x.py",
+                                "w.py", "x_pb2.py", "stamped.py"):
+                    self.assertNotIn(relpath, out)
+
+        big = self.root / "big.py"                                # over the size limit
+        big.write_text(f"# {'x' * 1_000_001}\ndef f():\n    return 1\n", "utf-8")
+        self.assertNotIn("big.py", self.explained())
+        self.assertIn("big.py", self.explained("--include", "big.py"))
+        built = self.root / "build" / "made.py"           # in a default-ignored folder
+        built.parent.mkdir()
+        built.write_text("def f():\n    return 1\n", "utf-8")
+        self.assertNotIn("build/made.py", self.explained())
+        self.assertIn("build/made.py", self.explained("--include", "build/made.py"))
+        query = self.root / "q.sql"                                 # the help's example
+        query.write_text("SELECT 1;\n", "utf-8")
+        (self.root / ".gitignore").write_text("*.sql\n", "utf-8")
+        code, out, err = self.run_cli("estimate", str(self.root), "--explain")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("q.sql", out)
+        code, out, err = self.run_cli("estimate", str(self.root), "--explain",
+                                      "--include", ".sql")
+        self.assertEqual(code, 0, err)
+        self.assertIn("q.sql", out)
+
+    def test_exclude_matches_as_its_help_says(self) -> None:
+        for pattern, gone, kept in (("shop/c*.py", "cart.py", "__init__.py"),   # glob
+                                    ("c?rt.py", "cart.py", "cli.py"),      # any depth
+                                    ("/cart.py", "", "cart.py"),      # at the root only
+                                    ("cart.py/", "", "cart.py"),   # directories only
+                                    ("**/cli.py", "cli.py", "cart.py")):
+            with self.subTest(pattern):
+                out = self.explained("--exclude", pattern)
+                if gone:
+                    self.assertNotIn(f"shop/{gone}", out)
+                self.assertIn(f"shop/{kept}", out)
+
+    def test_estimate_needs_no_key_and_sends_nothing(self) -> None:
+        code, out, _ = self.run_cli("estimate", str(self.root), "--json")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertGreater(data["requests"], 0)
+        self.assertGreater(data["worst_case_cost_usd"], 0)
+        self.assertEqual(self.model.calls, [])
+
+    def test_a_first_estimate_makes_no_state(self) -> None:
+        # Regression: it made .devdocs/devdocs.db, and with --context semantic
+        # synced the chunks into it.
+        state = self.root / ".devdocs"
+        for argv in ([], ["--context", "semantic"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli("estimate", str(self.root), "--quiet",
+                                              *argv)
+                self.assertEqual(code, 0, err)
+                self.assertIn(", 0 already cached\n", out)
+                self.assertFalse(state.exists())
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet")
+        self.assertEqual(code, 0, err)
+        with Database(state / "devdocs.db") as db:
+            runs = [row["status"] for row in db.query("SELECT status FROM run")]
+        self.assertEqual(runs, ["finished"])
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet")
+        self.assertEqual(code, 0, err)
+        self.assertIn("\n0 model calls (none), 5 already cached\n", out)
+
+    def priced(self, *argv: str) -> tuple[str, dict[str, Any]]:
+        """`estimate`'s result lines, and its JSON for the same command."""
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet", *argv)
+        self.assertEqual(code, 0, err)
+        code, data, err = self.run_cli("estimate", str(self.root), "--quiet", "--json",
+                                       *argv)
+        self.assertEqual(code, 0, err)
+        return out, json.loads(data)
+
+    def test_the_json_keeps_each_cost_under_its_own_name(self) -> None:
+        # Regression: max_cost_usd held the plan's worst case, not the ceiling.
+        for argv, cost, requests in (([], 0.5, None),
+                                     (["--max-cost", "7"], 7.0, None),
+                                     (["--max-cost", "0"], None, None),
+                                     (["--max-requests", "2"], 0.5, 2),
+                                     (["--max-cost", "0", "--max-requests", "0"],
+                                      None, None)):
+            with self.subTest(argv=argv):
+                _, data = self.priced(*argv)
+                self.assertEqual((data["cost_limit_usd"], data["request_limit"]),
+                                 (cost, requests))
+                self.assertNotIn("max_cost_usd", data)
+                self.assertEqual(data["worst_case_cost_usd"], round(
+                    sum(i["cost"] for i in data["items"] if not i["cached"]), 6))
+
+    def test_the_json_keeps_every_other_key(self) -> None:
+        _, data = self.priced("--max-requests", "2")
+        self.assertLessEqual({"files", "prose_files", "requests", "cached",
+                              "input_tokens", "output_tokens", "demoted",
+                              "demoted_by", "items"},
+                             set(data))
+        self.assertEqual(data["files"], 4)
+        self.assertEqual(len(data["demoted"]), 3)
+
+    def costs(self) -> tuple[float, list[float]]:
+        """With no limit: the module's worst case, then its files', as they are
+        walked after it. The module costs the most: the tests below need that."""
+        _, data = self.priced("--max-cost", "0")
+        module = next(i["cost"] for i in data["items"] if i["kind"] == "module")
+        files = [i["cost"] for i in data["items"] if i["kind"] == "file"]
+        self.assertGreater(module, sum(files))
+        return module, files
+
+    def cut(self, *argv: str) -> tuple[str, list[str]]:
+        """The line on what `argv` left as stubs, and which limits --json names."""
+        out, data = self.priced(*argv)
+        (line,) = [line for line in out.splitlines() if "to fit" in line]
+        return line, data["demoted_by"]
+
+    def test_the_limit_that_made_the_cut_is_named(self) -> None:
+        # Regression: it was always --max-cost, also with the requests to blame.
+        module, files = self.costs()
+        room = 0.00001
+        spare = module + files[0] + room       # holds the first two items, no more
+        for argv, line, named in (
+            (["--max-requests", "2"],          # beside the default cost limit
+             "3 items left as stubs to fit --max-requests 2", ["max_requests"]),
+            (["--max-requests", "2", "--max-cost", "0"],
+             "3 items left as stubs to fit --max-requests 2", ["max_requests"]),
+            (["--max-requests", "1", "--max-cost", f"{spare}"],
+             "4 items left as stubs to fit --max-requests 1", ["max_requests"]),
+            (["--max-cost", "0.0000001"],
+             "5 items left as stubs to fit --max-cost $1e-07", ["max_cost"]),
+            (["--max-cost", "0.0000001", "--max-requests", "2"],
+             "5 items left as stubs to fit --max-cost $1e-07", ["max_cost"]),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.cut(*argv), (line, named))
+
+    def test_what_cost_cut_before_the_requests_ran_out_is_named_too(self) -> None:
+        # The module is over the cost limit, then two files spend the requests.
+        _, files = self.costs()
+        limit = f"{files[0] + files[1] + 0.00001:.8f}"
+        line, named = self.cut("--max-cost", limit, "--max-requests", "2")
+        self.assertEqual(line, "3 items left as stubs to fit "
+                               f"--max-cost ${float(limit):g} and --max-requests 2")
+        self.assertEqual(named, ["max_cost", "max_requests"])
+
+    def test_a_request_limit_nothing_passed_is_not_named(self) -> None:
+        _, files = self.costs()
+        # All it cut is the module, before the fourth file spent the requests.
+        limit = f"{sum(files) + 0.00001:.8f}"
+        line, named = self.cut("--max-cost", limit, "--max-requests", "4")
+        self.assertEqual(line, "1 item left as a stub to fit "
+                               f"--max-cost ${float(limit):g}")
+        self.assertEqual(named, ["max_cost"])
+        # Past the last file kept, too, the cost made the cut: requests are left.
+        limit = f"{files[0] + 0.00001:.8f}"
+        line, named = self.cut("--max-cost", limit, "--max-requests", "5")
+        self.assertIn(f"to fit --max-cost ${float(limit):g}", line)
+        self.assertEqual(named, ["max_cost"])
+
+    def test_nothing_cut_names_nothing(self) -> None:
+        out, data = self.priced("--max-requests", "50")
+        self.assertNotIn("to fit", out)
+        self.assertEqual((data["demoted"], data["demoted_by"]), ([], []))
+
+    def test_the_free_tier_line_goes_by_the_models_the_plan_uses(self) -> None:
+        # Regression: every call was divided by the file tier's 1000 a day, so
+        # high quality, all on the 100 a day of gemini-2.5-pro, seemed to fit one.
+        for number in range(200):
+            path = self.root / "pkg" / f"part{number}.py"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(f"def part{number}():\n    return {number}\n", "utf-8")
+        out, data = self.priced("--quality", "high", "--max-cost", "0")
+        self.assertEqual({i["model"] for i in data["items"]}, {"gemini-2.5-pro"})
+        days = -(-data["requests"] // 100)
+        self.assertGreater(days, 1)
+        self.assertIn(f"free tier: up to {days} days of daily quota, fewer if other "
+                      "models can take over; runs resume where they stop\n", out)
+        for argv in (["--quality", "cheap"],              # fits flash-lite's 1000 a day
+                     ["--quality", "high", "--paid"],     # no such limit
+                     ["--quality", "high", "--provider", "anthropic"]):   # no free tier
+            with self.subTest(argv=argv):
+                out, _ = self.priced(*argv, "--max-cost", "0")
+                self.assertNotIn("free tier", out)
+
+    def test_semantic_estimate_quotes_the_embeddings_first(self) -> None:
+        code, out, _ = self.run_cli("estimate", str(self.root), "--context",
+                                    "semantic", "--json")
+        self.assertEqual(code, 0)
+        embed = json.loads(out)["items"][0]
+        self.assertEqual((embed["kind"], embed["requests"]), ("embed", 1))
+
+    def test_semantic_context_with_claude_is_a_config_error(self) -> None:
+        code, _, err = self.run_cli("estimate", str(self.root), "--context",
+                                    "semantic", "--provider", "anthropic")
+        self.assertEqual(code, 2)
+        self.assertIn("Gemini embeddings", err)
+
+    def test_explain_lists_every_file(self) -> None:
+        code, out, _ = self.run_cli("estimate", str(self.root), "--explain")
+        self.assertEqual(code, 0)
+        self.assertIn("shop/cart.py", out)
+
+    def test_excludes_from_flags_apply(self) -> None:
+        # Regression: list flags were refused by the config, exiting 2.
+        code, out, _ = self.run_cli("estimate", str(self.root), "--explain",
+                                    "--exclude", "shop/cli.py,shop/money.py")
+        self.assertEqual(code, 0)
+        self.assertIn("shop/cart.py", out)
+        self.assertNotIn("shop/cli.py", out)
+        self.assertNotIn("shop/money.py", out)
+
+
+class TestLimitsCountCalls(CliCase):
+    """A limit counts the calls a run makes, never an answer the cache holds:
+    a shop of six files, run once, then two of its files changed.
+    Regression: each cached answer took a request, so `estimate --max-requests
+    1` planned 4 calls and cut 3 cached pages, and `generate` stopped on the
+    budget (exit 7) after its one call."""
+
+    BASE = ("--context", "off", "--paid")
+    CACHED = ("shop/__init__.py", "shop/money.py", "shop/orders.py", "shop/tax.py")
+
+    def setUp(self) -> None:
+        super().setUp()
+        for relpath, text in MORE.items():
+            (self.root / relpath).write_text(text, "utf-8")
+        code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--quiet", *self.BASE)
+        self.assertEqual(code, 0, err)
+        for relpath in ("shop/cart.py", "shop/cli.py"):
+            path = self.root / relpath
+            path.write_text(path.read_text("utf-8") + "\n# changed\n", "utf-8")
+        self.model.calls.clear()
+
+    def test_estimate_cuts_calls_alone(self) -> None:
+        calls = [["module", "shop"], ["file", "shop/cart.py"], ["file", "shop/cli.py"]]
+        for limit, cut in (("1", calls), ("2", calls[1:])):
+            with self.subTest(max_requests=limit):
+                argv = ("estimate", str(self.root), "--quiet", *self.BASE,
+                        "--max-requests", limit)
+                code, out, err = self.run_cli(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"{len(cut)} items left as stubs to fit --max-requests "
+                              f"{limit}\n", out)
+                code, data, err = self.run_cli(*argv, "--json")
+                self.assertEqual(code, 0, err)
+                priced = json.loads(data)
+                self.assertEqual((priced["demoted"], priced["demoted_by"]),
+                                 (cut, ["max_requests"]))
+                self.assertEqual((priced["requests"], priced["cached"]),
+                                 (int(limit), 4))
+                self.assertEqual(tuple(sorted(item["key"] for item in priced["items"]
+                                              if item["cached"])), self.CACHED)
+
+    def test_both_limits_cut_calls_alone(self) -> None:
+        # The overview is over the cost; the module spends the one request.
+        argv = ("estimate", str(self.root), "--quiet", "--json", *self.BASE)
+        code, data, err = self.run_cli(*argv, "--max-cost", "0")
+        self.assertEqual(code, 0, err)
+        cost = {item["kind"]: item["cost"] for item in json.loads(data)["items"]
+                if item["kind"] != "file"}
+        self.assertGreater(cost["architecture"], cost["module"])
+        limit = f"{(cost['architecture'] + cost['module']) / 2:.8f}"
+        code, data, err = self.run_cli(*argv, "--max-cost", limit, "--max-requests",
+                                       "1")
+        self.assertEqual(code, 0, err)
+        priced = json.loads(data)
+        self.assertEqual((priced["demoted"], priced["demoted_by"]), (
+            [["architecture", ""], ["file", "shop/cart.py"], ["file", "shop/cli.py"]],
+            ["max_cost", "max_requests"]))
+        self.assertEqual((priced["requests"], priced["cached"]), (1, 4))
+
+    def test_generate_on_the_limit_writes_every_cached_page(self) -> None:
+        code, out, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      *self.BASE, "--max-requests", "1")
+        self.assertEqual(code, 0, err)   # as any run that its plan fits ends
+        self.assertEqual([request.tag for request in self.model.calls],
+                         ["architecture"])
+        self.assertIn("\n1 model call, 4 cache hits, ", out)
+        self.assertNotIn("stopped early", out)
+        for relpath in self.CACHED:
+            page = self.root / "docs" / f"{relpath}.md"
+            self.assertIn(PROSE, page.read_text("utf-8"), relpath)
+
+
+class TestEstimateAndGenerateAgree(CliCase):
+    """`generate` makes the calls `estimate` plans, also where a cached
+    overview sums up an answer the run buys: the run rebuilds its prompt, so
+    it is a call. Regression: it was planned free; `generate` bought the file,
+    was refused the module's call and stopped (exit 7), the page a stub."""
+
+    BASE = ("--context", "off", "--paid")
+
+    def planned(self, *limits: str) -> list[str]:
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet", "--json",
+                                      *self.BASE, *limits)
+        self.assertEqual(code, 0, err)
+        return [item["key"] or item["kind"] for item in json.loads(out)["items"]
+                if not item["cached"]]
+
+    def bought(self, *limits: str) -> list[str]:
+        """The calls of `generate`, which ends as a run its plan fits ends."""
+        self.model.calls.clear()
+        code, out, err = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      *self.BASE, *limits)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("stopped early", out)
+        return [request.tag for request in self.model.calls]
+
+    def test_a_cached_module_whose_file_is_bought_is_a_call(self) -> None:
+        self.assertEqual(self.bought("--max-requests", "1"), ["shop"])
+        code, out, err = self.run_cli("estimate", str(self.root), "--quiet",
+                                      *self.BASE, "--max-requests", "1")
+        self.assertEqual(code, 0, err)
+        # Each file would take the module along, past the one request.
+        self.assertIn("0 model calls (none), 1 already cached\n", out)
+        self.assertIn("4 items left as stubs to fit --max-requests 1\n", out)
+        for limit, calls in (("1", []), ("2", ["shop/cart.py", "shop"])):
+            with self.subTest(max_requests=limit):
+                self.assertEqual(self.planned("--max-requests", limit), calls)
+                self.assertEqual(self.bought("--max-requests", limit), calls)
+                page = self.root / "docs" / "shop" / "index.md"
+                self.assertIn("Holds the cart", page.read_text("utf-8"))
+
+    def test_runs_resumed_under_one_request_end_as_planned(self) -> None:
+        for relpath, text in MORE.items():
+            (self.root / relpath).write_text(text, "utf-8")
+        for number, call in enumerate(("architecture", "shop/cart.py")):
+            with self.subTest(run=number + 1):
+                self.assertEqual(self.planned("--max-requests", "1"), [call])
+                self.assertEqual(self.bought("--max-requests", "1"), [call])
+        overview = self.root / "docs" / "architecture.md"
+        self.assertIn("A small shop", overview.read_text("utf-8"))
+
+
+class TestFreeDays(unittest.TestCase):
+    """Days of free-tier quota, by the daily limit of each model a plan uses."""
+
+    @staticmethod
+    def days(*items: tuple[str, int]) -> int:
+        return cli._free_days(Estimate(items=[
+            PricedItem("file", str(number), model, 1, 1, 0.1, False, requests=requests)
+            for number, (model, requests) in enumerate(items)
+        ]))
+
+    def test_a_model_takes_the_days_its_limit_says(self) -> None:
+        for requests, days in ((1, 1), (100, 1), (101, 2), (200, 2), (201, 3)):
+            with self.subTest(requests=requests):
+                self.assertEqual(self.days(("gemini-2.5-pro", requests)), days)
+
+    def test_each_tier_has_its_own_limit(self) -> None:
+        self.assertEqual(self.days(("gemini-2.5-flash-lite", 1000)), 1)
+        self.assertEqual(self.days(("gemini-2.5-flash", 1000)), 4)
+        self.assertEqual(self.days(("gemini-embedding-001", 1001)), 2)
+
+    def test_calls_to_one_model_share_its_limit(self) -> None:
+        one_model = ("gemini-2.5-flash", 200), ("gemini-2.5-flash", 100)
+        self.assertEqual(self.days(*one_model), 2)
+
+    def test_a_tier_starts_on_the_day_the_one_before_ends(self) -> None:
+        # flash-lite takes days 1 to 3, flash days 3 to 5, pro the fifth
+        self.assertEqual(self.days(("gemini-2.5-flash-lite", 2500),
+                                   ("gemini-2.5-flash", 600),
+                                   ("gemini-2.5-pro", 1)), 5)
+        # all in a day each: the same day
+        self.assertEqual(self.days(("gemini-2.5-flash-lite", 1000),
+                                   ("gemini-2.5-flash", 250),
+                                   ("gemini-2.5-pro", 100)), 1)
+
+    def test_a_snapshot_has_the_limit_of_its_model(self) -> None:
+        self.assertEqual(self.days(("gemini-2.5-pro-preview-09-2025", 101)), 2)
+
+    def test_a_model_without_a_free_limit_gives_no_figure(self) -> None:
+        for model in ("claude-haiku-5-5", "gemini-3.1-pro-preview", "gemini-unknown"):
+            with self.subTest(model):
+                self.assertEqual(self.days((model, 5000)), 0)
+                self.assertEqual(self.days(("gemini-2.5-flash", 5000), (model, 1)), 0)
+
+    def test_what_the_cache_holds_takes_no_quota(self) -> None:
+        cached = PricedItem("file", "a.py", "gemini-2.5-pro", 0, 0, 0.0, True,
+                            requests=500)
+        self.assertEqual(cli._free_days(Estimate(items=[cached])), 1)
+
+
+class TestFreeDaysAgainstARun(CliCase):
+    """What `estimate` says of free days, against scripted runs of 25 files on a
+    hundredth of the catalog's limits, 10 a day on the file tier's models, the
+    quota day turned by hand. The figure is the most a run can take, so the
+    line says "up to"."""
+
+    LINE = ("free tier: up to 3 days of daily quota, fewer if other models can take "
+            "over; runs resume where they stop\n")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.day = 1
+        small = tuple(dataclasses.replace(info, free_rpm=100_000,
+                                          free_rpd=info.free_rpd // 100)
+                      if info.free_rpd else info for info in catalog.CATALOG)
+        self.enterContext(mock.patch.object(catalog, "CATALOG", small))
+        self.enterContext(mock.patch.object(
+            ledger, "quota_day", lambda now=None: f"2026-01-{self.day:02}"))
+        self.project = self.enterContext(tempfile.TemporaryDirectory())
+        for number in range(25):
+            Path(self.project, f"part{number}.py").write_text(
+                f"def part{number}():\n    return {number}\n", "utf-8")
+
+    def estimated(self, *flags: str) -> str:
+        code, out, err = self.run_cli("estimate", self.project, "--max-cost", "0",
+                                      "--quiet", *flags)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def days_to_finish(self, model: TaggedModel, *flags: str) -> int:
+        """The quota days a run takes, stopping on its quota and resumed each day."""
+        for self.day in range(1, 10):
+            code, _, err = self.run_cli("generate", self.project, "--api-key", "k",
+                                        "--max-cost", "0", "--quiet", *flags,
+                                        model=model)
+            if code == 0:
+                return self.day
+            self.assertEqual(code, 10, err)
+        self.fail("the run never finished")
+
+    def test_a_pinned_model_takes_all_the_days_it_says(self) -> None:
+        flags = ("--model", "gemini-2.5-flash-lite")
+        self.assertIn(self.LINE, self.estimated(*flags))
+        self.assertEqual(self.days_to_finish(TaggedModel(), *flags), 3)
+
+    def test_one_model_to_a_tier_takes_no_more(self) -> None:
+        self.assertIn(self.LINE, self.estimated())
+        self.assertEqual(self.days_to_finish(TaggedModel()), 3)
+
+    def test_a_key_that_reaches_every_model_takes_fewer(self) -> None:
+        class Everything(TaggedModel):
+            def list_models(self) -> list[str]:
+                return [m.id for m in catalog.CATALOG if m.provider == "gemini"]
+
+        self.assertIn(self.LINE, self.estimated())
+        self.assertEqual(self.days_to_finish(Everything()), 1)
+
+
+class TestInitAndCache(CliCase):
+    def test_init_writes_config_and_ignores_state(self) -> None:
+        (self.root / ".gitignore").write_text("node_modules/", encoding="utf-8")
+        code, _, _ = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0)
+        self.assertIn('provider = "gemini"',
+                      (self.root / "devdocs.toml").read_text("utf-8"))
+        self.assertEqual((self.root / ".gitignore").read_text("utf-8"),
+                         "node_modules/\n.devdocs/\n")
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", err)
+
+    def test_a_bad_path_is_refused_before_anything_is_written(self) -> None:
+        # Regression: an internal error, or the current directory for an empty path.
+        file = self.root / "pyproject.toml"
+        for path, said in ((str(self.root / "no" / "such"), "does not exist"),
+                           (str(file), "is not a directory"),
+                           ("", "path is empty"),
+                           ("a\0b", "path contains a NUL")):
+            with self.subTest(path=path), contextlib.chdir(self.root):
+                before = sorted(p.name for p in self.root.iterdir())
+                code, _, err = self.run_cli("init", path)
+                self.assertEqual(code, 2)
+                self.assertIn(said, err)
+                self.assertNotIn("internal error", err)
+                self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
+        self.assertFalse((self.root / "no").exists())
+
+    def elsewhere(self) -> Path:
+        """A new current directory apart from the project, until the test ends."""
+        here = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(contextlib.chdir(here))
+        return here
+
+    def test_init_writes_in_the_project_devdocs_path_names(self) -> None:
+        # Regression: it wrote in the current directory, where the commands
+        # that read the variable never look.
+        here = self.elsewhere()
+        variable = {"DEVDOCS_PATH": str(self.root)}
+        code, _, err = self.run_cli("init", "--provider", "anthropic", env=variable)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(list(here.iterdir()), [])
+        with clean_env(**variable):
+            self.assertEqual(load_config().provider, "anthropic")   # as they read it
+        (self.root / "devdocs.toml").write_text(f"path = {str(here)!r}\n", "utf-8")
+        code, _, err = self.run_cli("init", "--force", env=variable)   # replaced there
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", (self.root / "devdocs.toml").read_text("utf-8"))
+        self.assertEqual(list(here.iterdir()), [])
+
+    def test_init_reads_no_path_from_the_file_it_replaces(self) -> None:
+        # The file in the current directory names another project. Above, the
+        # variable would win over its path anyway; here nothing else does.
+        here = self.elsewhere()
+        (here / "devdocs.toml").write_text(f"path = {str(self.root)!r}\n", "utf-8")
+        (self.root / "devdocs.toml").write_text("max_cost = 9\n", "utf-8")
+        code, _, err = self.run_cli("init", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", (here / "devdocs.toml").read_text("utf-8"))
+        self.assertEqual((self.root / "devdocs.toml").read_text("utf-8"),
+                         "max_cost = 9\n")
+
+    def test_the_flag_comes_first_and_a_blank_variable_is_unset(self) -> None:
+        here = self.elsewhere()
+        code, out, err = self.run_cli("init", str(self.root),
+                                      env={"DEVDOCS_PATH": str(here / "typo")})
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.root / "devdocs.toml").is_file())
+        *_, named = shlex.split(out.removeprefix("next: "))   # on the next line too
+        self.assertEqual(Path(named), self.root)
+        for blank in ("", "  "):
+            with self.subTest(blank=blank):
+                code, _, err = self.run_cli("init", "--force",
+                                            env={"DEVDOCS_PATH": blank})
+                self.assertEqual(code, 0, err)
+                self.assertTrue((here / "devdocs.toml").is_file())
+
+    def test_a_root_the_variable_names_is_refused_as_a_flags_is(self) -> None:
+        # Missing, or holding a devdocs.toml already: exit 2, nothing written.
+        here = self.elsewhere()
+        root = self.root.resolve()
+        code, _, err = self.run_cli("init", env={"DEVDOCS_PATH": str(root / "typo")})
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: project root {root / 'typo'} does not exist\n",
+                      err)
+        (root / "devdocs.toml").write_text("max_cost = 9\n", "utf-8")
+        code, _, err = self.run_cli("init", env={"DEVDOCS_PATH": str(root)})
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: {root / 'devdocs.toml'} already exists\n", err)
+        self.assertEqual((root / "devdocs.toml").read_text("utf-8"), "max_cost = 9\n")
+        self.assertEqual(list(here.iterdir()), [])
+
+    def test_the_next_line_can_be_pasted_into_a_shell(self) -> None:
+        # Regression: the path was printed as typed, so a space or a shell
+        # character split or changed it, and a leading dash made it an option.
+        for name, shown in (("my project", "'my project'"),
+                            ("it's $HOME; `x`", "'it'\"'\"'s $HOME; `x`'"),
+                            ("-dash", "-- -dash")):
+            with self.subTest(name=name), contextlib.chdir(self.root):
+                (self.root / name).mkdir()
+                (self.root / name / "app.py").write_text("x = 1\n", "utf-8")
+                code, out, err = self.run_cli("init", "--", name)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out, f"next: devdocs estimate {shown}\n")
+                program, command, *rest = shlex.split(out.removeprefix("next: "))
+                code, out, err = self.run_cli(command, "--json", *rest)   # as pasted
+                self.assertEqual((program, code), ("devdocs", 0), err)
+                self.assertEqual(json.loads(out)["files"], 1)   # app.py, not the shop
+
+    def test_the_next_line_names_the_project_the_variable_gave(self) -> None:
+        # A variable set for init alone, as `DEVDOCS_PATH=app devdocs init`
+        # sets it, is gone by the next command: a bare line would price the
+        # current directory instead.
+        here = self.elsewhere()
+        code, out, err = self.run_cli("init")
+        self.assertEqual((code, out), (0, "next: devdocs estimate\n"), err)
+        (here / "my app").mkdir()
+        code, out, err = self.run_cli("init", env={"DEVDOCS_PATH": " my app "})
+        self.assertEqual((code, out), (0, "next: devdocs estimate 'my app'\n"), err)
+        self.assertTrue((here / "my app" / "devdocs.toml").is_file())
+        (here / "-app").mkdir()
+        code, out, err = self.run_cli("init", env={"DEVDOCS_PATH": "-app"})
+        self.assertEqual((code, out), (0, "next: devdocs estimate -- -app\n"), err)
+
+    def test_on_windows_the_next_line_needs_no_quotes_for_a_plain_path(self) -> None:
+        # Regression: 'C:\proj', quoted for its backslash, and cmd.exe keeps
+        # single quotes as part of the path. Windows reads C:/proj as C:\proj.
+        for path, shown in ((r"C:\proj", "C:/proj"), (r"src\app", "src/app"),
+                            (r"C:\my proj", "'C:/my proj'"), (r"-a\b", "-- -a/b")):
+            with self.subTest(path=path):
+                self.assertEqual(cli._next_step(path, windows=True),
+                                 f"next: devdocs estimate {shown}")
+        self.assertEqual(cli._next_step(r"a\b", windows=False),   # a POSIX name
+                         r"next: devdocs estimate 'a\b'")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_directory_it_cannot_open_is_refused(self) -> None:
+        self.root.chmod(0o000)
+        self.addCleanup(self.root.chmod, 0o755)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot open project root", err)
+
+    def test_a_config_it_cannot_write_names_the_file(self) -> None:
+        # Regression: an OSError was an internal error, exit 1.
+        target = self.root / "devdocs.toml"
+        target.mkdir()
+        code, _, err = self.run_cli("init", str(self.root), "--force")
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: cannot write {target.resolve()}: ", err)
+        self.assertNotIn("internal error", err)
+
+    def test_a_full_disk_names_the_file_too(self) -> None:
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(Path, "write_text", side_effect=full):
+            code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("devdocs.toml: No space left on device", err)
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_config_link_to_nothing_is_refused_and_nothing_made(self) -> None:
+        # Regression: exists() says False of it, so init wrote through it, even
+        # without --force, making the file it names, perhaps outside the project.
+        root = self.root.resolve()
+        config = root / "devdocs.toml"
+        (root / "config").mkdir()
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        for link in (str(outside / "devdocs.toml"), "config/devdocs.toml",
+                     "pyproject.toml/x"):
+            for flags in ((), ("--force",)):
+                with self.subTest(link=link, flags=flags):
+                    config.unlink(missing_ok=True)
+                    config.symlink_to(link)
+                    code, _, err = self.run_cli("init", str(root), *flags)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(f"devdocs: error: cannot write {config}: it links "
+                                  f"to {link}, which leads nowhere\n  hint: remove the "
+                                  "link, or make the file it names and pass --force\n",
+                                  err)
+                    self.assertEqual(os.readlink(config), link)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list((root / "config").iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_config_link_to_a_file_is_replaced_through_it_with_force(self) -> None:
+        # As a file is: kept without --force.
+        shared = self.root / "shared.toml"
+        shared.write_text("max_cost = 9\n", "utf-8")
+        (self.root / "devdocs.toml").symlink_to(shared.name)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", err)
+        self.assertEqual(shared.read_text("utf-8"), "max_cost = 9\n")
+        code, _, err = self.run_cli("init", str(self.root), "--force")
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.root / "devdocs.toml").is_symlink())
+        self.assertIn("[devdocs]", shared.read_text("utf-8"))
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_gitignore_it_cannot_change_names_the_file(self) -> None:
+        # Regression: an internal error, with the config already written.
+        ignore = self.root / ".gitignore"
+        target = (self.root / "devdocs.toml").resolve()
+        for mode, did in ((0o444, "append"), (0o000, "read")):
+            with self.subTest(did):
+                target.unlink(missing_ok=True)
+                ignore.write_bytes(b"build/\n")
+                ignore.chmod(mode)
+                self.addCleanup(ignore.chmod, 0o644)
+                code, _, err = self.run_cli("init", str(self.root))
+                self.assertEqual(code, 2)
+                self.assertIn(f"devdocs: error: cannot add .devdocs/ to "
+                              f"{ignore.resolve()}: Permission denied\n"
+                              f"  hint: {target} is written; add .devdocs/ to "
+                              ".gitignore yourself\n", err)
+                self.assertTrue(target.is_file())
+                ignore.chmod(0o644)
+                self.assertEqual(ignore.read_bytes(), b"build/\n")
+
+    def test_a_gitignore_on_a_full_disk_names_the_file_too(self) -> None:
+        # Any OSError: not only the refused permission of the test above.
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(b"build/\n")
+        real = Path.open
+
+        def full(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if mode == "ab":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", full):
+            code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn(f"devdocs: error: cannot add .devdocs/ to {ignore.resolve()}: "
+                      "No space left on device\n", err)
+        self.assertNotIn("internal error", err)
+        self.assertEqual(ignore.read_bytes(), b"build/\n")
+
+    def modes_of_gitignore(self) -> list[str]:
+        """The modes `init` opens the .gitignore with, however it opens it."""
+        modes: list[str] = []
+        real = io.open
+
+        def opened(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and Path(file).name == ".gitignore":
+                modes.append(mode)
+            return real(file, mode, *args, **kwargs)
+
+        with mock.patch.object(io, "open", opened), \
+                mock.patch("builtins.open", opened):
+            code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+        return modes
+
+    def test_a_gitignore_is_read_and_appended_to_never_written_over(self) -> None:
+        # Regression: it was written back whole, which the bytes alone cannot
+        # show of a file that is fine as text.
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(b"build/\n")
+        self.assertEqual(self.modes_of_gitignore(), ["rb", "ab"])
+        self.assertEqual(ignore.read_bytes(), b"build/\n.devdocs/\n")
+        (self.root / "devdocs.toml").unlink()
+        self.assertEqual(self.modes_of_gitignore(), ["rb"])   # it lists the entry now
+
+    def test_force_adds_the_entry_too(self) -> None:
+        # A stop's message sends the user to --force to finish this step.
+        config, ignore = self.root / "devdocs.toml", self.root / ".gitignore"
+        config.write_text("max_cost = 9\n", "utf-8")
+        ignore.write_bytes(b"build/\n")
+        code, _, err = self.run_cli("init", str(self.root), "--force")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", config.read_text("utf-8"))
+        self.assertEqual(ignore.read_bytes(), b"build/\n.devdocs/\n")
+
+    def inited(self, before: bytes) -> tuple[bytes, str]:
+        """What a .gitignore holding `before` holds after init, and init's log."""
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(before)
+        (self.root / "devdocs.toml").unlink(missing_ok=True)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+        return ignore.read_bytes(), err
+
+    def test_a_gitignore_only_ever_gains_the_entry(self) -> None:
+        # Regression: it was read as text and written back whole, CRLF as LF and
+        # a byte that is not UTF-8 as U+FFFD.
+        entry = b".devdocs/"
+        for before, added in (
+            (b"", entry + b"\n"),
+            (b"\n", entry + b"\n"),
+            (b"build/\n", entry + b"\n"),
+            (b"build/", b"\n" + entry + b"\n"),
+            (b"a\r\nb\r\n", entry + b"\r\n"),
+            (b"a\r\nb", b"\r\n" + entry + b"\r\n"),
+            (b"a\nb\nc\r\n", entry + b"\n"),                # mostly LF
+            (b"a\r\nb\r\nc\n", entry + b"\r\n"),            # mostly CRLF
+            (b"a\r\nb\n", entry + b"\r\n"),                 # as many of each
+            (b"a\r\nb\r", b"\n" + entry + b"\r\n"),          # just the LF it lacks
+            (b"a\nb\r", b"\n" + entry + b"\n"),
+            (b"a\rb\r", b"\n" + entry + b"\n"),               # no line break, to git
+            (b"caf\xe9/\n", entry + b"\n"),                  # Latin-1
+            (b"caf\xe9/\r\n\xff\xfe", b"\r\n" + entry + b"\r\n"),
+            (b"\xef\xbb\xbfa\r\n", entry + b"\r\n"),         # a BOM
+            (b"\xff\xfea\x00/\x00\n\x00", b"\n" + entry + b"\n"),   # UTF-16
+            (b"# no entry\n.devdocs\n/.devdocs/\n.devdocs/*\n", entry + b"\n"),
+            (b"x.devdocs/\n.devdocs/x\n", entry + b"\n"),
+            ("\ufeff.devdocs/\n".encode(), entry + b"\n"),   # not a word of its own
+        ):
+            with self.subTest(before=before):
+                after, log = self.inited(before)
+                self.assertEqual(after, before + added)
+                self.assertIn("added .devdocs/ to .gitignore", log)
+
+    def test_a_gitignore_that_lists_the_entry_is_not_touched(self) -> None:
+        # Every spelling the text it was read as, split on whitespace, gave.
+        for before in (b".devdocs/", b".devdocs/\n", b".devdocs/\r\n",
+                       b"a\r.devdocs/\r", b"  .devdocs/  \n", b"\t.devdocs/\t\n",
+                       b"\x0c.devdocs/\x0b\n",
+                       b"a .devdocs/ b\n", b"# .devdocs/\n", b"caf\xe9/\n.devdocs/",
+                       ".devdocs/\u00a0\n".encode(), "\u2003.devdocs/\n".encode(),
+                       b".devdocs/\x1f\n", b"\xff\xfe .devdocs/ \xff"):
+            with self.subTest(before=before):
+                after, log = self.inited(before)
+                self.assertEqual(after, before)
+                self.assertNotIn(".gitignore", log)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_read_only_gitignore_that_lists_the_entry_is_no_error(self) -> None:
+        ignore = self.root / ".gitignore"
+        ignore.write_bytes(b".devdocs/\n")
+        ignore.chmod(0o444)
+        self.addCleanup(ignore.chmod, 0o644)
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+
+    @unittest.skipIf(os.name == "nt", "needs a POSIX file mode and links")
+    def test_a_gitignore_link_is_refused_and_its_file_left_as_it_was(self) -> None:
+        # Regression: the entry was appended through it, yet git reads no
+        # .gitignore that is a link, nor does devdocs' scan: it never applied.
+        real = self.root / "shared.ignore"
+        real.write_bytes(b"build/\n")
+        real.chmod(0o640)
+        (self.root / ".gitignore").symlink_to(real.name)
+        node = real.stat().st_ino
+        self.assert_ignore_refused(self.LINKED)
+        self.assertTrue((self.root / ".gitignore").is_symlink())
+        self.assertEqual(real.read_bytes(), b"build/\n")
+        info = real.stat()
+        self.assertEqual((info.st_ino, info.st_mode & 0o777), (node, 0o640))
+
+    def test_no_gitignore_is_made(self) -> None:
+        code, _, err = self.run_cli("init", str(self.root))
+        self.assertEqual(code, 0, err)
+        self.assertFalse((self.root / ".gitignore").exists())
+        self.assertNotIn(".gitignore", err)
+
+    LINKED = "it is a symbolic link, which git does not read"   # wherever it leads
+
+    def assert_ignore_refused(self, reason: str) -> None:
+        """init, as --force lets it run again, refuses the .gitignore for
+        `reason`, saying what it wrote and what is left to do."""
+        root = self.root.resolve()
+        code, _, err = self.run_cli("init", str(root), "--force")
+        self.assertEqual(code, 2, err)
+        self.assertIn(f"devdocs: error: cannot add .devdocs/ to {root / '.gitignore'}: "
+                      f"{reason}\n  hint: {root / 'devdocs.toml'} is written; add "
+                      ".devdocs/ to .gitignore yourself\n", err)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX modes bind no root")
+    def test_a_gitignore_link_past_a_folder_it_cannot_search_is_refused(self) -> None:
+        # Regression: an internal error on 3.11 to 3.13. From 3.14 Path.is_file
+        # says False for it, so init went on in silence, adding no entry.
+        locked = self.root / "locked"
+        locked.mkdir()
+        (locked / "ignore").write_bytes(b"build/\n")
+        (self.root / ".gitignore").symlink_to("locked/ignore")
+        locked.chmod(0o000)
+        self.addCleanup(locked.chmod, 0o755)
+        self.assert_ignore_refused(self.LINKED)
+        locked.chmod(0o755)
+        self.assertEqual((locked / "ignore").read_bytes(), b"build/\n")
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_gitignore_link_to_nothing_is_refused_and_nothing_made(self) -> None:
+        # Regression: passed by in silence. Appending through it would make
+        # its target, perhaps outside the project. The last two lead nowhere,
+        # though the pyproject.toml they name is there.
+        root = self.root.resolve()
+        ignore = root / ".gitignore"
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        for link in ("shared/ignore", str(outside / "ignore"), "pyproject.toml/x",
+                     "missing/../pyproject.toml", "pyproject.toml/../pyproject.toml"):
+            with self.subTest(link=link):
+                ignore.unlink(missing_ok=True)
+                ignore.symlink_to(link)
+                self.assert_ignore_refused(self.LINKED)
+                self.assertEqual(os.readlink(ignore), link)
+        self.assertFalse((root / "shared").exists())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_directory_named_gitignore_is_refused_and_left_alone(self) -> None:
+        # Regression: passed by in silence, as a missing .gitignore is; only that is.
+        ignore = self.root / ".gitignore"
+        ignore.mkdir()
+        self.assert_ignore_refused("it is not a regular file")
+        self.assertEqual(list(ignore.iterdir()), [])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs a FIFO")
+    def test_a_fifo_named_gitignore_is_refused_and_never_opened(self) -> None:
+        # Reading one waits for a writer, for ever: here an open fails at once.
+        os.mkfifo(self.root / ".gitignore")
+        real = io.open
+
+        def opened(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and Path(file).name == ".gitignore":
+                raise AssertionError(f"init opened {file}")
+            return real(file, *args, **kwargs)
+
+        with mock.patch.object(io, "open", opened), mock.patch("builtins.open", opened):
+            self.assert_ignore_refused("it is not a regular file")
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX links")
+    def test_a_gitignore_link_to_no_regular_file_is_refused(self) -> None:
+        ignore = self.root / ".gitignore"
+        for link in ("shop", os.devnull, ".gitignore"):   # a folder, a device, a loop
+            with self.subTest(link=link):
+                ignore.unlink(missing_ok=True)
+                ignore.symlink_to(link)
+                self.assert_ignore_refused(self.LINKED)
+
+    def test_every_option_the_template_mentions_is_valid(self) -> None:
+        self.run_cli("init", str(self.root))
+        text = (self.root / "devdocs.toml").read_text("utf-8")
+        for option in ("formats", "pdf_engine", "pdf_split", "page_size"):
+            self.assertIn(f"# {option} = ", text)
+        uncommented = "\n".join(
+            line.removeprefix("# ") if " = " in line else line
+            for line in text.splitlines()
+        )
+        path = self.root / "uncommented.toml"
+        path.write_text(uncommented, encoding="utf-8")
+        config = load_config(config_file=path, env={})
+        self.assertEqual((config.formats, config.page_size), (("markdown",), "A4"))
+
+    def test_cache_stats_and_clear(self) -> None:
+        self.run_cli("generate", str(self.root), "--api-key", "k", "--quiet")
+        code, out, _ = self.run_cli("cache", "stats", str(self.root), "--json")
+        self.assertEqual(code, 0)
+        self.assertGreater(json.loads(out)["entries"], 0)
+        code, out, _ = self.run_cli("cache", "clear", str(self.root), "--json")
+        self.assertGreater(json.loads(out)["removed"], 0)
+
+    def test_only_generate_makes_state(self) -> None:
+        # Regression: cache stats and cache clear made an empty .devdocs/devdocs.db.
+        root, state = self.root.resolve(), self.root / ".devdocs"
+        said = {("cache", "stats"): "0 cached responses, bought for $0.0000 in total\n",
+                ("cache", "clear"): f"nothing to clear: {root} has no cache yet\n"}
+        with contextlib.chdir(self.root):   # models takes no path
+            for argv in (("estimate",), ("export",), ("doctor", "--api-key", "k"),
+                         ("models", "--api-key", "k"), *said, ("init",)):
+                with self.subTest(argv=argv):
+                    _, out, err = self.run_cli(*argv)
+                    made = state.exists()
+                    shutil.rmtree(state, ignore_errors=True)   # so it fails alone
+                    self.assertFalse(made, err)
+                    self.assertEqual(out, said.get(argv, out))
+            code, _, err = self.run_cli("generate", "--api-key", "k", "--quiet")
+            self.assertEqual(code, 0, err)
+            self.assertTrue((state / "devdocs.db").is_file())
+            _, out, _ = self.run_cli("cache", "clear", "--json")
+        self.assertGreater(json.loads(out)["removed"], 0)
+
+
+class TestDoctorAndModels(CliCase):
+    def test_doctor_offline_with_a_key(self) -> None:
+        code, out, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                    "--api-key", "k")
+        self.assertIn("api key", out)
+        self.assertIn(code, (0, 1))   # 1 only if this machine lacks a capability
+
+    def test_doctor_without_a_key_is_blocking(self) -> None:
+        code, out, _ = self.run_cli("doctor", str(self.root), "--offline")
+        self.assertEqual(code, 1)
+        self.assertIn("!! api key", out)
+
+    def test_doctor_says_how_to_give_a_missing_key(self) -> None:
+        # Regression: it showed the error without its hint.
+        _, out, _ = self.run_cli("doctor", str(self.root), "--offline")
+        self.assertIn("!! api key              no API key for provider 'gemini'\n"
+                      "  hint: pass --api-key or set one of: $DEVDOCS_API_KEY, "
+                      "$GEMINI_API_KEY, $GOOGLE_API_KEY\n", out)
+
+    def test_doctor_lists_the_pdf_engines_it_finds(self) -> None:
+        found = {"builtin": "/usr/bin/python3", "weasyprint": "/opt/bin/weasyprint"}
+        with mock.patch.object(external, "available_engines", return_value=found):
+            _, out, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                     "--api-key", "k")
+            _, data, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                      "--api-key", "k", "--json")
+        self.assertIn("ok pdf-engines", out)
+        self.assertIn("builtin, weasyprint (/opt/bin/weasyprint)", out)
+        self.assertNotIn("!! pdf engine", out)
+        self.assertEqual(json.loads(data)["pdf_engines"], found)
+
+    def doctor(self, *argv: str, env: dict[str, str] | None = None) -> tuple[int, str]:
+        """`doctor` on a healthy machine that has only the builtin engine."""
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.object(external, "available_engines",
+                               return_value={"builtin": "/usr/bin/python3"}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, _ = self.run_cli("doctor", str(self.root), "--offline",
+                                        "--api-key", "k", *argv, env=env)
+        return code, out
+
+    def test_a_missing_engine_blocks_when_pdf_is_configured(self) -> None:
+        # Regression: doctor exited 0 where generate exits 2, and --json
+        # carried neither the setting nor the problem.
+        (self.root / "devdocs.toml").write_text(
+            'formats = ["markdown", "pdf"]\npdf_engine = "chrome"\n', "utf-8")
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn("!! pdf engine           chrome is configured but not "
+                      "installed", out)
+        code, out = self.doctor("--json")
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertEqual(data["formats"], ["markdown", "pdf"])
+        self.assertEqual(data["pdf_engine"], {"configured": "chrome", "path": None})
+
+    def test_a_missing_engine_is_no_problem_without_pdf(self) -> None:
+        code, out = self.doctor(env={"DEVDOCS_PDF_ENGINE": "weasyprint"})
+        self.assertEqual(code, 0)
+        self.assertNotIn("pdf engine", out)
+
+    def test_an_empty_format_list_is_a_config_error(self) -> None:
+        (self.root / "devdocs.toml").write_text("formats = []\n", "utf-8")
+        code, out = self.doctor()
+        self.assertEqual(code, 2)
+        self.assertIn("!! config               no output format configured", out)
+
+    def doctor_json(
+        self, *argv: str, model: Any = None, env: dict[str, str] | None = None
+    ) -> tuple[int, dict[str, Any], str]:
+        """`doctor --json` on a healthy machine: its exit code, JSON and stderr."""
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.object(external, "available_engines",
+                               return_value={"builtin": "/usr/bin/python3"}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, err = self.run_cli("doctor", str(self.root), "--json", *argv,
+                                          model=model, env=env)
+        return code, json.loads(out), err
+
+    def test_no_limit_is_said_so(self) -> None:
+        # Regression: "max_cost=$0", and no word on max_requests.
+        toml = self.root / "devdocs.toml"
+        for text, shown in (
+            ("", "max_cost=$0.5 max_requests=no limit "),
+            ("max_cost = 0\n", "max_cost=no limit max_requests=no limit "),
+            ("max_cost = 2.5\nmax_requests = 40\n", "max_cost=$2.5 max_requests=40 "),
+            ("max_cost = 0\nmax_requests = 7\n", "max_cost=no limit max_requests=7 "),
+        ):
+            with self.subTest(text):
+                toml.write_text(text, "utf-8")
+                _, out = self.doctor()
+                self.assertIn(shown, out)
+                self.assertNotIn("$0 ", out)
+        _, out = self.doctor(env={"DEVDOCS_MAX_COST": "0"})
+        self.assertIn("max_cost=no limit ", out)
+
+    def test_the_json_says_where_the_key_came_from_and_never_shows_it(self) -> None:
+        # Regression: --json said nothing of the key.
+        key = "AIza-SECRET-0123"  # gitleaks:allow (a fake key)
+        toml = self.root / "devdocs.toml"
+        path = str(toml.resolve())
+
+        def status(origin: str | None, where: str | None) -> dict[str, Any]:
+            return {"found": origin is not None, "origin": origin, "where": where,
+                    "shared": False}
+
+        for argv, env, text, expected in (
+            (["--api-key", key], None, "", status("flag", "--api-key")),
+            ([], {"GEMINI_API_KEY": key}, "", status("env", "GEMINI_API_KEY")),
+            ([], {"GOOGLE_API_KEY": key}, "", status("env", "GOOGLE_API_KEY")),
+            ([], {"DEVDOCS_API_KEY": key}, "", status("env", "DEVDOCS_API_KEY")),
+            (["--provider", "anthropic"], {"ANTHROPIC_API_KEY": key}, "",
+             status("env", "ANTHROPIC_API_KEY")),
+            ([], None, f'api_key = "{key}"\n', status("file", path)),
+            ([], None, "", status(None, None)),
+        ):
+            with self.subTest(expected=expected):
+                toml.write_text(text, "utf-8")
+                code, data, err = self.doctor_json("--offline", *argv, env=env)
+                self.assertEqual(data["api_key"], expected)
+                self.assertEqual(code, 0 if expected["found"] else 1)
+                self.assertNotIn(key, json.dumps(data))
+                self.assertNotIn(key, err)
+                healthy = Report((Capability("python", True, "3.11"),))
+                with mock.patch.object(capabilities, "probe_all", return_value=healthy):
+                    _, out, err = self.run_cli("doctor", str(self.root), "--offline",
+                                               *argv, env=env)
+                self.assertNotIn(key, out + err)
+                if expected["found"]:
+                    self.assertIn(
+                        f"ok api key              from {expected['origin']} "
+                        f"{expected['where']}\n", out + "\n")
+
+    def test_the_config_files_path_is_the_file_that_was_read(self) -> None:
+        toml = self.root / "devdocs.toml"
+        toml.write_text('api_key = "k"\n', "utf-8")
+        path = str(toml.resolve())
+        for argv, env in ((["doctor", str(self.root / "shop")], None),   # from below
+                          (["doctor"], {"DEVDOCS_PATH": str(self.root)})):
+            with self.subTest(argv=argv):
+                _, out, _ = self.run_cli(*argv, "--offline", "--json", env=env)
+                self.assertEqual(json.loads(out)["api_key"]["where"], path)
+        # a `path` in the file moves the project, not the file
+        toml.write_text('api_key = "k"\npath = "shop"\n', "utf-8")
+        with contextlib.chdir(self.root):
+            _, out, _ = self.run_cli("doctor", "--offline", "--json")
+        self.assertEqual(json.loads(out)["api_key"]["where"], path)
+
+    def test_the_json_gives_the_outcome_of_the_provider_check(self) -> None:
+        # Regression: a failed or skipped check left no trace in --json.
+        code, data, _ = self.doctor_json("--api-key", "k")
+        self.assertEqual(code, 0)
+        check = data["provider_check"]
+        self.assertEqual((check["provider"], check["status"]), ("gemini", "ok"))
+        self.assertTrue(check["detail"].startswith("3 models; catalogued: "), check)
+        self.assertEqual(data["models"], sorted(TaggedModel().list_models()))
+
+        class Rejecting(TaggedModel):
+            def list_models(self) -> list[str]:
+                raise AuthError("Gemini rejected the API key", hint="check the key")
+
+        code, data, _ = self.doctor_json("--api-key", "k", model=Rejecting())
+        self.assertEqual(code, 1)
+        self.assertEqual(data["provider_check"], {
+            "provider": "gemini", "status": "failed",
+            "detail": "Gemini rejected the API key\n  hint: check the key",
+        })
+        self.assertNotIn("models", data)
+
+        made = mock.Mock(side_effect=AssertionError("a model was made"))
+        with mock.patch.object(cli, "make_provider", made):
+            for argv, why in ((["--offline", "--api-key", "k"], "--offline"),
+                              (["--offline"], "--offline"),
+                              ([], "no API key")):
+                with self.subTest(argv=argv):
+                    out, err = io.StringIO(), io.StringIO()
+                    with clean_env(), contextlib.redirect_stdout(out), \
+                            contextlib.redirect_stderr(err):
+                        cli.main(["doctor", str(self.root), "--json", *argv])
+                    self.assertEqual(json.loads(out.getvalue())["provider_check"], {
+                        "provider": "gemini", "status": "skipped", "detail": why,
+                    })
+        made.assert_not_called()
+
+    def test_a_config_error_leaves_the_rest_unchecked(self) -> None:
+        (self.root / "devdocs.toml").write_text("bogus = 1\n", "utf-8")
+        code, data, _ = self.doctor_json("--api-key", "k")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown option 'bogus'", data["config"])
+        self.assertNotIn("api_key", data)
+        self.assertNotIn("provider_check", data)
+
+    def sdk_doctor(self, sdk: Any) -> tuple[int, str, dict[str, Any]]:
+        """`doctor --offline --provider anthropic-sdk` with `sdk` as the anthropic
+        module, None for a package that is not there: the exit code, lines and
+        JSON."""
+        with mock.patch.dict(sys.modules, {"anthropic": sdk}):
+            code, out = self.doctor("--provider", "anthropic-sdk")
+            same, data, _ = self.doctor_json("--offline", "--api-key", "k",
+                                             "--provider", "anthropic-sdk")
+        self.assertEqual(same, code)
+        return code, out, data
+
+    def test_a_missing_sdk_blocks_even_offline_and_says_how_to_install_it(self) -> None:
+        # Regression: doctor passed, and the run then failed.
+        code, out, data = self.sdk_doctor(None)
+        self.assertEqual(code, 1)
+        self.assertIn("!! anthropic-sdk          cannot import anthropic: "
+                      "ModuleNotFoundError", out)
+        self.assertIn("pip install 'devdocs[anthropic]'", out)
+        sdk = data["anthropic_sdk"]
+        self.assertFalse(sdk["ok"])
+        self.assertIn("pip install 'devdocs[anthropic]'", sdk["detail"])
+
+    def test_a_broken_sdk_is_found_by_importing_it(self) -> None:
+        with mock.patch.object(importlib, "import_module",
+                               side_effect=AttributeError("half a module")):
+            code, out, data = self.sdk_doctor(types.SimpleNamespace())
+        self.assertEqual(code, 1)
+        self.assertIn("cannot import anthropic: AttributeError: half a module", out)
+        self.assertFalse(data["anthropic_sdk"]["ok"])
+
+    def test_an_sdk_that_imports_passes(self) -> None:
+        code, out, data = self.sdk_doctor(
+            types.SimpleNamespace(__version__="2.3.0", Anthropic=object))
+        self.assertEqual(code, 0)
+        self.assertIn("ok anthropic-sdk          2.3.0", out)
+        self.assertEqual(data["anthropic_sdk"], {"name": "anthropic-sdk", "ok": True,
+                                                 "value": "2.3.0", "detail": ""})
+
+    def test_what_only_shares_the_sdks_name_is_found_out(self) -> None:
+        # Regression: an empty folder named anthropic in the current directory
+        # imported as a package, under `python -m devdocs`; doctor passed, and
+        # the run then could not start.
+        for stray in ("anthropic/", "anthropic.py"):
+            folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+            if stray.endswith("/"):
+                (folder / stray).mkdir()
+            else:
+                (folder / stray).write_text("", "utf-8")
+            with self.subTest(stray), mock.patch.dict(sys.modules):
+                sys.modules.pop("anthropic", None)
+                # the stray alone on the path for its import; doctor imports lazily
+                with mock.patch.object(sys, "path", [str(folder)]):
+                    importlib.import_module("anthropic")
+                code, out = self.doctor("--provider", "anthropic-sdk")
+                self.assertEqual(code, 1)
+                self.assertIn("!! anthropic-sdk          no Anthropic client in the "
+                              f"anthropic found at {folder}", out)
+                self.assertIn("pip install 'devdocs[anthropic]'", out)
+
+    def test_without_the_sdk_the_provider_is_not_asked(self) -> None:
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.dict(sys.modules, {"anthropic": None}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, _ = self.run_cli("doctor", str(self.root), "--api-key", "k",
+                                        "--provider", "anthropic-sdk", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["provider_check"], {
+            "provider": "anthropic-sdk", "status": "skipped",
+            "detail": "the anthropic SDK is not usable",
+        })
+
+    def test_with_the_sdk_the_provider_is_asked(self) -> None:
+        sdk = types.SimpleNamespace(__version__="2.3.0", Anthropic=object)
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.dict(sys.modules, {"anthropic": sdk}), \
+                mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, err = self.run_cli("doctor", str(self.root), "--api-key", "k",
+                                          "--provider", "anthropic-sdk", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["provider_check"]["status"], "ok")
+
+    def test_the_other_providers_need_no_sdk(self) -> None:
+        absent = {"anthropic": None}
+        for provider in ("gemini", "anthropic"):
+            with self.subTest(provider), mock.patch.dict(sys.modules, absent):
+                code, out = self.doctor("--provider", provider)
+                self.assertEqual(code, 0)
+                self.assertNotIn("anthropic-sdk", out)
+                _, data, _ = self.doctor_json("--offline", "--api-key", "k",
+                                              "--provider", provider)
+                self.assertNotIn("anthropic_sdk", data)
+
+    def test_models_marks_what_the_key_can_reach(self) -> None:
+        code, out, _ = self.run_cli("models", "--api-key", "k", "--json")
+        self.assertEqual(code, 0)
+        rows = {row["id"]: row["available"] for row in json.loads(out)["catalogued"]}
+        self.assertTrue(rows["gemini-2.5-flash-lite"])
+        self.assertFalse(rows["gemini-3.1-flash-lite"])
+
+
+class TestDemoKey(CliCase):
+    """None ships, and `devdocs.demo` is where one would go. The branch that
+    warns of it is reached only then."""
+
+    def demo(self, *argv: str) -> tuple[int, str, str]:
+        with mock.patch.object(demo, "DEMO_KEY", "DEMO-SECRET"):
+            return self.run_cli(*argv)
+
+    def test_none_ships(self) -> None:
+        self.assertEqual(demo.DEMO_KEY, "")
+        code, _, err = self.run_cli("generate", str(self.root))
+        self.assertEqual(code, 2)
+        self.assertIn("no API key", err)
+        self.assertNotIn("demo", err)
+
+    def test_the_warning_names_the_real_choices(self) -> None:
+        # Regression: it named GEMINI_API_KEY alone.
+        code, out, err = self.demo("generate", str(self.root), "--quiet")
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "warning: using the shared demo key, whose free quota everyone shares. "
+            "To use your own, pass --api-key, set DEVDOCS_API_KEY, GEMINI_API_KEY or "
+            "GOOGLE_API_KEY, or set api_key in devdocs.toml.\n", err)
+        self.assertNotIn("DEMO-SECRET", out + err)
+
+    def assert_own_key_used(self, *argv: str, **env: str) -> None:
+        """A run with the demo key there sends `own`, and says nothing of the demo."""
+        err = io.StringIO()
+        with mock.patch.object(demo, "DEMO_KEY", "DEMO-SECRET"), clean_env(**env), \
+                mock.patch.object(cli, "make_provider",
+                                  return_value=self.model) as made, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            code = cli.main(["generate", str(self.root), "--quiet", *argv])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertNotIn("demo", err.getvalue())
+        made.assert_called_once_with("gemini", "own")
+
+    def test_every_choice_it_names_beats_it(self) -> None:
+        # Each alone: a key in the file, there throughout, would hide the others.
+        self.assert_own_key_used("--api-key", "own")
+        for variable in ("DEVDOCS_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            with self.subTest(variable):
+                self.assert_own_key_used(**{variable: "own"})
+        (self.root / "devdocs.toml").write_text('api_key = "own"\n', "utf-8")
+        self.assert_own_key_used()
+
+    def test_it_serves_gemini_alone(self) -> None:
+        code, _, err = self.demo("generate", str(self.root), "--provider", "anthropic")
+        self.assertEqual(code, 2)
+        self.assertIn("no API key", err)
+
+    def test_doctor_reports_it_as_shared(self) -> None:
+        healthy = Report((Capability("python", True, "3.11"),))
+        with mock.patch.object(capabilities, "probe_all", return_value=healthy):
+            code, out, err = self.demo("doctor", str(self.root), "--offline")
+            _, data, _ = self.demo("doctor", str(self.root), "--offline", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("ok api key              from demo (shared demo key)\n", out)
+        self.assertEqual(json.loads(data)["api_key"], {
+            "found": True, "origin": "demo", "where": "", "shared": True,
+        })
+        self.assertNotIn("DEMO-SECRET", out + data + err)
+
+
+def gone() -> TextIO:
+    """A stream whose reader has gone, as `| tee` or `| jq` has once the
+    Ctrl-C that stops a run ends it too."""
+    read, write = os.pipe()
+    os.close(read)
+    return open(write, "w", encoding="utf-8")
+
+
+class TestOutput(unittest.TestCase):
+    def test_output_nobody_reads_is_dropped_and_nothing_fails(self) -> None:
+        # Regression: the line raised, or the result raised in Python's flush
+        # at exit, which made a stop's 130 a 120.
+        lines: dict[str, Callable[[cli._Output], None]] = {
+            "info": lambda out: out.info("progress"),
+            "warn": lambda out: out.warn("careful"),
+            "result": lambda out: out.result("done", {"documents": 6}),
+        }
+        for name, line in lines.items():
+            with self.subTest(name), gone() as stream:
+                out = cli._Output(as_json=True, stdout=stream, stderr=stream)
+                line(out)
+                line(out)
+                stream.flush()   # as Python does at exit
+
+    def test_what_a_stream_cannot_encode_is_shown_as_an_escape(self) -> None:
+        for encoding, line, shown in (
+            ("latin-1", "wrote café/日本", b"wrote caf\xe9/\\u65e5\\u672c\n"),
+            ("ascii", "café", b"caf\\xe9\n"),
+            ("utf-8", "caf\udcff.py", b"caf\\udcff.py\n"),   # a name that is no UTF-8
+            ("utf-8", "café", "café\n".encode()),
+        ):
+            with self.subTest(encoding=encoding, line=line):
+                raw = io.BytesIO()
+                with io.TextIOWrapper(raw, encoding=encoding) as stream:
+                    cli._write(stream, line)
+                    self.assertEqual(raw.getvalue(), shown)
+
+    def test_output_nobody_reads_is_dropped_even_if_it_cannot_be_encoded(self) -> None:
+        with gone() as stream:
+            cli._write(stream, "caf\udcff.py")
+            cli._write(stream, "next")
+            stream.flush()   # as Python does at exit
+
+    @unittest.skipUnless(sys.getfilesystemencoding() == "utf-8", "a name in UTF-8")
+    def test_a_name_stdout_cannot_encode_ends_no_command(self) -> None:
+        # Regression: an internal error, for init with its config written.
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory())) / "日本"
+        folder.mkdir()
+        (folder / "大.py").write_text("def f():\n    return 1\n", "utf-8")
+        for argv, shown in (
+            (["estimate", str(folder), "--explain", "--quiet"], b"  \\u5927.py  ("),
+            (["init", str(folder)], b"next: devdocs estimate "),
+            (["init", str(folder), "--force"], b"\\u65e5\\u672c'\n"),   # quoted
+        ):
+            with self.subTest(argv=argv):
+                raw = io.BytesIO()
+                err = io.StringIO()
+                with io.TextIOWrapper(raw, encoding="latin-1") as stdout, clean_env(), \
+                        contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(err):
+                    code = cli.main(argv)
+                    self.assertEqual(code, 0, err.getvalue())
+                    self.assertIn(shown, raw.getvalue())
+                self.assertNotIn("internal error", err.getvalue())
+
+
+def as_from_a_terminal(case: unittest.TestCase) -> None:
+    """Give SIGINT and SIGTERM the handling a process started from a terminal
+    has, until `case` ends: a test run in the background inherits SIGINT
+    ignored, which devdocs, as Python does, leaves ignored."""
+    for signum, handler in ((signal.SIGINT, signal.default_int_handler),
+                            (signal.SIGTERM, signal.SIG_DFL)):
+        case.addCleanup(signal.signal, signum, signal.signal(signum, handler))
+
+
+class TestInterrupts(unittest.TestCase):
+    """The handler itself, called by hand: no signal is sent."""
+
+    def setUp(self) -> None:
+        as_from_a_terminal(self)
+        self.now = 100.0
+        self.halted: list[int] = []
+        self.err = io.StringIO()
+        self.interrupts = self.make(self.err)
+
+    def make(self, stderr: TextIO) -> cli._Interrupts:
+        """Interrupts on a clock the test turns, whose halt is recorded."""
+        out = cli._Output(stdout=io.StringIO(), stderr=stderr)
+        return cli._Interrupts(out, clock=lambda: self.now, halt=self.halted.append)
+
+    def test_outside_a_paid_run_the_first_signal_stops_at_once(self) -> None:
+        for signum, code in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            with self.subTest(signum.name):
+                interrupts = self.make(io.StringIO())
+                with self.assertRaises(KeyboardInterrupt):
+                    interrupts.handle(signum, None)
+                self.assertFalse(interrupts.event.is_set())
+                self.assertEqual((interrupts.code, self.halted), (code, []))
+
+    def test_in_a_paid_run_the_first_signal_asks_the_run_to_stop(self) -> None:
+        with self.interrupts.paying():
+            self.interrupts.handle(signal.SIGTERM, None)
+        self.assertTrue(self.interrupts.event.is_set())
+        self.assertEqual((self.interrupts.code, self.halted), (143, []))
+        self.assertIn("interrupt again to stop at once", self.err.getvalue())
+
+    def test_a_second_delivery_within_a_second_is_the_same_request(self) -> None:
+        with self.interrupts.paying():
+            self.interrupts.handle(signal.SIGINT, None)
+            self.now += 0.9
+            self.interrupts.handle(signal.SIGINT, None)   # the wrapper's copy
+            self.assertEqual(self.halted, [])
+            self.now += 0.2
+            self.interrupts.handle(signal.SIGINT, None)
+        self.assertEqual(self.halted, [130])
+        self.assertEqual(self.err.getvalue().count("stopped at once"), 1)
+
+    def test_a_later_signal_outside_a_run_claims_no_answers(self) -> None:
+        # Regression: it spoke of answers cached, in a command that bought none.
+        with self.assertRaises(KeyboardInterrupt):
+            self.interrupts.handle(signal.SIGINT, None)
+        self.now += 2
+        self.interrupts.handle(signal.SIGINT, None)
+        self.assertEqual(self.halted, [130])
+        self.assertEqual(self.err.getvalue(), "warning: stopped at once\n")
+
+    def test_a_later_signal_once_a_run_has_paid_says_what_it_kept(self) -> None:
+        with self.interrupts.paying():
+            pass
+        with self.assertRaises(KeyboardInterrupt):   # as the summary is printed
+            self.interrupts.handle(signal.SIGTERM, None)
+        self.now += 2
+        self.interrupts.handle(signal.SIGTERM, None)
+        self.assertEqual(self.halted, [143])
+        self.assertIn("warning: stopped at once; the answers received are cached",
+                      self.err.getvalue())
+
+    def test_a_doubled_ctrl_c_outside_a_run_raises_once(self) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            self.interrupts.handle(signal.SIGINT, None)
+        self.now += 0.01
+        self.interrupts.handle(signal.SIGINT, None)   # not again, mid-cleanup
+        self.assertEqual(self.halted, [])
+
+    def test_handlers_are_installed_for_the_command_then_restored(self) -> None:
+        both = (signal.SIGINT, signal.SIGTERM)
+        before = [signal.getsignal(signum) for signum in both]
+        with self.interrupts.handling():
+            for signum in both:
+                self.assertEqual(signal.getsignal(signum), self.interrupts.handle)
+        self.assertEqual([signal.getsignal(signum) for signum in both], before)
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["init", folder]), 0)
+        self.assertEqual([signal.getsignal(signum) for signum in both], before)
+
+    def test_a_line_the_stream_refuses_goes_to_its_descriptor(self) -> None:
+        # The signal came while the main thread was printing to stderr, and
+        # the stream refuses a second writer then.
+        read, write = os.pipe()
+        with open(read, encoding="utf-8") as pipe, \
+                open(write, "w", encoding="utf-8") as stream:
+            interrupts = self.make(stream)
+            busy = RuntimeError("reentrant call inside <_io.BufferedWriter>")
+            with mock.patch.object(cli._Output, "warn", side_effect=busy), \
+                    interrupts.paying():
+                interrupts.handle(signal.SIGINT, None)
+                self.now += 2
+                interrupts.handle(signal.SIGINT, None)
+            stream.close()
+            text = pipe.read()
+        self.assertEqual(self.halted, [130])
+        self.assertIn("warning: stopped at once;", text)
+
+    def test_a_stop_whose_output_is_gone_still_stops(self) -> None:
+        # Regression: under `2>&1 | tee log`, whose tee the Ctrl-C ends too,
+        # the notices it could not print stayed buffered, to fail again when
+        # the stream closed, as at exit.
+        with gone() as stream:
+            interrupts = self.make(stream)
+            with interrupts.paying():
+                interrupts.handle(signal.SIGINT, None)
+                self.now += 2
+                interrupts.handle(signal.SIGINT, None)
+        self.assertTrue(interrupts.event.is_set())
+        self.assertEqual(self.halted, [130])
+
+    def test_a_line_that_cannot_be_written_never_keeps_a_stop_from_stopping(
+        self,
+    ) -> None:
+        # Regression: only a reentrant print was caught, so any other failure
+        # raised from the handler, before a second request could stop at once.
+        closed = ValueError("I/O operation on closed file.")
+        with mock.patch.object(cli._Output, "info", side_effect=closed), \
+                mock.patch.object(cli._Output, "warn", side_effect=closed), \
+                self.interrupts.paying():
+            self.interrupts.handle(signal.SIGINT, None)
+            self.now += 2
+            self.interrupts.handle(signal.SIGINT, None)
+        self.assertTrue(self.interrupts.event.is_set())
+        self.assertEqual(self.halted, [130])
+
+    def test_a_signal_amid_a_wait_on_the_stop_still_sets_it(self) -> None:
+        # Regression: the handler set the stop itself, taking the lock that a
+        # wait on it holds as it starts and ends. A signal there, on a main
+        # thread waiting on the stop as the embedding limiter does, deadlocked.
+        def interrupted() -> None:
+            with self.interrupts.event._cond:   # as inside Event.wait
+                self.interrupts.handle(signal.SIGINT, None)
+
+        with self.interrupts.paying():
+            thread = threading.Thread(target=interrupted, daemon=True)
+            thread.start()
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(self.interrupts.event.wait(5))
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX signal masks")
+    def test_the_thread_that_sets_the_stop_leaves_signals_to_the_main_one(
+        self,
+    ) -> None:
+        # As the pool's workers do: a signal that thread took instead would
+        # leave the main thread's wait, and so the stop, asleep.
+        masks: list[set[signal.Signals]] = []
+
+        class Seen(threading.Event):
+            def set(self) -> None:
+                masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+                super().set()
+
+        self.interrupts.event = Seen()
+        with self.interrupts.paying():
+            self.interrupts.handle(signal.SIGINT, None)
+        (mask,) = masks
+        self.assertLessEqual({signal.SIGINT, signal.SIGTERM}, mask)
+
+    def test_an_ignored_signal_stays_ignored(self) -> None:
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        with self.interrupts.handling():
+            self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)
+            self.assertEqual(signal.getsignal(signal.SIGINT), self.interrupts.handle)
+
+    def test_off_the_main_thread_nothing_is_installed(self) -> None:
+        seen: list[object] = []
+
+        def command() -> None:
+            with self.interrupts.handling():
+                seen.append(signal.getsignal(signal.SIGINT))
+
+        thread = threading.Thread(target=command)
+        thread.start()
+        thread.join(5)
+        self.assertEqual(seen, [signal.getsignal(signal.SIGINT)])
+
+
+class SignalsMidRun(TaggedModel):
+    """Sends `signum` to this process while shop/cli.py's call is on the wire
+    and shop/cart.py's waits out a 30 s Retry-After; answers cli.py once the
+    run's stop is set, as a reply that arrives after the signal."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__()
+        self.signum = signum
+        self.limited = threading.Event()
+        self.stop = threading.Event()   # the run's, once the CLI made it
+        self.asked: list[str] = []
+
+    def generate(self, request: Request) -> Completion:
+        self.asked.append(request.tag)
+        if request.tag == "shop/cart.py" and not self.limited.is_set():
+            self.limited.set()
+            raise RateLimited("slow down", retry_after=30, status=429)
+        if request.tag == "shop/cli.py":
+            self.limited.wait(5)
+            os.kill(os.getpid(), self.signum)
+            self.stop.wait(10)
+        return super().generate(request)
+
+
+class TeeEnds(TaggedModel):
+    """Sends SIGINT while shop/cli.py's call is on the wire, as a Ctrl-C to
+    `devdocs generate 2>&1 | tee log` does, and ends tee, the reader of the
+    `tee` pipe, as that Ctrl-C does: at once, or once tee has the stop's
+    notice. Answers once the run's stop is set, as a reply after the signal."""
+
+    def __init__(self, tee: int, *, after_notice: bool) -> None:
+        super().__init__()
+        self.tee = tee
+        self.after_notice = after_notice
+        self.stop = threading.Event()   # the run's, once the CLI made it
+
+    def end_tee(self) -> None:
+        if self.tee >= 0:
+            os.close(self.tee)
+            self.tee = -1
+
+    def generate(self, request: Request) -> Completion:
+        if request.tag == "shop/cli.py":
+            if not self.after_notice:
+                self.end_tee()
+            os.kill(os.getpid(), signal.SIGINT)
+            self.stop.wait(10)
+            if self.after_notice:
+                self.read_until(b"stopping:")
+                self.end_tee()
+        return super().generate(request)
+
+    def read_until(self, text: bytes) -> None:
+        seen = b""
+        while text not in seen:
+            if not select.select([self.tee], [], [], 10)[0]:
+                raise AssertionError(f"{text!r} never came")
+            seen += os.read(self.tee, 4096)
+
+
+@unittest.skipIf(sys.platform == "win32", "sends POSIX signals")
+class TestStopSignals(CliCase):
+    """Real signals, end to end."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        as_from_a_terminal(self)
+        # Without devdocs' handler, SIGTERM would end the test run itself.
+        signal.signal(signal.SIGTERM, self.unhandled)
+
+    @staticmethod
+    def unhandled(signum: int, frame: FrameType | None) -> None:
+        raise AssertionError("SIGTERM reached the tests, not devdocs")
+
+    def stopped_by(self, signum: int) -> tuple[int, dict[str, Any], str]:
+        model = SignalsMidRun(signum)
+        real = cli._client
+
+        def client(*args: Any, **kwargs: Any) -> LLMClient:
+            made = real(*args, **kwargs)
+            model.stop = made.stop
+            return made
+
+        started = time.monotonic()
+        with mock.patch.object(cli, "_client", client):
+            code, out, err = self.run_cli("generate", str(self.root), "--api-key",
+                                          "k", "--concurrency", "2", "--json",
+                                          model=model)
+        # Well under the 30 s Retry-After; a stop seen late would show as the
+        # 10 s the model waits for it.
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(sorted(model.asked), ["shop/cart.py", "shop/cli.py"])
+        return code, json.loads(out), err
+
+    def check_written_and_recorded(self, summary: dict[str, Any], err: str) -> None:
+        self.assertEqual(summary["stopped"], "interrupted")
+        self.assertIn("stopping: requests already sent finish", err)
+        docs = self.root / "docs"
+        self.assertIn(PROSE, (docs / "shop" / "cli.py.md").read_text("utf-8"))
+        self.assertNotIn(PROSE, (docs / "shop" / "cart.py.md").read_text("utf-8"))
+        self.assertTrue((docs / "README.md").is_file())
+        with Database(self.root / ".devdocs" / "devdocs.db") as db:
+            (run,) = db.query("SELECT status FROM run")
+        self.assertEqual(run["status"], "interrupted")
+
+        # cli.py's answer, which came after the signal, was cached; cart.py's
+        # call, in its backoff when the stop came, was never sent again.
+        self.assertEqual(self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      "--quiet")[0], 0)
+        self.assertEqual(sorted(r.tag for r in self.model.calls),
+                         ["shop", "shop/__init__.py", "shop/cart.py", "shop/money.py"])
+
+    def test_ctrl_c_mid_run_stops_it_gracefully(self) -> None:
+        code, summary, err = self.stopped_by(signal.SIGINT)
+        self.assertEqual(code, 130)
+        self.check_written_and_recorded(summary, err)
+
+    def test_sigterm_mid_run_stops_it_gracefully(self) -> None:
+        code, summary, err = self.stopped_by(signal.SIGTERM)
+        self.assertEqual(code, 143)
+        self.check_written_and_recorded(summary, err)
+
+    def stopped_as_tee_ends(self, *, after_notice: bool) -> None:
+        """Stop a run whose output, stdout and stderr, goes through a tee the
+        Ctrl-C ends; check that it stops as it does with a reader."""
+        read, write = os.pipe()
+        model = TeeEnds(read, after_notice=after_notice)
+        self.addCleanup(model.end_tee)
+        stdout = self.enterContext(open(os.dup(write), "w", encoding="utf-8"))
+        stderr = self.enterContext(   # line-buffered, as sys.stderr is
+            open(write, "w", buffering=1, encoding="utf-8"))
+        real = cli._client
+
+        def client(*args: Any, **kwargs: Any) -> LLMClient:
+            made = real(*args, **kwargs)
+            model.stop = made.stop
+            return made
+
+        with clean_env(), mock.patch.object(cli, "make_provider", return_value=model), \
+                mock.patch.object(cli, "_client", client), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["generate", str(self.root), "--api-key", "k",
+                             "--concurrency", "1", "--json"])
+        for stream in (stdout, stderr):
+            stream.flush()   # as Python does at exit
+        self.assertEqual(code, 130)
+        docs = self.root / "docs"
+        self.assertIn(PROSE, (docs / "shop" / "cli.py.md").read_text("utf-8"))
+        with Database(self.root / ".devdocs" / "devdocs.db") as db:
+            (run,) = db.query("SELECT status FROM run")
+        self.assertEqual(run["status"], "interrupted")
+
+        # cli.py's answer, which came after the Ctrl-C, was cached.
+        self.assertEqual(self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      "--quiet")[0], 0)
+        self.assertEqual(sorted(r.tag for r in self.model.calls),
+                         ["shop", "shop/__init__.py", "shop/money.py"])
+
+    def test_a_stop_outlives_its_output(self) -> None:
+        # Regression: with stderr gone, a progress line raised into the run,
+        # which wrote no page, lost the answer on the wire and stayed "running".
+        self.stopped_as_tee_ends(after_notice=False)
+
+    def test_an_answer_that_comes_after_the_output_went_is_kept(self) -> None:
+        # Regression: its progress line raised before it was cached.
+        self.stopped_as_tee_ends(after_notice=True)
+
+    def test_a_signal_while_the_pages_are_written_lets_them_be(self) -> None:
+        # Regression: the write was abandoned, every page with it.
+        class Signalled(MarkdownRenderer):
+            def render(self, docset: DocSet) -> dict[str, bytes]:
+                # the run's pages, which have a date; not those of its check
+                if docset.run is not None and docset.run.generated_at:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return super().render(docset)
+
+        with mock.patch.object(generate_module, "renderer_for",
+                               lambda fmt, **options: Signalled()):
+            code, out, err = self.run_cli("generate", str(self.root), "--api-key",
+                                          "k", "--json")
+        docs = self.root / "docs"
+        self.assertTrue((docs / "index.json").is_file())
+        self.assertIn(PROSE, (docs / "shop" / "cart.py.md").read_text("utf-8"))
+        self.assertEqual(code, 130)
+        self.assertIn("stopping:", err)
+        self.assertEqual(json.loads(out)["stopped"], "")   # nothing left to cut
+        with Database(self.root / ".devdocs" / "devdocs.db") as db:
+            (run,) = db.query("SELECT status FROM run")
+        self.assertEqual(run["status"], "finished")
+
+    def test_a_signal_while_the_output_is_checked_stops_at_once(self) -> None:
+        # Regression: the check ran in the paid part of the run, where a stop
+        # is graceful, so with nothing bought every page was written again
+        # from the cache, which a fresh clone lacks: the prose became stubs.
+        self.assertEqual(self.run_cli("generate", str(self.root), "--api-key", "k",
+                                      "--quiet")[0], 0)
+        shutil.rmtree(self.root / ".devdocs")   # gitignored: a clone has none
+        docs = self.root / "docs"
+
+        def pages() -> dict[str, bytes]:
+            return {path.relative_to(docs).as_posix(): path.read_bytes()
+                    for path in sorted(docs.rglob("*")) if path.is_file()}
+
+        before = pages()
+        self.assertIn(PROSE.encode(), before["shop/cart.py.md"])
+        self.model.calls.clear()
+
+        class Signalled(MarkdownRenderer):
+            def render(self, docset: DocSet) -> dict[str, bytes]:
+                # the check's pages, which have no date; not the run's
+                if docset.run is not None and not docset.run.generated_at:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return super().render(docset)
+
+        with mock.patch.object(generate_module, "renderer_for",
+                               lambda fmt, **options: Signalled()):
+            code, _, err = self.run_cli("generate", str(self.root), "--api-key", "k")
+        self.assertEqual(code, 130)
+        self.assertNotIn("stopping:", err)
+        self.assertIn("warning: interrupted;", err)
+        self.assertIn("warning: interrupted; nothing was bought and no documents "
+                      "were written\n", err)
+        self.assertEqual((self.model.calls, pages()), ([], before))
+        with Database(self.root / ".devdocs" / "devdocs.db") as db:
+            self.assertEqual(db.query("SELECT id FROM run"), [])
+
+    def test_a_second_ctrl_c_a_second_later_stops_at_once(self) -> None:
+        script = textwrap.dedent("""\
+            import signal
+            import sys
+            import threading
+            from unittest import mock
+
+            from devdocs import cli
+            from tests.test_generate import TaggedModel
+
+            # as a terminal starts it
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+
+            class Hanging(TaggedModel):
+                def generate(self, request):
+                    if request.tag == "shop/cli.py":   # never answers in time
+                        print("on the wire", file=sys.stderr, flush=True)
+                        threading.Event().wait(60)
+                    return super().generate(request)
+
+            with mock.patch.object(cli, "make_provider", return_value=Hanging()):
+                sys.exit(cli.main(["generate", sys.argv[1], "--api-key", "k",
+                                   "--concurrency", "1"]))
+        """)
+        kept = {k: v for k, v in os.environ.items() if not k.startswith(_KEYS)}
+        child = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.root)],
+            cwd=Path(__file__).resolve().parents[1], env=kept, text=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        self.addCleanup(child.kill)
+        watchdog = threading.Timer(60, child.kill)
+        watchdog.start()
+        self.addCleanup(watchdog.cancel)
+        stderr = child.stderr
+        assert stderr is not None
+        self.addCleanup(stderr.close)
+
+        def read_until(text: str) -> None:
+            for line in stderr:
+                if text in line:
+                    return
+            self.fail(f"devdocs ended before printing {text!r}")
+
+        read_until("on the wire")
+        child.send_signal(signal.SIGINT)
+        read_until("stopping:")
+        time.sleep(1.2)   # past one second: a new request, not the same delivered twice
+        started = time.monotonic()
+        child.send_signal(signal.SIGINT)
+        rest = stderr.read()
+        self.assertEqual(child.wait(10), 130)
+        self.assertLess(time.monotonic() - started, 10)   # not the call's 60 s
+        self.assertEqual(rest.count("stopped at once"), 1)
+        self.assertFalse((self.root / "docs").exists())
+
+        # cart.py was answered before cli.py's call went out: the next run
+        # has it for free, and pays for what the stop kept from being asked.
+        code, out, _ = self.run_cli("generate", str(self.root), "--api-key", "k",
+                                    "--json", "--quiet")
+        self.assertEqual(code, 0)
+        summary = json.loads(out)
+        self.assertEqual((summary["resumed"], summary["cache_hits"]), (True, 1))
+        self.assertEqual(sorted(r.tag for r in self.model.calls), [
+            "shop", "shop/__init__.py", "shop/cli.py", "shop/money.py"])
+
+
+def signals(signum: int = signal.SIGINT) -> Callable[..., Any]:
+    """A stand-in for a step of a command, during which `signum` arrives."""
+    def step(*args: object, **kwargs: object) -> None:
+        os.kill(os.getpid(), signum)
+        raise AssertionError("the signal did not end the command")
+
+    return step
+
+
+class SignalsAsked(TaggedModel):
+    """Takes the signal while the provider is asked for its models."""
+
+    def list_models(self) -> list[str]:
+        signals()()
+        return []
+
+
+@unittest.skipIf(sys.platform == "win32", "sends POSIX signals")
+class TestWhatAStopSays(CliCase):
+    """What a stop that ends a command says of it, by real signals. Regression:
+    every command said its documents were kept and a run would resume."""
+
+    PIPELINE = generate_module.Pipeline
+
+    def setUp(self) -> None:
+        super().setUp()
+        as_from_a_terminal(self)
+        signal.signal(signal.SIGTERM, TestStopSignals.unhandled)
+
+    def stopped(self, *argv: str, code: int = 130, model: Any = None) -> str:
+        """What a stop made of `argv`, after its exit code is checked."""
+        exit_code, _, err = self.run_cli(*argv, model=model)
+        self.assertEqual(exit_code, code, err)
+        (line,) = [line for line in err.splitlines() if "interrupted" in line]
+        return line
+
+    def test_estimate(self) -> None:
+        with mock.patch.object(self.PIPELINE, "prepare", signals()):
+            line = self.stopped("estimate", str(self.root))
+        self.assertEqual(
+            line, "warning: interrupted; nothing was sent, so nothing was spent")
+
+    def test_doctor(self) -> None:
+        with mock.patch.object(capabilities, "probe_all", signals()):
+            line = self.stopped("doctor", str(self.root), "--offline")
+        self.assertEqual(line, "warning: interrupted; the checks did not finish; "
+                               "nothing was changed")
+
+    def test_models(self) -> None:
+        line = self.stopped("models", "--api-key", "k", model=SignalsAsked())
+        self.assertEqual(line, "warning: interrupted; nothing was changed")
+
+    def test_cache(self) -> None:
+        with mock.patch.object(cli.ResponseCache, "stats", signals()):
+            line = self.stopped("cache", "stats", str(self.root))
+        self.assertEqual(line, "warning: interrupted; the cache is as it was")
+        self.assertFalse((self.root / ".devdocs").exists())   # stats makes no state
+        self.assertIn("0 cached responses", self.run_cli("cache", "stats",
+                                                         str(self.root))[1])
+        with mock.patch.object(cli.ResponseCache, "clear", signals()):
+            line = self.stopped("cache", "clear", str(self.root))
+        self.assertEqual(line, "warning: interrupted; the cache is empty or as it was; "
+                               "`devdocs cache stats` tells which")
+
+    def test_init_before_it_writes(self) -> None:
+        # Before it writes, no --force advice: --force would replace a config
+        # this run never touched.
+        config = self.root / "devdocs.toml"
+        config.write_text("max_cost = 9.99  # by hand\n", "utf-8")
+        for flags in ((), ("--force",)):
+            with self.subTest(flags=flags), \
+                    mock.patch.object(cli, "search_start", signals()):
+                line = self.stopped("init", str(self.root), *flags)
+                self.assertEqual(line, "warning: interrupted; nothing was written")
+                self.assertEqual(config.read_text("utf-8"),
+                                 "max_cost = 9.99  # by hand\n")
+
+    def test_init_once_it_writes(self) -> None:
+        config, ignore = self.root / "devdocs.toml", self.root / ".gitignore"
+        ignore.write_bytes(b"build/\n")
+        for owner, step in ((Path, "write_text"), (cli, "_ignore_state")):
+            with self.subTest(step), mock.patch.object(owner, step, signals()):
+                line = self.stopped("init", str(self.root), "--force")
+                self.assertEqual(line, "warning: interrupted; its files may be "
+                                       "unfinished; run it again with --force to "
+                                       "finish them")
+        self.assertEqual(ignore.read_bytes(), b"build/\n")
+        code, _, err = self.run_cli("init", str(self.root), "--force")   # as it says
+        self.assertEqual(code, 0, err)
+        self.assertIn("[devdocs]", config.read_text("utf-8"))
+        self.assertEqual(ignore.read_bytes(), b"build/\n.devdocs/\n")
+
+    def test_export(self) -> None:
+        with mock.patch.object(self.PIPELINE, "export", signals()):
+            line = self.stopped("export", str(self.root))
+        self.assertEqual(line, "warning: interrupted; each file written so far is "
+                               "whole; export again for the rest, for free")
+
+    def test_generate_before_anything_is_bought(self) -> None:
+        for step in ("prepare", "check"):
+            with self.subTest(step), mock.patch.object(self.PIPELINE, step, signals()):
+                line = self.stopped("generate", str(self.root), "--api-key", "k")
+                self.assertEqual(line, "warning: interrupted; nothing was bought and "
+                                       "no documents were written")
+        line = self.stopped("generate", str(self.root), "--api-key", "k",
+                            model=SignalsAsked())
+        self.assertIn("nothing was bought", line)
+        self.assertEqual(self.model.calls, [])
+
+    def test_generate_once_it_has_paid(self) -> None:
+        # The pages are written; the summary was being printed.
+        with mock.patch.object(cli, "_warnings", signals()):
+            line = self.stopped("generate", str(self.root), "--api-key", "k")
+        self.assertEqual(line, "warning: interrupted; documents written so far are "
+                               "kept, run again to resume")
+        self.assertTrue((self.root / "docs" / "index.json").is_file())
+        self.assertGreater(len(self.model.calls), 0)
+
+    def test_generate_stopped_by_an_interrupt_no_handler_took(self) -> None:
+        self.model.interrupt_after = 1
+        line = self.stopped("generate", str(self.root), "--api-key", "k",
+                            "--concurrency", "1")
+        self.assertIn("documents written so far are kept", line)
+
+    def test_sigterm_keeps_its_own_status(self) -> None:
+        with mock.patch.object(self.PIPELINE, "prepare", signals(signal.SIGTERM)):
+            line = self.stopped("estimate", str(self.root), code=143)
+        self.assertIn("nothing was sent", line)
+        with mock.patch.object(self.PIPELINE, "prepare", signals(signal.SIGTERM)):
+            line = self.stopped("generate", str(self.root), "--api-key", "k", code=143)
+        self.assertIn("nothing was bought", line)
+
+
+if __name__ == "__main__":
+    unittest.main()
