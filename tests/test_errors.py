@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
+import re
 import unittest
 
 from devdocs.errors import (
@@ -79,6 +83,43 @@ class TestRetryable(unittest.TestCase):
     def test_spent_quota_is_not_retryable(self) -> None:
         self.assertFalse(QuotaExhausted("daily limit").retryable)
         self.assertFalse(QuotaExhausted("billing", status=402).retryable)
+
+
+class TestQuotaHint(unittest.TestCase):
+    """The hint is printed as the way out, so its command must really run."""
+
+    def hinted_command(self, error: QuotaExhausted) -> argparse.Namespace:
+        from devdocs.cli import build_parser
+
+        found = re.search(r"`devdocs ([^`]+)`", error.hint or "")
+        self.assertIsNotNone(found, error.hint)
+        assert found is not None
+        argv = [*found.group(1).split(), "."]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                return build_parser().parse_args(argv)
+        except SystemExit:
+            self.fail(f"the CLI rejects the hinted `devdocs {' '.join(argv)}`")
+
+    def test_hinted_command_exists_and_resumes(self) -> None:
+        for error in (
+            QuotaExhausted("Gemini daily quota exhausted"),
+            QuotaExhausted("limit of 1000 requests per day", status=None),
+            QuotaExhausted("Anthropic billing: credit balance too low", status=402),
+        ):
+            with self.subTest(status=error.status):
+                args = self.hinted_command(error)
+                self.assertEqual(args.command, "generate")
+                self.assertFalse(args.no_resume)
+
+    def test_billing_hint_does_not_promise_a_reset(self) -> None:
+        hint = QuotaExhausted("billing", status=402).hint or ""
+        self.assertIn("billing", hint)
+        self.assertNotIn("resets", hint)
+
+    def test_hint_can_be_given(self) -> None:
+        self.assertEqual(QuotaExhausted("cap", hint="raise the cap").hint,
+                         "raise the cap")
 
 
 class TestPayload(unittest.TestCase):

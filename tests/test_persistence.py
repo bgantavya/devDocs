@@ -7,6 +7,8 @@ a StorageError stops it cleanly with exit code 9.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sqlite3
 import tempfile
 import threading
@@ -258,6 +260,24 @@ class TestInMemoryUnderAThreadPool(unittest.TestCase):
             self.assertEqual(ResponseCache(db).stats()[0], len(prompts))
             served = first[0].model
             self.assertEqual(DailyUsage(db).requests(served), len(prompts))
+
+
+class TestCliOnADamagedIndex(unittest.TestCase):
+    def test_cache_stats_exits_with_the_storage_code(self) -> None:
+        from devdocs.cli import main
+
+        project = file_database(self).parent
+        good = project / "good.db"
+        Database(good).close()
+        (project / ".devdocs").mkdir()
+        (project / ".devdocs" / "devdocs.db").write_bytes(good.read_bytes()[:200])
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = main(["cache", "stats", str(project)])
+        self.assertEqual(code, StorageError.exit_code)
+        self.assertIn("rebuild the index", stderr.getvalue())
 
 
 if __name__ == "__main__":
