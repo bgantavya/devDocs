@@ -7,7 +7,7 @@ name = "devDocs"
 version = "3.0.0"
 description = "AI-powered CLI tool that builds professional '*.md' documentation files of a project for internal teams using the Google Gemini API."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "MIT"
 
 authors = [
@@ -29,7 +29,6 @@ classifiers = [
   "Topic :: Software Development :: Code Generators",
   "Topic :: Software Development :: Documentation",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",

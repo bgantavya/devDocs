@@ -1,8 +1,10 @@
 from argparse import ArgumentParser, Namespace
 from logging import INFO, WARNING, basicConfig, exception, getLogger, info
-from os import chdir, curdir, getcwd, listdir, makedirs, scandir
+from getpass import getpass
+from os import chdir, curdir, environ, getcwd, listdir, makedirs, scandir
 from os.path import abspath, dirname, exists, getsize, isdir, join, splitext
-from typing import List, Optional
+from sys import stdin
+from typing import List, Optional, Set
 
 from google.genai import Client
 from google.genai.types import GenerateContentConfig
@@ -42,40 +44,96 @@ Only return the final `README.md` content. Do not include any explanations, pref
 
                     '''
 
-avoid: List[str] = [
-    'cache', 'node', 'module', 'pkg', 'package', '@', '$', '#', '&',
-    'util', 'hook', 'component', 'python', 'compile', 'dist', 'build', 'env',
-    'docs', 'lib', 'bin', 'obj', 'out', '__pycache__', '.next', '.turbo', '.expo',
-    '.idea', '.vscode', 'coverage', 'test', 'tests', 'fixtures', 'migrations',
-    'assets', 'static', 'logs', 'debug', 'config', 'style'
+# Cheapest capable first; escalate only on failure.
+MODELS: List[str] = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
 ]
-prefix: List[str] = ['.', '-', '_', '~']
+
+# Directory names. Whole segments, never substrings.
+avoid: Set[str] = {
+    'node_modules', '__pycache__', 'dist', 'build', 'coverage', 'vendor',
+    'venv', '.venv', 'env', 'target', 'bin', 'obj', 'out', 'logs',
+    '.next', '.turbo', '.expo', '.idea', '.vscode', '.git', 'site-packages',
+    'migrations', 'fixtures', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+    'eggs', 'wheels', 'htmlcov', '.tox', '.eggs', 'third_party',
+}
+
+# Exact filenames, lowercased.
+skip_files: Set[str] = {
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock',
+    'uv.lock', 'cargo.lock', 'composer.lock', 'gemfile.lock',
+    '.ds_store', 'thumbs.db', '.gitkeep',
+}
+
+# No '_': it was eating every __init__.py.
+prefix: List[str] = ['.', '~']
 suffix: List[str] = [
     '.log', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.gif', '.webp',
     '.pyc', '.class', '.zip', '.min.js', '.mp4', '.mp3', '.wav', '.pdf',
     '.docx', '.xlsx', '.db', '.sqlite', '.bak', '.7z', '.rar', '.tar.gz',
-    '.exe', '.dll', '.so', '.ttf', '.woff', '.eot', '.swp', '.map', '.webm', '.md', '.css'
+    '.exe', '.dll', '.so', '.ttf', '.woff', '.eot', '.swp', '.map', '.webm',
+    '.md', '.css'
 ]
+
+forced: Set[str] = set()   # forced back in by --include
+skipped: List[str] = []    # reported at end of run
+
+
+_FATAL = frozenset({400, 401, 403})   # another model cannot help
+dead_models: Set[str] = set()         # 404'd this run, skip them
+
+
+def _status_of(err: Exception) -> Optional[int]:
+    """Pull the HTTP status off an SDK exception.
+
+    The SDK puts it on `.code`, `.status_code` or `.response.status_code`
+    depending on the failure, so all three are tried. None means the error
+    carried no status and should be treated as retryable.
+    """
+    for attr in ('code', 'status_code'):
+        value = getattr(err, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(err, 'response', None)
+    value = getattr(response, 'status_code', None)
+    return value if isinstance(value, int) else None
+
+
+def _text_of(response: object) -> Optional[str]:
+    """Return the markdown a response carried, or None if it carried none.
+
+    `.text` is None whenever finishReason is SAFETY or MAX_TOKENS, because the
+    candidate then has no parts at all. Callers must treat None as "this model
+    produced nothing", not as a transport error.
+    """
+    text = getattr(response, 'text', None)
+    if not text:
+        return None
+    return text.removeprefix('```markdown').removesuffix('```').strip() or None
 
 
 def GenerateReadMe(file: str, code: str, readme: str) -> str:
-    """Generate markdown docs using Gemini with fallback model sequence."""
+    """Ask Gemini for this file's markdown, escalating models only when needed.
+
+    Walks MODELS cheapest first. A fatal status aborts the run outright, a 404
+    retires that model, anything else falls through to the next one. Returns a
+    placeholder rather than raising so one bad file cannot end the run.
+    """
     if client is None:
         return f"# {file}\n\n⚠️ Failed to generate documentation. API client is not initialized."
 
-    models: List[str] = [
-        "gemini-3.1-pro-preview",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash-lite",
-    ]
     last_error: Optional[Exception] = None
 
-    for model_name in models:
+    for model_name in MODELS:
+        if model_name in dead_models:
+            continue
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -86,12 +144,24 @@ def GenerateReadMe(file: str, code: str, readme: str) -> str:
                     f"Existing README (if any):\n{readme}",
                 ],
             )
-            return response.text.removeprefix('```markdown').removesuffix('```').strip()
         except Exception as err:
             last_error = err
+            status = _status_of(err)
+            if status in _FATAL:
+                exception(f"{status} from Gemini; aborting. Check your API key.")
+                raise SystemExit(2)
+            if status == 404:
+                dead_models.add(model_name)
+            continue
+
+        text = _text_of(response)
+        if text is not None:
+            return text
+        info(f"{model_name} returned no content for {file}")
+        break   # empty candidate; a bigger model will not fix it
 
     exception(f"Error generating README for {file}: {last_error}")
-    return f"# {file}\n\n⚠️ Failed to generate documentation GEMINI SERVER ERROR."
+    return f"# {file}\n\nDocumentation could not be generated for this file."
 
 
 def print_tree(start_path: str = '.', prefix: str = '') -> str:
@@ -110,7 +180,7 @@ def print_tree(start_path: str = '.', prefix: str = '') -> str:
 
         with scandir(start_path) as entries:
             for entry in entries:
-                if IsValid(entry.name):
+                if IsValid(entry.name, entry.is_dir()):
                     if entry.is_dir():
                         folders.append(entry.name)
                     else:
@@ -212,7 +282,10 @@ def LookFolder(base: str) -> None:
         chdir(base)
         print(f"Reading Folder: {base}")
 
-        entries: List[str] = [entry for entry in listdir() if IsValid(entry)]
+        entries: List[str] = [
+            entry for entry in listdir()
+            if IsValid(entry, isdir(join(getcwd(), entry)))
+        ]
         folders: List[str] = [
             folder for folder in entries
             if isdir(join(getcwd(), folder))
@@ -252,31 +325,92 @@ def LookFolder(base: str) -> None:
 
 
 def Look(include: str, exclude: str) -> None:
-    """Apply user include/exclude filters to default keyword and suffix lists."""
+    """Fold --include / --exclude into the filter lists.
+
+    --include forces a name back in whatever else says; --exclude adds it to the
+    skip set, or to the extension list when it starts with a dot. Both were
+    previously inverted and did the opposite of their help text.
+    """
     try:
-        include_entries = [i.strip() for i in include.split(',') if i.strip()]
-        exclude_entries = [e.strip() for e in exclude.split(',') if e.strip()]
+        for item in (i.strip().lower() for i in include.split(',')):
+            if item:
+                forced.add(item)
+                avoid.discard(item)
+                skip_files.discard(item)
+                if item in suffix:
+                    suffix.remove(item)
 
-        for include_item in include_entries:
-            avoid.append(include_item)
-
-        for exclude_item in exclude_entries:
-            if exclude_item in avoid:
-                avoid.remove(exclude_item)
-            if exclude_item in suffix:
-                suffix.remove(exclude_item)
+        for item in (e.strip().lower() for e in exclude.split(',')):
+            if item:
+                forced.discard(item)
+                if item.startswith('.'):
+                    if item not in suffix:
+                        suffix.append(item)
+                else:
+                    avoid.add(item)
     except Exception:
-        exception("Error in use with args --include  || --exclude")
+        exception("Error in use with args --include || --exclude")
 
 
-def IsValid(entry: str) -> bool:
-    """Return True when file/folder name passes configured filters."""
+def IsValid(entry: str, is_dir: bool = False) -> bool:
+    """Decide whether one directory entry is worth reading.
+
+    Matches whole path segments, never substrings, so `out` no longer removes
+    routes.py and `lib` no longer removes library.ts. --include wins over every
+    other rule. Rejected names are recorded in `skipped` for the run summary.
+    """
     name = entry.lower()
-    return (
-        not any(name.startswith(sw) for sw in prefix)
-        and not any(name.endswith(ew) for ew in suffix)
-        and not any(kw in name for kw in avoid)
-    )
+
+    if name in forced:
+        return True
+
+    if any(name.startswith(sw) for sw in prefix):
+        skipped.append(entry)
+        return False
+
+    if is_dir:
+        if name in avoid:
+            skipped.append(entry + '/')
+            return False
+        return True
+
+    if name in skip_files:
+        skipped.append(entry)
+        return False
+
+    if any(name.endswith(ew) for ew in suffix):
+        skipped.append(entry)
+        return False
+
+    # `build.py` and `out.go` survive; only a bare `build` or `out` does not.
+    if name in avoid:
+        skipped.append(entry)
+        return False
+
+    return True
+
+
+def resolve_api_key(explicit: str = '') -> str:
+    """Find a Gemini key: flag, then environment, then an interactive prompt.
+
+    The prompt is only reached on a terminal. Without a TTY this raises instead
+    of blocking forever, which is what made the tool unusable in CI. getpass
+    keeps the key out of the scrollback.
+    """
+    if explicit:
+        return explicit.strip()
+
+    for var in ('GEMINI_API_KEY', 'GOOGLE_API_KEY'):
+        value = environ.get(var, '').strip()
+        if value:
+            info(f"Using API key from ${var}")
+            return value
+
+    if not stdin.isatty():
+        raise SystemExit(
+            "No API key. Pass --api-key or set GEMINI_API_KEY."
+        )
+    return getpass("Paste your Google Gemini API Key: ").strip()
 
 
 def main() -> None:
@@ -336,7 +470,13 @@ def main() -> None:
             "--include",
             type=str,
             default='',
-            help="Folders, files, extensionse to include ((e.g., docs, ext, setting, config)"
+            help="Folders, files, extensions to force include (e.g., tests, build)"
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default='',
+            help="Gemini API key (else $GEMINI_API_KEY, else prompt)"
         )
 
         global client
@@ -355,7 +495,7 @@ def main() -> None:
         if not exists(DOCS_BASE):
             makedirs(DOCS_BASE)
 
-        avoid.append(DOCS_BASE)
+        avoid.add(DOCS_BASE.lower())
         data = (
             f"name: {args.name}\n"
             f"description: {args.description}\n"
@@ -363,12 +503,14 @@ def main() -> None:
             f"keywords: {args.keywords}"
         )
 
-        client = Client(api_key=input("Paste your Google Gemini API Key here:").strip())
+        client = Client(api_key=resolve_api_key(args.api_key))
         print(f"📁 Starting in: {args.path}")
         makedirs(DOCS_BASE, exist_ok=True)
         chdir(args.path)
         LookFolder(curdir)
-        print("✅ Documentation generated successfully.")
+        print("Documentation generated successfully.")
+        if skipped:
+            print(f"Skipped {len(skipped)} path(s). Use --include to force any back in.")
     except Exception:
         exception("Error during execution. Try using --help.")
 
