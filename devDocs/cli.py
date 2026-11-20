@@ -1,119 +1,377 @@
-k='docs'
-Y='utf-8'
-X='README'
-W=any
-V=open
-Q='.md'
-N='.'
-G=str
-F=print
-B=''
-A=Exception
-from logging import basicConfig as l,info as H,WARNING as Z,INFO,getLogger as a,exception as E
-from os import listdir as m,getcwd as J,chdir as R,scandir as n,curdir as o,makedirs as S
-from os.path import isdir as O,join as C,splitext as p,exists as b,getsize as q,dirname as c,abspath as d
-from google.genai import Client as r
-from google.genai.types import GenerateContentConfig as D
-from argparse import ArgumentParser as s
-from time import sleep
-l(level=INFO)
-a('google_genai').setLevel(Z)
-a('httpx').setLevel(Z)
-P='\nYou are Gantavya Bansal, a senior software engineer and expert technical writer. Your task is to generate clean, professional, and well-structured `README.md` documentation in Markdown format. Use the provided filename, source code, and any existing README or folder structure as context.\n\nYour output must be:\n\n- Concise and easy to follow\n- Focused on technical clarity and usability\n- Markdown-only (no extra commentary, no code fences)\n\nYour output must include:\n\n1. **Project Title** – Inferred from the filename or main script\n2. **Folder Structure** – Tree view if available, with clickable index links\n3. **Description** – What the project does and its purpose\n4. **How to Use** – Installation steps, CLI/API usage examples\n5. **Technologies Used** – Languages, tools, libraries\n6. **Architecture or Code Overview** – Key components, flow, functions, or classes\n7. **Known Issues / Improvements** – Current limitations, TODOs\n8. **Additional Notes or References** – Licensing, credits, related tools\n\nOnly return the final `README.md` content. Do not include any explanations, prefixes, or suffixes.\n\n                    '
-def t(file,code,readme):
-	J='```';I='```markdown';G=readme;F=code;C=file
-	try:B=M.models.generate_content(model='gemini-2.0-flash-lite',config=D(system_instruction=P),contents=[f"Filename: {C}",f"Code:\n{F}",f"Existing README (if any):\n{G}"]);return B.text.removeprefix(I).removesuffix(J).strip()
-	except A as H:
-		try:B=M.models.generate_content(model='gemini-2.0-flash',config=D(system_instruction=P),contents=[f"Filename: {C}",f"Code:\n{F}",f"Existing README (if any):\n{G}"]);return B.text.removeprefix(I).removesuffix(J).strip()
-		except A as H:
-			try:B=M.models.generate_content(model='gemini-2.5-flash-lite',config=D(system_instruction=P),contents=[f"Filename: {C}",f"Code:\n{F}",f"Existing README (if any):\n{G}"]);return B.text.removeprefix(I).removesuffix(J).strip()
-			except A as H:
-				try:B=M.models.generate_content(model='gemini-2.5-flash',config=D(system_instruction=P),contents=[f"Filename: {C}",f"Code:\n{F}",f"Existing README (if any):\n{G}"]);return B.text.removeprefix(I).removesuffix(J).strip()
-				except A as H:E(f"Error generating README for {C}: {H}");return f"# {C}\n\n⚠️ Failed to generate documentation GEMINI SERVER ERROR."
-def e(start_path=N,prefix=B):
-	L=prefix;D=start_path
-	try:
-		I=B;J=[];F=[]
-		if not O(D):
-			if O(c(d(D))):D=c(d(D))
-			else:return B
-		with n(D)as G:
-			for H in G:
-				if h(H.name):
-					if H.is_dir():F.append(H.name)
-					else:J.append(H.name)
-		F.sort();J.sort();G=F+J
-		for(N,K)in enumerate(G):
-			P=C(D,K);M=N==len(G)-1;Q='└── 'if M else'├── ';I+=L+Q+K+'\n'
-			if K in F:R='    'if M else'│   ';I+=e(P,L+R)
-		return I
-	except A as S:E(f"Error generating Tree for {D} dir: {S}");return f"# {D}\n\n⚠️ Failed to generate documentation tree."
-def u(base,folders,files):
-	I=files;G=folders;D=base
-	try:
-		F=K(D);F+=f"\n {e(start_path=D)} \n"
-		if G:
-			for L in G:O=C(J(),L);F+=f"\n readme for folder:{L} \n content inside: \n {K(O)} \n"
-		if I:
-			for M in I:F+=f"\n readme for file:{M} \n content inside: {K(M)} \n"
-		f(X if D==N else D,F,K(X if D==N else D));H(B)
-	except A as P:E(f"Error generating README for {D}: {P}")
-def K(file):
-	C=file
-	try:
-		if b(C+Q):
-			with V(C+Q,'r',encoding=Y)as D:return D.read()
-		else:return B
-	except A as F:E(f"Error reading README for {C}: {F}");return f"# {C}\n\n⚠️ Failed to read {C}.md"
-def v(file):
-	B=file
-	try:
-		with V(B,'r',encoding=Y)as C:return C.read()
-	except A as D:E(f"Error reading code in {B}: {D}");return f"# {B}\n\n⚠️ Failed to read {B}"
-def f(file,code,readme):
-	N='README.md';G=readme;D=file
-	try:
-		O=J().replace(U,B).lstrip('\\/').replace('\\','/');K=C(U,I,O);S(K,exist_ok=True);L=p(D)[0]+Q
-		if X in L.upper():
-			if not j:H('skipping overwriting README');M=C(K,N)
-			else:M=C(N)
-		else:M=C(K,L)
-		G=i+G
-		with V(M,'w',encoding=Y)as P:P.write(t(D,code,G))
-		F(f"Written to: {L}")
-	except A as R:E(f"Error writing README for {D}: {R}")
-L=['cache','node','module','pkg','package','@','$','#','&','util','hook','component','python','compile','dist','build','env',k,'lib','bin','obj','out','__pycache__','.next','.turbo','.expo','.idea','.vscode','coverage','test','tests','fixtures','migrations','assets','static','logs','debug','config','style']
-w=[N,'-','_','~']
-T=['.log','.png','.jpg','.jpeg','.svg','.ico','.gif','.webp','.pyc','.class','.zip','.min.js','.mp4','.mp3','.wav','.pdf','.docx','.xlsx','.db','.sqlite','.bak','.7z','.rar','.tar.gz','.exe','.dll','.so','.ttf','.woff','.eot','.swp','.map','.webm',Q,'.css']
-def g(base):
-	I=base
-	try:
-		R(I);F(f"Reading Folder: {I}");N=[A for A in m()if h(A)];L=[A for A in N if O(C(J(),A))]
-		if L:
-			F('Folders found:')
-			for D in L:H(D)
-			for D in L:H(B);F(f"Opening Folder: {D}");g(D);F(f"Closing Folder: {D}");H(B)
-		M=[A for A in N if not O(C(J(),A))and q(A)<1000000]
-		if M:
-			F('Files found:')
-			for G in M:H(G)
-			for G in M:P=v(G);Q=K(G);f(G,P,Q)
-		u(I,L,M);R('..')
-	except A as S:E(f"Failed to read {I} folder.")
-def x(include,exclude):
-	D=exclude;C=include
-	try:
-		C=[A.strip()for A in C.split(',')if A.strip()];D=[A.strip()for A in D.split(',')if A.strip()]
-		for F in C:L.append(F.strip())
-		for B in D:
-			if B in L:L.remove(B.strip())
-			if B in T:T.remove(B.strip())
-	except A as G:E('Error in use with args --include  || --exclude')
-def h(entry):A=entry.lower();return not W(A.startswith(B)for B in w)and not W(A.endswith(B)for B in T)and not W(B in A for B in L)
-def y():
-	try:
-		C=s(description='Auto-generate documentation from source code and folder structure.');C.add_argument('-p','--path',type=G,default=N,help='Root path to scan (default: current directory)');C.add_argument('--name',type=G,default='My Project',help='Project name to include in README');C.add_argument('--description',type=G,default='No description provided.',help='Short description of the project');C.add_argument('--authors',type=G,default='Anonymous',help='Comma-separated list of author names');C.add_argument('--keywords',type=G,default=B,help='Comma-separated keywords (e.g., cli, docs, auto)');C.add_argument('--overwrite',action='store_true',help='Overwrite existing README files (default: False)');C.add_argument('--output',type=G,default=k,help='Output dir where docs to be stored (default: docs)');C.add_argument('--exclude',type=G,default=B,help='Folders, files, extensionse to exclude ((e.g., docs, ext, setting, config)');C.add_argument('--include',type=G,default=B,help='Folders, files, extensionse to include ((e.g., docs, ext, setting, config)');global M;global U;global I;global i;global j;D=C.parse_args();U=J();j=D.overwrite;I=D.output;x(include=D.include,exclude=D.exclude)
-		if not b(I):S(I)
-		L.append(I);i=f"name: {D.name}\ndescription: {D.description}\nauthors: {D.authors}\nkeywords: {D.keywords}";M=r(api_key=input('Paste your Google Gemini API Key here:').strip());F(f"📁 Starting in: {D.path}");S(I,exist_ok=True);R(D.path);g(o);F('✅ Documentation generated successfully.')
-	except A as H:E('Error during execution. Try using --help.')
-if __name__=='__main__':y()
+from argparse import ArgumentParser, Namespace
+from logging import INFO, WARNING, basicConfig, exception, getLogger, info
+from os import chdir, curdir, getcwd, listdir, makedirs, scandir
+from os.path import abspath, dirname, exists, getsize, isdir, join, splitext
+from typing import List, Optional
+
+from google.genai import Client
+from google.genai.types import GenerateContentConfig
+
+basicConfig(level=INFO)
+getLogger("google_genai").setLevel(WARNING)
+getLogger("httpx").setLevel(WARNING)
+
+# Runtime globals initialized in main().
+client: Optional[Client] = None
+start_dir: str = ""
+DOCS_BASE: str = "docs"
+data: str = ""
+ow: bool = False
+
+prompt = '''
+You are Gantavya Bansal, a senior software engineer and expert technical writer. Your task is to generate clean, professional, and well-structured `README.md` documentation in Markdown format. Use the provided filename, source code, and any existing README or folder structure as context.
+
+Your output must be:
+
+- Concise and easy to follow
+- Focused on technical clarity and usability
+- Markdown-only (no extra commentary, no code fences)
+
+Your output must include:
+
+1. **Project Title** – Inferred from the filename or main script
+2. **Folder Structure** – Tree view if available, with clickable index links
+3. **Description** – What the project does and its purpose
+4. **How to Use** – Installation steps, CLI/API usage examples
+5. **Technologies Used** – Languages, tools, libraries
+6. **Architecture or Code Overview** – Key components, flow, functions, or classes
+7. **Known Issues / Improvements** – Current limitations, TODOs
+8. **Additional Notes or References** – Licensing, credits, related tools
+
+Only return the final `README.md` content. Do not include any explanations, prefixes, or suffixes.
+
+                    '''
+
+avoid: List[str] = [
+    'cache', 'node', 'module', 'pkg', 'package', '@', '$', '#', '&',
+    'util', 'hook', 'component', 'python', 'compile', 'dist', 'build', 'env',
+    'docs', 'lib', 'bin', 'obj', 'out', '__pycache__', '.next', '.turbo', '.expo',
+    '.idea', '.vscode', 'coverage', 'test', 'tests', 'fixtures', 'migrations',
+    'assets', 'static', 'logs', 'debug', 'config', 'style'
+]
+prefix: List[str] = ['.', '-', '_', '~']
+suffix: List[str] = [
+    '.log', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.gif', '.webp',
+    '.pyc', '.class', '.zip', '.min.js', '.mp4', '.mp3', '.wav', '.pdf',
+    '.docx', '.xlsx', '.db', '.sqlite', '.bak', '.7z', '.rar', '.tar.gz',
+    '.exe', '.dll', '.so', '.ttf', '.woff', '.eot', '.swp', '.map', '.webm', '.md', '.css'
+]
+
+
+def GenerateReadMe(file: str, code: str, readme: str) -> str:
+    """Generate markdown docs using Gemini with fallback model sequence."""
+    if client is None:
+        return f"# {file}\n\n⚠️ Failed to generate documentation. API client is not initialized."
+
+    models: List[str] = [
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-lite",
+    ]
+    last_error: Optional[Exception] = None
+
+    for model_name in models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                config=GenerateContentConfig(system_instruction=prompt),
+                contents=[
+                    f"Filename: {file}",
+                    f"Code:\n{code}",
+                    f"Existing README (if any):\n{readme}",
+                ],
+            )
+            return response.text.removeprefix('```markdown').removesuffix('```').strip()
+        except Exception as err:
+            last_error = err
+
+    exception(f"Error generating README for {file}: {last_error}")
+    return f"# {file}\n\n⚠️ Failed to generate documentation GEMINI SERVER ERROR."
+
+
+def print_tree(start_path: str = '.', prefix: str = '') -> str:
+    """Build a filtered tree-like text representation for the given directory."""
+    try:
+        tree = ''
+        files: List[str] = []
+        folders: List[str] = []
+
+        if not isdir(start_path):
+            parent = dirname(abspath(start_path))
+            if isdir(parent):
+                start_path = parent
+            else:
+                return ""
+
+        with scandir(start_path) as entries:
+            for entry in entries:
+                if IsValid(entry.name):
+                    if entry.is_dir():
+                        folders.append(entry.name)
+                    else:
+                        files.append(entry.name)
+
+        folders.sort()
+        files.sort()
+        ordered_entries = folders + files
+
+        for index, name in enumerate(ordered_entries):
+            path = join(start_path, name)
+            is_last = index == len(ordered_entries) - 1
+
+            branch = '└── ' if is_last else '├── '
+            tree += prefix + branch + name + '\n'
+
+            if name in folders:
+                extension = '    ' if is_last else '│   '
+                tree += print_tree(path, prefix + extension)
+
+        return tree
+    except Exception as err:
+        exception(f"Error generating Tree for {start_path} dir: {err}")
+        return f"# {start_path}\n\n⚠️ Failed to generate documentation tree."
+
+
+def FolderReadMe(base: str, folders: List[str], files: List[str]) -> None:
+    """Generate a folder-level README summary from nested files and folders."""
+    try:
+        all_content = LookReadMe(base)
+        all_content += f"\n {print_tree(start_path=base)} \n"
+
+        for folder in folders:
+            path = join(getcwd(), folder)
+            all_content += f"\n readme for folder:{folder} \n content inside: \n {LookReadMe(path)} \n"
+
+        for file in files:
+            all_content += f"\n readme for file:{file} \n content inside: {LookReadMe(file)} \n"
+
+        root_name = 'README' if base == '.' else base
+        WriteReadMe(root_name, all_content, LookReadMe(root_name))
+        info("")
+    except Exception as err:
+        exception(f"Error generating README for {base}: {err}")
+
+
+def LookReadMe(file: str) -> str:
+    """Read an adjacent markdown file if available."""
+    try:
+        md_path = file + '.md'
+        if exists(md_path):
+            with open(md_path, 'r', encoding='utf-8') as readme:
+                return readme.read()
+        return ""
+    except Exception as err:
+        exception(f"Error reading README for {file}: {err}")
+        return f"# {file}\n\n⚠️ Failed to read {file}.md"
+
+
+def LookCode(file: str) -> str:
+    """Read source code content from a file path."""
+    try:
+        with open(file, 'r', encoding='utf-8') as code_file:
+            return code_file.read()
+    except Exception as err:
+        exception(f"Error reading code in {file}: {err}")
+        return f"# {file}\n\n⚠️ Failed to read {file}"
+
+
+def WriteReadMe(file: str, code: str, readme: str) -> None:
+    """Create markdown output for one file and write it to docs or root README."""
+    try:
+        rel_path = getcwd().replace(start_dir, '').lstrip('\\/').replace('\\', '/')
+        docs_dir = join(start_dir, DOCS_BASE, rel_path)
+        makedirs(docs_dir, exist_ok=True)
+
+        filename = splitext(file)[0] + '.md'
+        if 'README' in filename.upper():
+            if not ow:
+                info("skipping overwriting README")
+                full_path = join(docs_dir, 'README.md')
+            else:
+                full_path = join('README.md')
+        else:
+            full_path = join(docs_dir, filename)
+
+        generated_prompt_input = data + readme
+        with open(full_path, 'w', encoding='utf-8') as readme_file:
+            readme_file.write(GenerateReadMe(file, code, generated_prompt_input))
+
+        print(f"Written to: {filename}")
+    except Exception as err:
+        exception(f"Error writing README for {file}: {err}")
+
+
+def LookFolder(base: str) -> None:
+    """Recursively scan folders and generate markdown docs for valid files."""
+    try:
+        chdir(base)
+        print(f"Reading Folder: {base}")
+
+        entries: List[str] = [entry for entry in listdir() if IsValid(entry)]
+        folders: List[str] = [
+            folder for folder in entries
+            if isdir(join(getcwd(), folder))
+        ]
+
+        if folders:
+            print("Folders found:")
+            for folder in folders:
+                info(folder)
+
+            for folder in folders:
+                info("")
+                print(f"Opening Folder: {folder}")
+                LookFolder(folder)
+                print(f"Closing Folder: {folder}")
+                info("")
+
+        files: List[str] = [
+            file for file in entries
+            if (not isdir(join(getcwd(), file))) and (getsize(file) < 1_000_000)
+        ]
+
+        if files:
+            print("Files found:")
+            for file in files:
+                info(file)
+
+            for file in files:
+                code = LookCode(file)
+                readme = LookReadMe(file)
+                WriteReadMe(file, code, readme)
+
+        FolderReadMe(base, folders, files)
+        chdir('..')
+    except Exception:
+        exception(f"Failed to read {base} folder.")
+
+
+def Look(include: str, exclude: str) -> None:
+    """Apply user include/exclude filters to default keyword and suffix lists."""
+    try:
+        include_entries = [i.strip() for i in include.split(',') if i.strip()]
+        exclude_entries = [e.strip() for e in exclude.split(',') if e.strip()]
+
+        for include_item in include_entries:
+            avoid.append(include_item)
+
+        for exclude_item in exclude_entries:
+            if exclude_item in avoid:
+                avoid.remove(exclude_item)
+            if exclude_item in suffix:
+                suffix.remove(exclude_item)
+    except Exception:
+        exception("Error in use with args --include  || --exclude")
+
+
+def IsValid(entry: str) -> bool:
+    """Return True when file/folder name passes configured filters."""
+    name = entry.lower()
+    return (
+        not any(name.startswith(sw) for sw in prefix)
+        and not any(name.endswith(ew) for ew in suffix)
+        and not any(kw in name for kw in avoid)
+    )
+
+
+def main() -> None:
+    """CLI entrypoint for docs generation workflow."""
+    try:
+        parser = ArgumentParser(
+            description="Auto-generate documentation from source code and folder structure."
+        )
+        parser.add_argument(
+            "-p", "--path",
+            type=str,
+            default=".",
+            help="Root path to scan (default: current directory)"
+        )
+        parser.add_argument(
+            "--name",
+            type=str,
+            default="My Project",
+            help="Project name to include in README"
+        )
+        parser.add_argument(
+            "--description",
+            type=str,
+            default="No description provided.",
+            help="Short description of the project"
+        )
+        parser.add_argument(
+            "--authors",
+            type=str,
+            default="Anonymous",
+            help="Comma-separated list of author names"
+        )
+        parser.add_argument(
+            "--keywords",
+            type=str,
+            default="",
+            help="Comma-separated keywords (e.g., cli, docs, auto)"
+        )
+        parser.add_argument(
+            "--overwrite",
+            action="store_true",
+            help="Overwrite existing README files (default: False)"
+        )
+        parser.add_argument(
+            "--output",
+            type=str,
+            default='docs',
+            help="Output dir where docs to be stored (default: docs)"
+        )
+        parser.add_argument(
+            "--exclude",
+            type=str,
+            default='',
+            help="Folders, files, extensionse to exclude ((e.g., docs, ext, setting, config)"
+        )
+        parser.add_argument(
+            "--include",
+            type=str,
+            default='',
+            help="Folders, files, extensionse to include ((e.g., docs, ext, setting, config)"
+        )
+
+        global client
+        global start_dir
+        global DOCS_BASE
+        global data
+        global ow
+
+        args: Namespace = parser.parse_args()
+        start_dir = getcwd()
+
+        ow = args.overwrite
+        DOCS_BASE = args.output
+        Look(include=args.include, exclude=args.exclude)
+
+        if not exists(DOCS_BASE):
+            makedirs(DOCS_BASE)
+
+        avoid.append(DOCS_BASE)
+        data = (
+            f"name: {args.name}\n"
+            f"description: {args.description}\n"
+            f"authors: {args.authors}\n"
+            f"keywords: {args.keywords}"
+        )
+
+        client = Client(api_key=input("Paste your Google Gemini API Key here:").strip())
+        print(f"📁 Starting in: {args.path}")
+        makedirs(DOCS_BASE, exist_ok=True)
+        chdir(args.path)
+        LookFolder(curdir)
+        print("✅ Documentation generated successfully.")
+    except Exception:
+        exception("Error during execution. Try using --help.")
+
+
+if __name__ == "__main__":
+    main()

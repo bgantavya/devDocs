@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "devDocs"
-version = "2.0.7"
+version = "3.0.0"
 description = "AI-powered CLI tool that builds professional '*.md' documentation files of a project for internal teams using the Google Gemini API."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = "MIT"
 
 authors = [
   { name = "Gantavya Bansal", email = "gantavyaoo@gmail.com" }
@@ -28,7 +28,6 @@ classifiers = [
   "Topic :: Documentation",
   "Topic :: Software Development :: Code Generators",
   "Topic :: Software Development :: Documentation",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
@@ -49,7 +48,7 @@ Issues = "https://github.com/bgantavya/devDocs/issues"
 Documentation = "https://github.com/bgantavya/devDocs#readme"
 
 [project.scripts]
-devDocs = "devDocs.cli:y"
+devDocs = "devDocs.cli:main"
 
 [tool.setuptools]
 packages = ["devDocs"]
