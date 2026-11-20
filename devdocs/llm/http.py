@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import math
 import random
@@ -349,6 +350,23 @@ def _alive(connection: http.client.HTTPConnection) -> bool:
     return not readable
 
 
+def _nameable(host: str) -> bool:
+    """Whether `host` could name a machine: an IP literal, or a name whose
+    labels are non-empty and at most 63 bytes. Anything else would only fail
+    later in the resolver, and on a slow network slowly."""
+    if ":" in host:
+        try:
+            ipaddress.IPv6Address(host.partition("%")[0])
+        except ValueError:
+            return False
+        return True
+    try:
+        encoded = host.removesuffix(".").encode("idna")
+    except UnicodeError:
+        return False
+    return 0 < len(encoded) <= 253 and not any(c in host for c in " \t/\\")
+
+
 def _split(url: str) -> tuple[str, str, int, str]:
     """Scheme, host, port and request target of an http(s) URL."""
     try:
@@ -363,6 +381,9 @@ def _split(url: str) -> tuple[str, str, int, str]:
     if not host:
         where = url.partition("?")[0][:100]
         raise ProviderError(f"URL has no host: {where!r}", retryable=False)
+    if not _nameable(host):
+        raise ProviderError(f"URL has a malformed host: {host[:100]!r}",
+                            retryable=False)
     target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     return scheme, host, port or (443 if scheme == "https" else 80), target
 
@@ -540,6 +561,10 @@ def _proxy_address(proxy: str) -> tuple[str, int, dict[str, str]]:
         )
     if not parts.hostname:
         raise ProviderError("the proxy URL has no host", retryable=False, hint=hint)
+    if not _nameable(parts.hostname):
+        raise ProviderError(
+            "the proxy URL has a malformed host or port", retryable=False, hint=hint
+        )
 
     headers: dict[str, str] = {}
     if parts.username:

@@ -1,0 +1,283 @@
+# CI: lint, types, tests (Linux and macOS; Windows experimental, allowed to
+# fail), coverage, security scans, commit subjects, packaging, the container
+# image and the installers. Pushes to v4 and main run it through publish.yml
+# (workflow_call) instead, so it is not run twice; a release needs it to pass.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [v4, main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked --extra dev
+      - run: uv run ruff check devdocs tests scripts
+
+  types:
+    name: Types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked --extra dev
+      - run: uv run mypy --strict devdocs scripts/release.py
+
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        experimental: [false]
+        include:
+          - os: windows-latest
+            python: "3.11"
+            experimental: true
+          - os: windows-latest
+            python: "3.14"
+            experimental: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked --extra dev
+      - run: uv run coverage run -m unittest discover -s tests
+      - name: Write coverage.xml
+        if: ${{ !cancelled() }}
+        run: uv run coverage xml --fail-under=0
+      - name: Report (fail_under from pyproject.toml)
+        run: uv run coverage report
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: error
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan the history of HEAD for secrets (gitleaks)
+        env:
+          GITLEAKS_VERSION: 8.30.1 # bump together with the linux_x64 checksum
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "$GITLEAKS_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --log-opts=HEAD \
+            --redact --no-banner --verbose .
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked --extra dev
+      - name: Bandit
+        run: uv run bandit -r devdocs -ll
+      - name: pip-audit (locked dev dependencies)
+        run: |
+          uv export --locked --extra dev --no-hashes --no-emit-project \
+            > "$RUNNER_TEMP/requirements.txt"
+          uv run pip-audit --progress-spinner off --no-deps --disable-pip \
+            -r "$RUNNER_TEMP/requirements.txt"
+
+  commits:
+    name: Commit subjects
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Lint the subjects of the commits this pull request adds
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: python scripts/release.py lint-commits "origin/${BASE_REF}..HEAD"
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv build
+      - name: Check the wheel (its package data, no runtime dependencies)
+        run: |
+          python - <<'EOF'
+          import re
+          import sys
+          import tomllib
+          import zipfile
+          from email.parser import HeaderParser
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              sys.exit(f"expected one wheel in dist/, found {[w.name for w in wheels]}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+              metadata = next(n for n in names if n.endswith(".dist-info/METADATA"))
+              meta = HeaderParser().parsestr(wheel.read(metadata).decode())
+          patterns = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))[
+              "tool"]["setuptools"]["package-data"]["devdocs"]
+          data = {pattern: {p.as_posix() for p in Path("devdocs").glob(pattern) if p.is_file()}
+                  for pattern in patterns}
+          problems = [f"no file in the checkout matches package-data {pattern!r}"
+                      for pattern, found in data.items() if not found]
+          expected = set().union(*data.values())
+          problems += [f"lacks {name}" for name in sorted(expected - names)]
+          problems += [
+              f"requires {req}"
+              for req in meta.get_all("Requires-Dist") or []
+              if not re.search(r";.*\bextra\s*==", req)
+          ]
+          if problems:
+              sys.exit(f"{wheels[0].name}: " + "; ".join(problems))
+          print(f"{wheels[0].name}: {len(expected)} package-data files, no runtime dependencies")
+          EOF
+      - name: Check the version sync (Python and npm)
+        run: python scripts/release.py check
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Test the npm wrapper
+        working-directory: npm
+        run: npm test
+      - name: Pack the npm wrapper (dry run; prepack bundles devdocs)
+        working-directory: npm
+        run: npm pack --dry-run
+      - name: Run the bundled wrapper
+        run: node npm/bin/devdocs.js --version
+
+  container:
+    name: Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: devdocs:ci
+      - run: docker run --rm devdocs:ci --version
+      - name: Estimate a mounted project as uid 1001 (read-only root)
+        run: |
+          project="$RUNNER_TEMP/project"
+          mkdir -p "$project"
+          printf 'def add(a: int, b: int) -> int:\n    """Return a + b."""\n    return a + b\n' \
+            > "$project/app.py"
+          sudo chown -R 1001:1001 "$project"
+          docker run --rm --user 1001:1001 --read-only --tmpfs /tmp \
+            --volume "$project:/work" devdocs:ci estimate
+          test "$(stat -c %u "$project/.devdocs/devdocs.db")" = 1001
+
+  installers:
+    name: Installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            experimental: false
+          - os: macos-latest
+            experimental: false
+          - os: windows-latest
+            experimental: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Put ~/.local/bin on PATH for later steps, as the installers advise
+        shell: pwsh
+        run: Join-Path $HOME '.local' 'bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        env:
+          DEVDOCS_SOURCE: ${{ github.workspace }}
+        run: sh scripts/install.sh
+      - name: Install with install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DEVDOCS_SOURCE: ${{ github.workspace }}
+        run: ./scripts/install.ps1
+      - name: Run the installed devdocs
+        run: |
+          command -v devdocs
+          devdocs --version

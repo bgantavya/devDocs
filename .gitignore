@@ -1,5 +1,4 @@
 # Editor/IDE
-.github
 .vscode
 .code
 .idea
@@ -22,27 +21,35 @@ develop-eggs/
 dist/
 downloads/
 eggs/
-.eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
 wheels/
-*.egg-info/
 .installed.cfg
-*.egg
 
-# Testing
+# Testing and tools
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 .tox/
+.mypy_cache/
+.ruff_cache/
 
 # Packaging
 .env
 .env.local
 .env.*.local
 
-# Docs output
+# npm wrapper: prepack copies these in
+node_modules/
+npm/python/
+npm/LICENSE
+npm/*.tgz
+
+# devdocs: its own state, and its docs output
+.devdocs/
 docs/

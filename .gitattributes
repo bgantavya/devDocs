@@ -1,0 +1,3 @@
+# Scripts run through a shebang need LF endings, whatever core.autocrlf says.
+*.sh text eol=lf
+npm/bin/*.js text eol=lf

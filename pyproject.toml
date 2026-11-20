@@ -80,7 +80,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["devdocs"]
+files = ["devdocs", "scripts/release.py"]
 
 # Optional extra: type-checked as Any when it is not installed.
 [[tool.mypy.overrides]]

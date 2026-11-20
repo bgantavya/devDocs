@@ -1,32 +1,279 @@
-name: Publish to PyPI (OIDC)
+# Release: on a push to v4 or main, run CI, then ask scripts/release.py whether
+# the conventional commits since the last vX.Y.Z tag call for a release. If so:
+# commit the version bump and an annotated tag as github-actions[bot]; build the
+# sdist and wheel once (SBOM, provenance) for PyPI and the GitHub release; the
+# npm and GHCR jobs build their own packages from the same tag, each with its
+# own provenance. Jobs after the tag check out refs/tags/<tag>, since
+# actions/checkout tries a bare name as a branch first. PyPI's trusted publisher
+# is registered for this file name with no environment, so keep both. If branch
+# protection blocks the bot's push, allow github-actions to bypass it, or switch
+# to a release-PR flow.
+name: Release
 
 on:
-  release:
-    types: [published]  # Trigger when a GitHub release is published
+  push:
+    branches: [v4, main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] actionlint 1.7 rejects $/; ./ resolves from this commit
     permissions:
-      id-token: write       # Required for OIDC
       contents: read
 
+  plan:
+    name: Plan
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.next.outputs.release }}
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
+      previous: ${{ steps.next.outputs.previous }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.11"
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - id: next
+        run: |
+          python scripts/release.py next --json > "$RUNNER_TEMP/next.json"
+          cat "$RUNNER_TEMP/next.json"
+          jq -r '"release=\(.release)", "version=\(.version)", "tag=\(.tag)",
+                 "previous=\(.previous // "")"' "$RUNNER_TEMP/next.json" >> "$GITHUB_OUTPUT"
 
-      - name: Install build dependencies
-        run: pip install build
+  tag:
+    name: Tag
+    needs: plan
+    if: >-
+      needs.plan.outputs.release == 'true'
+      && (github.ref == 'refs/heads/v4' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the release commit and tag
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true # zizmor: ignore[artipacked] git push below; no artifacts here
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Commit the version, tag it, push both
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          test "$TAG" = "v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python scripts/release.py bump "$VERSION"
+          git add devdocs/__init__.py npm/package.json
+          git diff --cached --quiet || git commit -m "chore(release): v$VERSION"
+          git tag -a "$TAG" -m "devdocs $VERSION"
+          git push --atomic origin "HEAD:refs/heads/$BRANCH" "refs/tags/$TAG"
 
-      - name: Remove previous Build
-        run: rm -rf dist build *.egg-info
+  build:
+    name: Build
+    needs: [plan, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # sign the provenance (Sigstore)
+      attestations: write # store the provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - name: Build the sdist and wheel (SOURCE_DATE_EPOCH from the tagged commit)
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          uv build --no-create-gitignore # else dist/* attests dist/.gitignore too
+      - name: SBOM of dist (CycloneDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: dist
+          format: cyclonedx-json
+          output-file: devdocs-${{ needs.plan.outputs.version }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: devdocs-${{ needs.plan.outputs.version }}.cdx.json
+          if-no-files-found: error
 
-      - name: Build the package
-        run: python -m build
+  pypi:
+    name: PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # trusted publishing; PEP 740 attestations
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
-      - name: Publish to PyPI (trusted publisher)
-        uses: pypa/gh-action-pypi-publish@release/v1
+  npm:
+    name: npm
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # trusted publishing; provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Use npm 11 (trusted publishing needs 11.5.1 or later)
+        run: npm install --global npm@11.21.1 # zizmor: ignore[adhoc-packages] exact version; node 22 ships npm 10
+      - name: Publish (prepack bundles devdocs)
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # zizmor: ignore[secrets-outside-env] first publish only; trusted publishing needs none
+        run: npm publish --provenance --access public
+
+  ghcr:
+    name: GHCR
+    needs: [plan, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push the image and its attestation
+      id-token: write # sign the provenance (Sigstore)
+      attestations: write # store the provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+      - name: Revision and commit time of the tag
+        id: source
+        env:
+          TZ: UTC
+        run: |
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "created=$(git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" \
+            >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+          # Runs privileged; pinned by hand, as Dependabot does not track it.
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/bgantavya/devdocs
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.plan.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.tag }}
+            type=raw,value=latest
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VERSION=${{ needs.plan.outputs.version }}
+            REVISION=${{ steps.source.outputs.revision }}
+            CREATED=${{ steps.source.outputs.created }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/bgantavya/devdocs
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false # storage records need an organization-owned repository
+
+  release:
+    name: GitHub release
+    needs: [plan, pypi, npm, ghcr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release, upload its assets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: sbom
+      - name: Write the notes and create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PREVIOUS: ${{ needs.plan.outputs.previous }}
+        run: |
+          if [ -n "$PREVIOUS" ]; then range="$PREVIOUS..$TAG"; else range="$TAG"; fi
+          python scripts/release.py notes "$range" > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/* sbom/* --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md"
