@@ -40,7 +40,12 @@ from devdocs.llm import Completion, Finish, Request, Usage
 from devdocs.llm.catalog import ModelInfo, assume, find
 from devdocs.llm.http import HttpResponse, Transport, parse_retry_after
 
-__all__ = ["AnthropicProvider", "GeminiProvider"]
+__all__ = [
+    "EMBEDDING_DIMENSIONS",
+    "EMBEDDING_MODEL",
+    "AnthropicProvider",
+    "GeminiProvider",
+]
 
 _MAX_PAGES = 20
 
@@ -117,6 +122,8 @@ def _count(value: Any) -> int:
 # -- Gemini ---------------------------------------------------------------------
 
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSIONS = 768     # truncated from 3072: near-full quality, 1/4 the size
 
 # FinishReason, ai.google.dev/api/generate-content. Verdicts every model of the
 # vendor would repeat are BLOCKED, which the client returns instead of
@@ -160,8 +167,8 @@ class GeminiProvider:
         transport: Transport,
         *,
         base_url: str = _GEMINI_BASE,
-        embedding_model: str = "gemini-embedding-001",
-        dimensions: int = 768,
+        embedding_model: str = EMBEDDING_MODEL,
+        dimensions: int = EMBEDDING_DIMENSIONS,
     ) -> None:
         self.api_key = api_key
         self.transport = transport

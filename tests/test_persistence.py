@@ -1,4 +1,4 @@
-"""Cache, run ledger and daily usage over a real index.
+"""Cache, run ledger, daily usage and chunk vectors over a real index.
 
 Each guards money: a lost cache row is a request paid twice, and a raw
 exception out of a repository ends a run as "internal error" (exit 1) where
@@ -19,6 +19,7 @@ from pathlib import Path
 
 from devdocs.errors import StorageError
 from devdocs.index.cache import ResponseCache
+from devdocs.index.chunk import Chunk, ChunkStore
 from devdocs.index.db import Database
 from devdocs.index.ledger import (
     DailyUsage,
@@ -260,6 +261,21 @@ class TestInMemoryUnderAThreadPool(unittest.TestCase):
             self.assertEqual(ResponseCache(db).stats()[0], len(prompts))
             served = first[0].model
             self.assertEqual(DailyUsage(db).requests(served), len(prompts))
+
+
+class TestChunkVectors(unittest.TestCase):
+    def test_vectors_are_kept_per_model(self) -> None:
+        with Database(":memory:") as db:
+            store = ChunkStore(db)
+            store.replace("a.py", [Chunk("c1", "a.py", "f", 1, 3, "def f(): pass")])
+            self.assertEqual([c.id for c in store.missing("embed-1", 3)], ["c1"])
+
+            store.store([("c1", [0.5, 0.25, 0.125])], "embed-1")
+            self.assertEqual(store.missing("embed-1", 3), [])
+            ids, vectors = store.vectors("embed-1", 3)
+            self.assertEqual((ids, list(vectors[0])), (["c1"], [0.5, 0.25, 0.125]))
+            # another model's vector is not this one's
+            self.assertEqual([c.id for c in store.missing("embed-2", 3)], ["c1"])
 
 
 class TestCliOnADamagedIndex(unittest.TestCase):

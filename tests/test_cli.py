@@ -105,6 +105,19 @@ class TestEstimate(CliCase):
         self.assertGreater(data["max_cost_usd"], 0)
         self.assertEqual(self.model.calls, [])
 
+    def test_semantic_estimate_quotes_the_embeddings_first(self) -> None:
+        code, out, _ = self.run_cli("estimate", str(self.root), "--context",
+                                    "semantic", "--json")
+        self.assertEqual(code, 0)
+        embed = json.loads(out)["items"][0]
+        self.assertEqual((embed["kind"], embed["requests"]), ("embed", 1))
+
+    def test_semantic_context_with_claude_is_a_config_error(self) -> None:
+        code, _, err = self.run_cli("estimate", str(self.root), "--context",
+                                    "semantic", "--provider", "anthropic")
+        self.assertEqual(code, 2)
+        self.assertIn("Gemini embeddings", err)
+
     def test_explain_lists_every_file(self) -> None:
         code, out, _ = self.run_cli("estimate", str(self.root), "--explain")
         self.assertEqual(code, 0)

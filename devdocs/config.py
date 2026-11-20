@@ -59,6 +59,7 @@ class Config:
     provider: str = "gemini"
     model: str = ""                  # pin one model for every call
     quality: str = "cheap"           # "cheap" | "balanced" | "high"
+    context: str = "standard"        # "off" | "standard" | "semantic"
     include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
     max_cost: float = 0.50           # USD ceiling; 0 disables the guard
@@ -79,6 +80,7 @@ class Config:
 
 
 _QUALITY = {"cheap", "balanced", "high"}
+_CONTEXT = {"off", "standard", "semantic"}
 _PROVIDERS = set(_ENV_KEYS)
 _FORMATS = {"markdown", "html", "pdf"}
 
@@ -166,6 +168,16 @@ def _validate(config: Config) -> None:
         raise ConfigError(
             f"unknown quality {config.quality!r}",
             hint=f"choose one of: {', '.join(sorted(_QUALITY))}",
+        )
+    if config.context not in _CONTEXT:
+        raise ConfigError(
+            f"unknown context {config.context!r}",
+            hint=f"choose one of: {', '.join(sorted(_CONTEXT))}",
+        )
+    if config.context == "semantic" and config.provider != "gemini":
+        raise ConfigError(
+            "semantic context needs Gemini embeddings",
+            hint='use context = "standard" with Anthropic, or provider = "gemini"',
         )
     unknown = set(config.formats) - _FORMATS
     if unknown:
